@@ -5,7 +5,7 @@
 
 - 作成日: 2026-07-22
 - 対象環境: Windows 11 Home / PowerShell / Claude Code CLI（`claude`）
-- 設置場所: `C:\claude\claude-window-keeper\`
+- 設置場所: `C:\claude\ClaudeCode\claude-window-keeper\`
 
 ---
 

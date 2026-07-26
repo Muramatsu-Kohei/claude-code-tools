@@ -45,7 +45,7 @@ PCが消えていた・スリープしていた時間帯にタイミングが来
 
 ## 4. インストールと初回セットアップ
 
-このフォルダ（`claude-window-keeper`）を任意の場所に置きます。以下の例では `C:\claude\claude-window-keeper` にある前提です。
+このフォルダ（`claude-window-keeper`）を任意の場所に置きます。以下の例では `C:\claude\ClaudeCode\claude-window-keeper` にある前提です。
 
 > **メモ：** PowerShell では Windows のパス区切り `\` が場面によって消えることがあります。
 > コマンドプロンプトや Git Bash 経由で叩くときは、パスを **フォワードスラッシュ `/`** で書くと確実です。
@@ -54,16 +54,16 @@ PCが消えていた・スリープしていた時間帯にタイミングが来
 
 ```powershell
 # ロジックだけ確認（実際には送信しない）
-powershell -ExecutionPolicy Bypass -File "C:/claude/claude-window-keeper/claude-window-ping.ps1" -DryRun
+powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/claude-window-ping.ps1" -DryRun
 
 # 現在の状態を表示
-powershell -ExecutionPolicy Bypass -File "C:/claude/claude-window-keeper/claude-window-ping.ps1" -Status
+powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/claude-window-ping.ps1" -Status
 ```
 
 ### STEP 2 — 手動で1回だけ打ってみる（ここで初めてトークンを消費）
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:/claude/claude-window-keeper/claude-window-ping.ps1" -Force
+powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/claude-window-ping.ps1" -Force
 ```
 
 `PING sent (model=haiku); reply: ok` と表示され、推定リセット時刻が出れば成功です。
@@ -71,7 +71,7 @@ powershell -ExecutionPolicy Bypass -File "C:/claude/claude-window-keeper/claude-
 ### STEP 3 — 自動実行を登録する
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:/claude/claude-window-keeper/register-task.ps1"
+powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/register-task.ps1"
 ```
 
 - **UAC（管理者確認）のダイアログが出たら「はい」を選んでください。** タスク登録には管理者権限が必要です。
@@ -91,7 +91,7 @@ powershell -Command "Get-ScheduledTask -TaskName ClaudeWindowKeeper | Select-Obj
 
 ```powershell
 # いまの状態・推定リセット時刻を見る
-powershell -ExecutionPolicy Bypass -File "C:/claude/claude-window-keeper/claude-window-ping.ps1" -Status
+powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/claude-window-ping.ps1" -Status
 
 # 実行ログを見る
 powershell -Command "Get-Content $env:USERPROFILE\.claude\window-keeper\ping.log -Tail 20"
@@ -134,8 +134,8 @@ State          : 255 min until next ping is due
 **例：6時間ごと運用にして送信回数をさらに減らす**
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:/claude/claude-window-keeper/register-task.ps1" -Unregister
-powershell -ExecutionPolicy Bypass -File "C:/claude/claude-window-keeper/register-task.ps1" -WindowMinutes 360
+powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/register-task.ps1" -Unregister
+powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/register-task.ps1" -WindowMinutes 360
 ```
 
 ---
@@ -226,7 +226,7 @@ ping は最も安い haiku モデルの極小メッセージなので、週次�
 
 ```powershell
 # 自動実行を解除
-powershell -ExecutionPolicy Bypass -File "C:/claude/claude-window-keeper/register-task.ps1" -Unregister
+powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/register-task.ps1" -Unregister
 
 # 状態・ログの削除（任意）
 powershell -Command "Remove-Item $env:USERPROFILE\.claude\window-keeper -Recurse -Force"
