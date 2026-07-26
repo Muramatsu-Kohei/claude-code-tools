@@ -1,0 +1,9 @@
+# Claude Code の個人用ローカル設定(権限の許可リストなど。環境ごとに異なるため共有しない)
+.claude/settings.local.json
+**/.claude/settings.local.json
+
+node_modules/
+
+# OS が勝手に作るもの
+.DS_Store
+Thumbs.db
