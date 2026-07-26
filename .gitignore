@@ -1,0 +1,2 @@
+# Claude Code のローカル専用設定(権限の許可リストなど。環境ごとに異なるため共有しない)
+.claude/settings.local.json
