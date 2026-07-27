@@ -161,13 +161,41 @@ if (-not $claude) {
 }
 
 # ClaudeにPing（デフォルトではhaikuで最小限の応答で済むプロンプト）を送信
+#
+# 呼び出しの間だけ $ErrorActionPreference を Continue に落とす。
+# Windows PowerShell 5.1 は Stop と 2>&1 を併用すると、外部コマンドが stderr に1行出しただけで
+# 終了コード0でも NativeCommandError を投げる。それを catch して失敗扱いにすると
+# 「送信して枠を消費したのに state を更新しない」状態になり、毎時の実行で再送が続いて
+# 枠を数倍消費してしまう。そのため成否は例外ではなく終了コードで判定する。
+$prevEap  = $ErrorActionPreference
+$exitCode = $null
+$reply    = $null
 try {
-    $reply = & $claude.Source -p "Reply with only the word: ok" --model $Model 2>&1 | Out-String
-    Write-Log ("PING  sent (model={0}); reply: {1}" -f $Model, ($reply.Trim() -replace '\s+', ' '))
+    $ErrorActionPreference = "Continue"
+    # ForEach-Object で文字列化するのは、2>&1 で混ざる ErrorRecord をそのまま Out-String に渡すと
+    # 「At line:...」を含む複数行に展開され、ログ1行に収まらなくなるため
+    $reply = & $claude.Source -p "Reply with only the word: ok" --model $Model 2>&1 |
+             ForEach-Object { "$_" } | Out-String
+    $exitCode = $LASTEXITCODE
 } catch {
+    # 実行ファイルが消えている等、終了コードすら得られないケース
     Write-Log ("ERROR ping failed: " + $_.Exception.Message)
     exit 1
+} finally {
+    $ErrorActionPreference = $prevEap
 }
+
+# 出力が空でも .Trim() が落ちないよう文字列に寄せてから整形する
+$replyText = (("" + $reply).Trim() -replace '\s+', ' ')
+
+# 非0終了は送信失敗。state を更新しないので次回の実行で再送される。
+# ここを見ないと、認証切れやレート超過でも「送信できた」とログに残り、
+# ウィンドウを固定できていないことに気づけない。
+if ($exitCode -ne 0) {
+    Write-Log ("ERROR ping failed (exit={0}): {1}" -f $exitCode, $replyText)
+    exit 1
+}
+Write-Log ("PING  sent (model={0}); reply: {1}" -f $Model, $replyText)
 
 # ログの更新
 $now = Get-Date

@@ -56,6 +56,11 @@ Claude Code の 5 時間セッション制限（レートリミット）のウ�
 - 「送るかどうか」の判断はすべて ping 本体が持つ。タスクは単に頻繁に叩くだけ（冪等）。
 - そのため 1 時間ごとに起動しても、5 時間未満なら必ず SKIP されコストは発生しない。
 - `-DryRun` / `-Status` は状態を汚さないため、検証に安全に使える。
+- **判定の順序は 2 → 3 → 4。** SKIP 判定（3）が DryRun 判定（4）より先に来るため、
+  記録がある状態で `-DryRun` 単体を実行すると SKIP で終了し DRYRUN 行に到達しない。
+  送信処理の流れを検証したいときは `-Force -DryRun`（送信・記録なし）を使う。
+- **成否は例外ではなく `$LASTEXITCODE` で判定する。** 理由は下の「9. 配布時の前提・注意」の
+  「PowerShell 5.1 の stderr 挙動」を参照。
 
 ---
 
@@ -156,11 +161,25 @@ Get-ScheduledTask -TaskName ClaudeWindowKeeper | Select-Object TaskName,State
 - `--output-format json` でトークン実測を取得
 - タスク登録: UAC 昇格経由で成功、`State = Ready` を確認
 
+### 配布前レビューで追加検証した事項（2026-07-27）
+
+- 両スクリプトの構文（PS 5.1 パーサ）: OK
+- `Get-Help` でコメントベースヘルプが認識され、パラメータ 5 件ずつ取得できることを確認
+- `.ps1` は working tree・git index の blob ともに UTF-8 BOM（`EF BB BF`）付きであることを確認
+- `New-ScheduledTaskSettingsSet` の `MultipleInstances` 既定は `IgnoreNew`
+  → AtLogOn と定期トリガーが同時に発火しても二重送信にはならない
+- 登録済みタスクの実体: `State=Ready` / `LastTaskResult=0` / Repetition `PT1H/P3650D` /
+  S4U・Limited / `NumberOfMissedRuns=0`
+- SKIP をファイルに残さない変更が有効であることをログで確認（変更後に SKIP 行の増加なし）
+- `$ErrorActionPreference` と stderr / 終了コードの挙動 → 上記「9. 配布時の前提・注意」に記録し対処済み
+
 ### つまずきポイントの記録
 
 - `!` 実行（Git Bash 経由）では Windows パスの `\` が消え、`C:claude...` になり `-File` が失敗した。
   → パスは **フォワードスラッシュ `/`** で渡すこと。
 - タスク登録は管理者必須 → 自己昇格処理で対応済み。
+- `-DryRun` 単体では、記録がある間は SKIP 判定が先に走って DRYRUN 行に到達しない。
+  → 検証には `-Force -DryRun` を使う。
 
 ---
 
@@ -199,3 +218,40 @@ powershell -File ".\register-task.ps1" -Unregister
 | 文字エンコーディング | `.ps1` は **UTF-8 with BOM**（日本語コメントを含むため） | BOM なしにすると Windows PowerShell 5.1 が ANSI と誤認しコメントが化ける。編集時は BOM を保持すること |
 
 配布物に含めないもの: `.claude/settings.local.json`（この作業環境専用の権限許可リスト。リポジトリルートの `.gitignore` で除外済み）。
+
+### PowerShell 5.1 の stderr 挙動（対処済み・再発させないための記録）
+
+Windows PowerShell 5.1 は `$ErrorActionPreference = "Stop"` と `2>&1` を併用すると、
+**外部コマンドが stderr に1行出力した時点で、終了コードが 0 でも `NativeCommandError` を投げる。**
+
+```powershell
+$ErrorActionPreference = "Stop"
+& cmd.exe /c "echo warning-to-stderr 1>&2 & exit /b 0" 2>&1 | Out-String
+# → THROWN: RemoteException: warning-to-stderr   （exit 0 なのに例外）
+```
+
+当初の実装は `claude` の呼び出しを `2>&1 | Out-String` で受けて try/catch で囲んでいたため、
+この挙動を踏むと **ping は実際に送信されて枠を消費したのに catch に落ちて `state.json` を更新しない**
+状態になっていた。すると次の毎時実行でも「経過 ≧ WindowMinutes」のままなので real ping を毎時送り続け、
+**1 日 4〜5 回のはずが最大 24 回（枠とコストが約 5 倍）** になる。ログには ERROR しか残らず原因も追いにくい。
+
+あわせて、**非 0 終了は例外にならない**ことも確認した。
+
+```powershell
+& cmd.exe /c "echo failed-output & exit /b 1" 2>&1 | Out-String
+# → 例外にならず $LASTEXITCODE = 1
+```
+
+そのため終了コードを見ないと、認証切れ・ネットワーク断・レート超過で失敗しても
+`PING sent; reply: <エラー文>` とログに残り state が更新され、
+**ウィンドウを固定できていないのに固定できたと誤認する**。
+
+**対処:** `claude` 呼び出しの間だけ `$ErrorActionPreference` を `Continue` に落とし（`finally` で復帰）、
+成否は `$LASTEXITCODE` で判定する形に変更した。stderr は `2>&1` で受けたうえで
+`ForEach-Object { "$_" }` で文字列化してからログに載せる（ErrorRecord をそのまま `Out-String` に渡すと
+「At line:...」を含む複数行に展開され、ログ 1 行に収まらないため）。
+
+なお検証時点の `claude` 2.1.220 は `--version` の stderr が空であり、この不具合は顕在化していなかった。
+つまり **`claude` 側の出力仕様が変わった瞬間に初めて壊れる潜在バグ**だった。MCP サーバの接続警告や
+アップデート通知が stderr に出れば即発生するため、`claude` を外部コマンドとして呼ぶ箇所では
+この形（EAP を退避して終了コードで判定）を維持すること。

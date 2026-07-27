@@ -50,6 +50,7 @@ PCが消えていた・スリープしていた時間帯にタイミングが来
 | `register-task.ps1` | タスクスケジューラへの自動実行登録／解除 | ✅ |
 | `README.md` | このファイル | — |
 | `OPERATIONS.md` | 運用者向けの設計判断・実測値・注意点の記録 | — |
+| `LICENSE` | MIT License | — |
 
 2つの `.ps1` は**同じフォルダに置いてください**（`register-task.ps1` は同フォルダの `claude-window-ping.ps1` を自動的に探します）。それ以外に依存関係はなく、設置場所はどこでも構いません。
 
@@ -151,6 +152,10 @@ State          : 255 min until next ping is due
 | `-Status` | off | 状態表示のみ（送信・記録なし） |
 | `-DryRun` | off | ロジック確認のみ（送信・記録なし。トークン消費ゼロ） |
 
+> **`-DryRun` を後から使うときは `-Force` と併用してください。** 経過時間の判定は `-DryRun` の判定より先に
+> 行われるため、前回の送信から5時間たっていない間は `SKIP` が表示されるだけで `DRYRUN` の行までたどり着きません。
+> `-Force -DryRun` なら送信も記録もせずに送信処理の流れだけを確認できます（初回はまだ記録が無いので `-DryRun` 単体で動きます）。
+
 ### `register-task.ps1`
 
 | オプション | 既定 | 説明 |
@@ -247,6 +252,12 @@ ping スクリプトは PATH で見つからないとき `%USERPROFILE%\.local\b
 **Q. 複数のPCで使える？**
 はい。PCごとに STEP 1〜3 を実行してください。状態ファイルは PC ローカル（`%USERPROFILE%`）なので共有されません。
 
+**Q. WSL の中で Claude Code を使っています。これは使える？**
+はい、**Windows 側にセットアップすれば WSL 側にも効きます。** 利用枠は Web／デスクトップ／CLI で共有されるアカウント単位のものなので、同じアカウントでログインしていれば、Windows 側から打った ping で WSL 側 Claude Code のウィンドウも同時に固定されます。ただし次の2点に注意してください。
+
+- このツール自体は Windows 側で動きます（タスクスケジューラ依存）。**`claude` を WSL にしか入れていない場合**は Windows の PATH で見つからず `ERROR 'claude' command not found` になります。Windows 側にも Claude Code を入れるか、PATH を通してください（`claude --version` を PowerShell で確認）
+- 状態とログは Windows 側の `%USERPROFILE%\.claude\window-keeper\` にのみ作られます。WSL の `~/.claude/` とは別物なので、WSL 側から `-Status` を見ようとしても記録はありません
+
 ---
 
 ## 10. うまくいかないときは
@@ -258,6 +269,8 @@ ping スクリプトは PATH で見つからないとき `%USERPROFILE%\.local\b
 | タスク登録が「アクセスが拒否されました」 | UAC のダイアログで「はい」を選ぶ（`register-task.ps1` は非管理者なら自動で昇格を要求します） |
 | 自動実行されていない | `-Status` で `Last ping` が更新されているか確認（`SKIP` はログに残らないため、ログが増えないこと自体は異常ではありません）。更新されていなければタスクスケジューラで `State` が `Ready` か、`Last Run Result` が `0x0` かを確認 |
 | Git Bash やコマンドプロンプト経由で `-File` が失敗する | Windows パスの `\` が消えることがあります。**フォワードスラッシュ `/`** でパスを書くと確実です |
+| `-DryRun` を付けたのに `SKIP` しか出ない | 経過時間の判定が先に走るためです。異常ではありません。`-Force -DryRun` で併用してください（7章の注記参照） |
+| `ERROR ping failed (exit=...)` | `claude` が異常終了しています。同じコマンドを手で実行して原因を確認してください（`claude -p "Reply with only the word: ok" --model haiku`）。認証切れなら `claude` を起動して再ログインします。この場合は記録を更新しないため、原因を解消すれば次回の実行で自動的に再送されます |
 
 ---
 

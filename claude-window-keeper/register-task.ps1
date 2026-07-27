@@ -72,8 +72,10 @@ if (-not $isAdmin) {
                 $fwd += ('-{0}' -f $kv.Key) 
             }
         # [switch]の以外は -key value の形式
+        # 値はクォートで囲む。-TaskName "My Task" のように空白を含む値が、
+        # Start-Process の引数連結で2つの引数に割れてしまうのを防ぐため
         } else {
-            $fwd += @(('-{0}' -f $kv.Key), ('{0}' -f $kv.Value))
+            $fwd += @(('-{0}' -f $kv.Key), ('"{0}"' -f $kv.Value))
         }
     }
 
