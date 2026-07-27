@@ -36,34 +36,57 @@ PCが消えていた・スリープしていた時間帯にタイミングが来
 
 ## 3. 必要なもの
 
-- Windows 10 / 11
-- Windows PowerShell（標準搭載）
-- **Claude Code の CLI（`claude` コマンド）がインストール済みで、PATH が通っていること**
-  - 確認：PowerShell で `claude --version` が表示されればOK
+- **Windows 10 / 11**（Windows 専用です。タスクスケジューラを使うため macOS / Linux では動きません）
+- **Windows PowerShell 5.1 以降**（Windows 標準搭載。PowerShell 7 でも動作します）
+- **Claude Code の CLI（`claude` コマンド）がインストール済みであること**
+  - 確認：PowerShell で `claude --version` がバージョンを表示すればOK
+- タスクスケジューラへの登録時のみ**管理者権限（UAC承認）**
+
+## 4. 収録ファイル
+
+| ファイル | 役割 | 必須 |
+|---|---|---|
+| `claude-window-ping.ps1` | 本体。経過時間を判定し、必要なときだけ最小メッセージを送って時刻を記録 | ✅ |
+| `register-task.ps1` | タスクスケジューラへの自動実行登録／解除 | ✅ |
+| `README.md` | このファイル | — |
+| `OPERATIONS.md` | 運用者向けの設計判断・実測値・注意点の記録 | — |
+
+2つの `.ps1` は**同じフォルダに置いてください**（`register-task.ps1` は同フォルダの `claude-window-ping.ps1` を自動的に探します）。それ以外に依存関係はなく、設置場所はどこでも構いません。
 
 ---
 
-## 4. インストールと初回セットアップ
+## 5. インストールと初回セットアップ
 
-このフォルダ（`claude-window-keeper`）を任意の場所に置きます。以下の例では `C:\claude\ClaudeCode\claude-window-keeper` にある前提です。
+### STEP 0 — フォルダを置いて、PowerShell でそこへ移動する
 
-> **メモ：** PowerShell では Windows のパス区切り `\` が場面によって消えることがあります。
-> コマンドプロンプトや Git Bash 経由で叩くときは、パスを **フォワードスラッシュ `/`** で書くと確実です。
+フォルダを好きな場所（例：`C:\tools\claude-window-keeper`、`%USERPROFILE%\claude-window-keeper` など）に置きます。
+
+PowerShell を開き、**そのフォルダへ移動**します。以降のコマンドはすべて「このフォルダにいる状態」で実行する前提です。
+
+```powershell
+# 自分が置いた場所に読み替えてください（パスに空白が含まれてもクォートで囲めばOK）
+cd "C:\tools\claude-window-keeper"
+```
+
+> **ZIP でこのツールを受け取った場合：** Windows がダウンロードファイルにブロック印を付けることがあります。念のため一度だけ解除しておくと確実です。
+> ```powershell
+> Get-ChildItem -Recurse | Unblock-File
+> ```
 
 ### STEP 1 — まず「送らずに」動作確認する（トークンを消費しません）
 
 ```powershell
 # ロジックだけ確認（実際には送信しない）
-powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/claude-window-ping.ps1" -DryRun
+powershell -ExecutionPolicy Bypass -File .\claude-window-ping.ps1 -DryRun
 
 # 現在の状態を表示
-powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/claude-window-ping.ps1" -Status
+powershell -ExecutionPolicy Bypass -File .\claude-window-ping.ps1 -Status
 ```
 
 ### STEP 2 — 手動で1回だけ打ってみる（ここで初めてトークンを消費）
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/claude-window-ping.ps1" -Force
+powershell -ExecutionPolicy Bypass -File .\claude-window-ping.ps1 -Force
 ```
 
 `PING sent (model=haiku); reply: ok` と表示され、推定リセット時刻が出れば成功です。
@@ -71,11 +94,12 @@ powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-kee
 ### STEP 3 — 自動実行を登録する
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/register-task.ps1"
+powershell -ExecutionPolicy Bypass -File .\register-task.ps1
 ```
 
 - **UAC（管理者確認）のダイアログが出たら「はい」を選んでください。** タスク登録には管理者権限が必要です。
 - 管理者ウィンドウが別途開き、そこに登録結果が表示されます。
+- タスクは「ログオンしているかどうかにかかわらず実行」（S4U）で登録されるため、**黒いウィンドウが一瞬光ることはありません**。パスワードの保存も不要です。
 
 登録できたか確認：
 
@@ -85,15 +109,17 @@ powershell -Command "Get-ScheduledTask -TaskName ClaudeWindowKeeper | Select-Obj
 
 `State` が `Ready` なら完了です。以降は自動で動きます。
 
+> **注意：** 登録されるタスクには**このフォルダの絶対パスが埋め込まれます**。あとでフォルダを移動・リネームした場合は、移動後に STEP 3 をもう一度実行してください（`-Force` 相当で上書き登録されます）。
+
 ---
 
-## 5. 日常的に使うコマンド
+## 6. 日常的に使うコマンド
 
 ```powershell
-# いまの状態・推定リセット時刻を見る
-powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/claude-window-ping.ps1" -Status
+# いまの状態・推定リセット時刻を見る（フォルダ内で実行）
+powershell -ExecutionPolicy Bypass -File .\claude-window-ping.ps1 -Status
 
-# 実行ログを見る
+# 実行ログを見る（どこで実行してもOK）
 powershell -Command "Get-Content $env:USERPROFILE\.claude\window-keeper\ping.log -Tail 20"
 ```
 
@@ -107,9 +133,11 @@ Est. reset at  : 2026-07-22 07:16:58
 State          : 255 min until next ping is due
 ```
 
+状態とログの保存先は、スクリプトの置き場所と関係なく `%USERPROFILE%\.claude\window-keeper\` です（`state.json` と `ping.log`）。
+
 ---
 
-## 6. 設定オプション
+## 7. 設定オプション
 
 ### `claude-window-ping.ps1`
 
@@ -134,13 +162,13 @@ State          : 255 min until next ping is due
 **例：6時間ごと運用にして送信回数をさらに減らす**
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/register-task.ps1" -Unregister
-powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/register-task.ps1" -WindowMinutes 360
+powershell -ExecutionPolicy Bypass -File .\register-task.ps1 -Unregister
+powershell -ExecutionPolicy Bypass -File .\register-task.ps1 -WindowMinutes 360
 ```
 
 ---
 
-## 7. トークンとコストの目安
+## 8. トークンとコストの目安
 
 `-p "ok"` という最小メッセージでも、Claude Code は毎回システムプロンプトとツール定義を一緒に送るため、見た目より多くのトークンを処理します（実測値）。
 
@@ -162,7 +190,7 @@ Anthropic は**どのプランも「合計トークン数」での上限を公�
 
 ---
 
-## 7-1. このツールの負荷は無視できるレベルか？（結論：はい）
+## 8-1. このツールの負荷は無視できるレベルか？（結論：はい）
 
 「毎回3万トークンも使うなら、リミットをかなり圧迫するのでは？」と不安に思うかもしれません。実際にリミットと比べると、負荷はごくわずかです。
 
@@ -197,13 +225,13 @@ ping は最も安い haiku モデルの極小メッセージなので、週次�
 
 ---
 
-## 8. よくある質問（FAQ）
+## 9. よくある質問（FAQ）
 
 **Q. これで利用上限そのものが増えるの？**
 いいえ。上限は変わりません。**リセットの「タイミングを予測可能にする」**だけのツールです。
 
 **Q. 使わない日も勝手にトークンを消費する？**
-はい、規則的に少量消費します。それが「ウィンドウを既知の状態に保つ」というこのツールの目的です。不要な期間は STEP の `-Unregister` で自動実行を止められます。
+はい、規則的に少量消費します。それが「ウィンドウを既知の状態に保つ」というこのツールの目的です。不要な期間は `-Unregister` で自動実行を止められます。
 
 **Q. `-Status` のリセット時刻はどこまで正確？**
 「前回送信時刻＋5時間」の計算値です。Claude 側の実際の挙動が固定5時間ウィンドウであればほぼ一致します（下の「制限事項」参照）。
@@ -211,25 +239,50 @@ ping は最も安い haiku モデルの極小メッセージなので、週次�
 **Q. 送信メッセージの中身は？**
 「`ok` とだけ返して」という1行だけです。
 
+**Q. `claude` を PATH に通していない（`claude --version` が失敗する）場合は？**
+ping スクリプトは PATH で見つからないとき `%USERPROFILE%\.local\bin\claude.exe`（公式インストーラ）と `%APPDATA%\npm\claude.cmd`（npm グローバル）も探します。それ以外の場所に入れている場合は PATH を通してください。
+
+**Q. 複数のPCで使える？**
+はい。PCごとに STEP 1〜3 を実行してください。状態ファイルは PC ローカル（`%USERPROFILE%`）なので共有されません。
+
 ---
 
-## 9. 制限事項・注意
+## 10. うまくいかないときは
+
+| 症状 | 対処 |
+|---|---|
+| `ERROR 'claude' command not found in PATH.` | PowerShell で `claude --version` を確認。通らなければ Claude Code CLI を再インストールするか PATH を設定 |
+| `このシステムではスクリプトの実行が無効になっている` | 本 README のコマンド形式（`powershell -ExecutionPolicy Bypass -File ...`）で実行しているか確認 |
+| タスク登録が「アクセスが拒否されました」 | UAC のダイアログで「はい」を選ぶ（`register-task.ps1` は非管理者なら自動で昇格を要求します） |
+| 自動実行されていない | `%USERPROFILE%\.claude\window-keeper\ping.log` を確認。ログが増えていなければタスクの `State` が `Ready` か確認 |
+| Git Bash やコマンドプロンプト経由で `-File` が失敗する | Windows パスの `\` が消えることがあります。**フォワードスラッシュ `/`** でパスを書くと確実です |
+
+---
+
+## 11. 制限事項・注意
 
 - **前提としている挙動：** 「最初の1発から5時間の固定ウィンドウ」。もし Claude 側が完全な**ローリングウィンドウ**（各リクエストが個別に5時間で失効）だった場合、リセット時刻の完全固定は原理的にできません。ただしその場合でもツール自体は無害です（微量トークンを規則的に消費するだけ）。
-- `claude` コマンドが PATH にない環境では動きません。
+- Windows 専用です（タスクスケジューラ依存）。
+- `claude` コマンドが見つからない環境では動きません（10章参照）。
 - タスクの登録・削除には管理者権限（UAC承認）が必要です。
 - 実際の挙動に違和感があれば、`ping.log` のタイムスタンプと Claude Code 内 `/usage` の表示を突き合わせ、`-WindowMinutes` を調整してください。
 
 ---
 
-## 10. アンインストール
+## 12. アンインストール
 
 ```powershell
-# 自動実行を解除
-powershell -ExecutionPolicy Bypass -File "C:/claude/ClaudeCode/claude-window-keeper/register-task.ps1" -Unregister
+# 自動実行を解除（フォルダ内で実行）
+powershell -ExecutionPolicy Bypass -File .\register-task.ps1 -Unregister
 
 # 状態・ログの削除（任意）
 powershell -Command "Remove-Item $env:USERPROFILE\.claude\window-keeper -Recurse -Force"
 ```
 
-あとはフォルダごと削除すれば完全に元通りです。
+あとはフォルダごと削除すれば完全に元通りです。レジストリなど他の場所には何も書き込みません。
+
+---
+
+## ライセンス
+
+MIT License. 詳細は [LICENSE](./LICENSE) を参照してください。**無保証**です。利用上限の挙動は Anthropic 側の仕様変更で変わる可能性があります。

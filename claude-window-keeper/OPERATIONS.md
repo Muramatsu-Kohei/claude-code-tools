@@ -4,8 +4,8 @@
 一般的な使い方は [README.md](./README.md) を参照。
 
 - 作成日: 2026-07-22
-- 対象環境: Windows 11 Home / PowerShell / Claude Code CLI（`claude`）
-- 設置場所: `C:\claude\ClaudeCode\claude-window-keeper\`
+- 検証環境: Windows 11 Home / Windows PowerShell 5.1 / Claude Code CLI（`claude`）
+- 設置場所: 任意（スクリプトは自身の位置を `$PSScriptRoot` から解決するため、置き場所に依存しない）
 
 ---
 
@@ -26,6 +26,10 @@ Claude Code の 5 時間セッション制限（レートリミット）のウ�
 | `register-task.ps1` | タスクスケジューラへの登録／解除（非管理者時はUACで自己昇格） |
 | `README.md` | 一般向け説明 |
 | `OPERATIONS.md` | 本ドキュメント |
+| `LICENSE` | MIT License |
+
+配布時はこの4＋1ファイルをフォルダごと渡す。`.ps1` 2つが必須で、同一フォルダに置く必要がある
+（`register-task.ps1` は `$PSScriptRoot` から ping スクリプトを探す）。それ以外の依存はない。
 
 ### 状態・ログの保存先
 
@@ -176,3 +180,21 @@ powershell -File ".\register-task.ps1" -Unregister
 
 挙動に違和感が出たら `ping.log` のタイムスタンプと Claude Code 内 `/usage` を突き合わせ、
 `-WindowMinutes` を調整する。
+
+---
+
+## 9. 配布時の前提・注意
+
+他人の環境へ渡す前提で洗い出した、環境依存になりうる箇所と結論。
+
+| 箇所 | 環境依存性 | 結論 |
+|---|---|---|
+| スクリプトの設置場所 | `$PSScriptRoot` / `$env:USERPROFILE` のみ使用。絶対パスの埋め込みなし | 依存しない |
+| 状態・ログ | 常に `%USERPROFILE%\.claude\window-keeper\` | ユーザー単位で分離。PC間で共有されない |
+| `claude` の解決 | PATH → `%USERPROFILE%\.local\bin\claude.exe` → `%APPDATA%\npm\claude.cmd` の順 | 他の場所に入れている人は PATH 設定が必要（README 9章のFAQに記載） |
+| 登録タスクの実行コマンド | `Register-ScheduledTask` に**絶対パスが焼き込まれる** | フォルダ移動・リネーム後は `register-task.ps1` の再実行が必要（README 5章 STEP 3 の注記） |
+| 実行ユーザー | `"{USERDOMAIN}\{USERNAME}"` + LogonType S4U | ローカル/Microsoft アカウントで動作確認済み。ドメイン参加環境では未検証 |
+| ファイルのブロック印 | ZIP 配布時に Zone.Identifier が付く | `-ExecutionPolicy Bypass` で回避されるが、README に `Unblock-File` の案内を記載 |
+| 文字エンコーディング | `.ps1` は **UTF-8 with BOM**（日本語コメントを含むため） | BOM なしにすると Windows PowerShell 5.1 が ANSI と誤認しコメントが化ける。編集時は BOM を保持すること |
+
+配布物に含めないもの: `.claude/settings.local.json`（この作業環境専用の権限許可リスト。リポジトリルートの `.gitignore` で除外済み）。
