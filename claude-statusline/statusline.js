@@ -127,7 +127,7 @@ const COST_HIGH = 20;
 const colorFor = (pct) => (pct >= PCT_CRIT ? THEME.crit : pct >= PCT_WARN ? THEME.warn : THEME.ok);
 
 const write = (text) => process.stdout.write(Buffer.from(text + '\n', 'utf8'));
- 
+
 // ファイルディスクリプタ0番（fd 0 = 標準入力）の同期読み取り。End Of File まで読み切るので部分読みにならない。
 let raw = '';
 try {
@@ -161,7 +161,7 @@ const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const pad = (n) => String(n).padStart(2, '0');
 function formatReset(value) {
   if (value === null || value === undefined || value === '') return null;
-  
+
   let t;
   if (typeof value === 'number') {
     t = new Date(value * 1000);

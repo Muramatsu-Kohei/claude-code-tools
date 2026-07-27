@@ -6,7 +6,17 @@ Claude Code 用のステータスライン。コンテキスト使用率・セ�
 claude | Opus5 hi | ctx 4% 958k | $0.32 +2/-0 | 5h 26% 05:50 | 7d 7% Sat 09:00
 ```
 
-依存はありません（Node.js 標準機能のみ）。Windows / macOS / Linux で動作します。
+外部パッケージへの依存はありません（Node.js 標準機能のみ）。Windows / macOS / Linux で動作します。
+
+## 前提条件
+
+**Node.js 14 以上が必要です。** スクリプト本体は Node で動くため、Node.js 自体はインストールされている必要があります。
+
+```bash
+node --version   # v14.0.0 以上であること
+```
+
+> **注意:** Claude Code の公式インストーラは実行用のランタイムを同梱していますが、それを `node` として PATH に公開しません。**Claude Code が動いていても `node` が使えるとは限りません。** 特に WSL では入っていないことが多いので、下の「WSL で使う場合」も確認してください。`node` が無い環境では、スクリプトが起動しないため下の `(statusline: ...)` フォールバックすら表示されず、ステータスラインが無言で消えます。
 
 ## ファイル構成
 
@@ -90,6 +100,40 @@ my-statusline/
 
 このディレクトリを git リポジトリやマーケットプレイス経由で配布すると、インストール時に `user` / `project` / `local` のスコープを利用者が選べます。
 
+## WSL で使う場合
+
+WSL の中で Claude Code を動かしている場合、**WSL 側に Node.js が入っているかを必ず確認してください。** Windows 側に Node.js があっても、WSL からは `node` として見えません（見えるのは `node.exe` だけです）。この状態で `command` に `node ...` と書くと `node: command not found`（シェルによっては `Permission denied`）になり、ステータスラインが無言で消えます。
+
+```bash
+node --version   # WSL の中で実行して確認
+```
+
+**推奨: WSL 内に Node.js を入れる**
+
+```bash
+sudo apt install nodejs      # または nvm を使う
+```
+
+これで `settings.json` は「方法 1」のままそのまま動きます。
+
+**代替: Windows 側の `node.exe` を使う**
+
+WSL に Node を入れたくない場合、`wslpath` で Windows 形式のパスに変換して渡せば動きます。`node.exe` は Linux パス（`/home/...`）を解釈できないため、この変換が必須です。
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node.exe \"$(wslpath -w ~/.claude/statusline.js)\"",
+    "padding": 0
+  }
+}
+```
+
+ただし WSL → Windows のプロセス間連携（interop）を経由するため、起動が約 90ms（Windows ネイティブは約 55ms）に増えます。常用するなら WSL 内に Node を入れるほうが快適です。
+
+> **`~/.claude` は環境ごとに別物です。** Windows・WSL・macOS はそれぞれ独立したホームディレクトリを持つため、Windows と WSL の両方で Claude Code を使うなら、**両方に `statusline.js` を置いて両方の `settings.json` を設定する**必要があります。片方だけ設定しても、もう片方には反映されません。
+
 ## 動作確認
 
 設定する前に、サンプル入力を食わせて単体で動くか確認できます。
@@ -148,6 +192,7 @@ const THEME = {
 
 **ステータスラインが表示されない**
 
+- `node --version` が通りますか。**Claude Code を動かしている環境（WSL なら WSL の中）で**確認してください。`node` が無いとスクリプトが起動せず、下の `(statusline: ...)` すら出ません（「前提条件」「WSL で使う場合」参照）
 - ワークスペースの信頼ダイアログを承認しましたか。`statusLine` はシェルコマンドを実行するため hooks と同じ信頼ゲートがかかります。未承認だと空白のままで、`claude --debug` に `Status line command skipped: workspace trust not accepted` と出ます
 - 設定に `disableAllHooks: true` があるとステータスラインも無効化されます
 - `claude --debug` でセッション初回実行時の終了コードと stderr が確認できます
