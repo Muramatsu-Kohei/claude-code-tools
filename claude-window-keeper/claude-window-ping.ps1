@@ -1,4 +1,5 @@
-﻿<#
+﻿# Get-Help claude-window-ping.ps1 で表示される文字列
+<#
 .SYNOPSIS
   Keeps the Claude Code rate-limit window at a predictable start time.
 
@@ -36,6 +37,8 @@
   .\claude-window-ping.ps1            # real ping if window elapsed
   .\claude-window-ping.ps1 -Force     # real ping now
 #>
+
+# 実行時のパラメータ
 [CmdletBinding()]
 param(
     [int]$WindowMinutes = 300,
@@ -45,6 +48,7 @@ param(
     [switch]$DryRun
 )
 
+# エラーで処理中断
 $ErrorActionPreference = "Stop"
 
 $stateDir  = Join-Path $env:USERPROFILE ".claude\window-keeper"
@@ -55,18 +59,21 @@ if (-not (Test-Path $stateDir)) {
     New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 }
 
+# ログ記載用func. 追記され続ける
 function Write-Log([string]$msg) {
     $line = "{0}  {1}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"), $msg
     Add-Content -Path $logFile -Value $line
     Write-Host $line
 }
 
-# --- Load previous state ---------------------------------------------------
+# 前回のPing時間をログから復元
 $lastPing = $null
 if (Test-Path $stateFile) {
     try {
         $state = Get-Content $stateFile -Raw | ConvertFrom-Json
-        if ($state.lastPing) { $lastPing = [datetime]$state.lastPing }
+        if ($state.lastPing) { 
+            $lastPing = [datetime]$state.lastPing 
+        }
     } catch {
         Write-Log ("WARN  could not read state file: " + $_.Exception.Message)
     }
@@ -74,7 +81,7 @@ if (Test-Path $stateFile) {
 
 $now = Get-Date
 
-# --- Status-only mode ------------------------------------------------------
+# 状況確認のみ（実行時に -Status がつけられたとき）
 if ($Status) {
     if ($lastPing) {
         $elapsed = $now - $lastPing
@@ -92,32 +99,34 @@ if ($Status) {
     } else {
         Write-Host "No previous ping recorded yet."
     }
-    return
+    return # 確認のみでこれ以降の処理（Ping送信）は行わない
+    
 }
 
-# --- Decide whether to ping ------------------------------------------------
+# スキップ判定（-Force がある場合は前回からの時間に関係なくPing）
 if (-not $Force -and $lastPing) {
     $elapsed = $now - $lastPing
     if ($elapsed.TotalMinutes -lt $WindowMinutes) {
         $remain = [math]::Ceiling($WindowMinutes - $elapsed.TotalMinutes)
         Write-Log ("SKIP  {0} min since last ping (need {1}); {2} min to go" -f `
             [math]::Floor($elapsed.TotalMinutes), $WindowMinutes, $remain)
-        return
+        return # 前回から指定時間（5h = 300min）経っていなければ以降をスキップ
     }
 }
 
-# --- Send the ping ---------------------------------------------------------
+# 時限発火のシミュレーション（実行時に -DryRun がつけられたとき）
 if ($DryRun) {
     Write-Log ("DRYRUN would run: claude -p '<minimal>' --model {0} (state NOT updated)" -f $Model)
-    return
+    return # シミュレーションなのでログに残すだけでこれ以降の処理は行わない
 }
 
+# claudeコマンドの捜索
 $claude = Get-Command claude -ErrorAction SilentlyContinue
 if (-not $claude) {
-    # S4U 実行時は対話ログオン時のシェルプロファイルによる PATH 追加が読み込まれない
-    # ことがあるため、claude の代表的なインストール先を順に探してからエラーにする。
-    # 通常はレジストリの永続 User PATH に .local\bin が入っており PATH 解決できるが、
-    # 保険としてフルパスを直接叩けるようにしておく。
+    # S4U 実行時は対話ログオン時のシェルプロファイルによる PATH 追加が読み込まれない可能性あり
+    # claude の代表的なインストール先を順に探してからエラーにする
+    # 通常はレジストリの永続 User PATH に .local\bin が入っており PATH 解決できるはず
+    # 保険としてフルパスを直接叩けるようにしておく
     $candidates = @(
         (Join-Path $env:USERPROFILE ".local\bin\claude.exe"),  # ネイティブインストーラ
         (Join-Path $env:APPDATA "npm\claude.cmd")              # npm グローバル
@@ -131,6 +140,7 @@ if (-not $claude) {
     }
 }
 
+# ClaudeにPing（デフォルトではhaikuで最小限の応答で済むプロンプト）を送信
 try {
     $reply = & $claude.Source -p "Reply with only the word: ok" --model $Model 2>&1 | Out-String
     Write-Log ("PING  sent (model={0}); reply: {1}" -f $Model, ($reply.Trim() -replace '\s+', ' '))
@@ -139,7 +149,7 @@ try {
     exit 1
 }
 
-# --- Update state ----------------------------------------------------------
+# ログの更新
 $now = Get-Date
 @{ lastPing = $now.ToString("o") } | ConvertTo-Json | Set-Content -Path $stateFile
 $reset = $now.AddMinutes($WindowMinutes)
