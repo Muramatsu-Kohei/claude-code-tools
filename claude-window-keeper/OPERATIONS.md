@@ -115,7 +115,7 @@ Get-ScheduledTask -TaskName ClaudeWindowKeeper | Select-Object TaskName,State
 
 ---
 
-## 5-1. 契約プランのレート上限（Team / Standard seat, 2026-07 時点）
+## 5-1. プラン別のレート上限の目安（2026-07 時点）
 
 **重要:** Anthropic は**どのプランも「合計トークン数」での上限を公表していない**。公式は相対倍率（Pro=1x、Premium=Standard の 5x 等）と「Web/デスクトップ/Claude Code が同一枠を共有」という説明のみ。消費速度が会話長・複雑さ・モデル・機能で変動するため、固定トークン数では表現されない。
 
@@ -171,7 +171,7 @@ Get-ScheduledTask -TaskName ClaudeWindowKeeper | Select-Object TaskName,State
 - 登録済みタスクの実体: `State=Ready` / `LastTaskResult=0` / Repetition `PT1H/P3650D` /
   S4U・Limited / `NumberOfMissedRuns=0`
 - SKIP をファイルに残さない変更が有効であることをログで確認（変更後に SKIP 行の増加なし）
-- `$ErrorActionPreference` と stderr / 終了コードの挙動 → 上記「9. 配布時の前提・注意」に記録し対処済み
+- `$ErrorActionPreference` と stderr / 終了コードの挙動 → 下記「9. 配布時の前提・注意」に記録し対処済み
 
 ### つまずきポイントの記録
 
