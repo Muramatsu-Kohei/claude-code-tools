@@ -11,7 +11,7 @@ Claude Code の運用を補助する自作ツール群。各ツールは独立�
 
 ## ライセンス
 
-MIT License. 詳細は [LICENSE](LICENSE) を参照してください。リポジトリ直下の LICENSE が全体をカバーします
-(`claude-window-keeper` はフォルダ単体で配布できるよう、同じ内容の LICENSE を同梱しています)。
+MIT License. 詳細は [LICENSE](LICENSE) を参照してください。
+各ツールは単体で配布できるよう、フォルダ内にも同じ内容の LICENSE を同梱しています(意図的な複製です)。
 
 **無保証**です。Claude Code の利用上限や入力仕様は Anthropic 側の変更で変わる可能性があります。

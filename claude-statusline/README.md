@@ -26,6 +26,7 @@ node --version   # v14.0.0 以上であること
 | `settings-snippet.json` | `settings.json` に貼る設定ブロック |
 | `sample-input.json` | 動作確認用のサンプル入力（匿名化済み） |
 | `preview-colors.js` | ANSI 色見本の表示。配色を決めるとき用 |
+| `LICENSE` | MIT License |
 
 ## 表示の見方
 
@@ -82,6 +83,7 @@ my-statusline/
 ├── .claude-plugin/
 │   └── plugin.json
 ├── settings.json
+├── LICENSE
 └── scripts/
     └── statusline.js
 ```
@@ -235,3 +237,7 @@ Windows PowerShell は `-File` 実行時に stdin を自ら読み切って `$inp
 - [Customize your status line](https://code.claude.com/docs/en/statusline)
 - [Settings](https://code.claude.com/docs/en/settings)
 - [Plugins reference](https://code.claude.com/docs/en/plugins-reference)
+
+## ライセンス
+
+MIT License. 詳細は [LICENSE](./LICENSE) を参照してください。**無保証**です。
