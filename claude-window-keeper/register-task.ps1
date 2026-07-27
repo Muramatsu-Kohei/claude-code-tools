@@ -59,16 +59,24 @@ $ErrorActionPreference = "Stop"
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host "Administrator rights required. Requesting elevation (UAC prompt)..."
+
     # 昇格後の実行に引数を引き継ぐ。-NoExit は結果を読めるように昇格側の窓を残すため
     $fwd = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', ('"{0}"' -f $PSCommandPath))
+
     # 明示的に指定された引数だけを転送する（switch は値ではなく名前だけを渡す）
+    # $PSBoundParametersが実行時のオプション Key Value を自動格納する特殊変数
     foreach ($kv in $PSBoundParameters.GetEnumerator()) {
+        # [switch]の場合は -key の形式
         if ($kv.Value -is [switch]) {
-            if ($kv.Value.IsPresent) { $fwd += ('-{0}' -f $kv.Key) }
+            if ($kv.Value.IsPresent) { 
+                $fwd += ('-{0}' -f $kv.Key) 
+            }
+        # [switch]の以外は -key value の形式
         } else {
             $fwd += @(('-{0}' -f $kv.Key), ('{0}' -f $kv.Value))
         }
     }
+
     try {
         Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $fwd
         Write-Host "Elevated window launched. Check its output there, then close it."
@@ -77,6 +85,7 @@ if (-not $isAdmin) {
         Write-Host "Elevation cancelled or failed: $($_.Exception.Message)"
     }
     return # 実処理は昇格した側で行うため、この実行はここで終わり
+    # 昇格側は $isAdmin が True なので飛ばされる
 }
 
 # タスクの削除（実行時に -Unregister がつけられたとき）
@@ -106,6 +115,7 @@ $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argLine
 
 # 起動直後にウィンドウを開き直すためのログオン時トリガー
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+
 # PC を点けたままウィンドウが明けた場合に拾うための定期トリガー
 # 「今日の 0:01 に1回」を起点に指定間隔で無期限（10年）繰り返す形にしている
 $periodicTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(1) `
@@ -122,8 +132,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
 
 # S4U（「ユーザーがログオンしているかどうかにかかわらず実行する」）で動かす
-# 非対話セッションで実行されるためコンソール窓が一切出ず、-WindowStyle Hidden だけでは
-# 消せない PowerShell/conhost の一瞬のちらつきを解消できる
+# 非対話セッションで実行されるためコンソール窓が一切出ず
+# -WindowStyle Hidden だけでは消せない PowerShell/conhost の一瞬のちらつきを解消できる
 # S4U はパスワードの保存が不要（RunLevel Limited なので権限も昇格しない）
 $principal = New-ScheduledTaskPrincipal `
     -UserId ("{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME) `
