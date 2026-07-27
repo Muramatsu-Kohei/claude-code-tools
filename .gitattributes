@@ -1,0 +1,11 @@
+# 改行コードを環境に依存させないための設定。
+# 指定が無いと core.autocrlf の値次第で checkout 結果が変わり、
+# 配布物の中身が受け取った人ごとに違うことになる。
+
+# 既定はリポジトリ・作業ツリーともに LF に統一する
+* text=auto eol=lf
+
+# .ps1 は Windows 専用ツールのため CRLF で取り出す
+# （Windows PowerShell 5.1 は LF でも動くが、Windows のエディタで開いたときに崩れないようにする）
+# なお UTF-8 BOM は Git が保持するので、BOM を必須とする方針とは衝突しない
+*.ps1 text eol=crlf

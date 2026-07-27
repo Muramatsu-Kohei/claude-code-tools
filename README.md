@@ -9,14 +9,9 @@ Claude Code の運用を補助する自作ツール群。各ツールは独立�
 
 セットアップ手順は各ツールの README を参照してください。
 
-## リポジトリ構成の方針
+## ライセンス
 
-対象環境(Claude Code)ごとに 1 リポジトリとし、その中をツール単位のフォルダに分けています。
-どちらも数ファイル規模のため、リポジトリを分けずに一箇所へまとめています。
+MIT License. 詳細は [LICENSE](LICENSE) を参照してください。リポジトリ直下の LICENSE が全体をカバーします
+(`claude-window-keeper` はフォルダ単体で配布できるよう、同じ内容の LICENSE を同梱しています)。
 
-各ツールのフォルダは単体で完結しており(claude-window-keeper は LICENSE 込みでフォルダごと配布可能)、
-独立したリポジトリとして切り出したくなった場合は履歴付きのまま分離できます。
-
-```
-git subtree split --prefix=claude-statusline -b split-statusline
-```
+**無保証**です。Claude Code の利用上限や入力仕様は Anthropic 側の変更で変わる可能性があります。
