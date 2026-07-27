@@ -14,6 +14,11 @@
   last one. It is safe to run frequently (e.g. hourly from Task Scheduler);
   it will skip until the window has actually elapsed.
 
+  Logging: only meaningful events (PING / STATE / WARN / ERROR / DRYRUN) are
+  written to ping.log. The routine "SKIP" lines are printed to the console
+  only, so the log stays short. The log is rotated to ping.log.1 once it
+  exceeds 1 MB (one generation kept).
+
 .PARAMETER WindowMinutes
   Length of the rate-limit window in minutes. Default 300 (5 hours).
 
@@ -59,11 +64,22 @@ if (-not (Test-Path $stateDir)) {
     New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 }
 
-# ログ記載用func. 追記され続ける
-function Write-Log([string]$msg) {
+# ログは追記され続けるため、この大きさを超えたら 1 世代だけ退避して作り直す
+# （SKIP をファイルに残さない運用なら年に数十行程度で、通常ここには到達しない保険）
+$logMaxBytes = 1MB
+
+# ログ記載用func.
+# -ConsoleOnly を付けた呼び出しは画面表示だけで、ファイルには残さない
+function Write-Log([string]$msg, [switch]$ConsoleOnly) {
     $line = "{0}  {1}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"), $msg
-    Add-Content -Path $logFile -Value $line
     Write-Host $line
+    if ($ConsoleOnly) { return }
+
+    # 追記前にサイズを見て、超過していれば ping.log.1 へ退避（前世代は破棄）
+    if ((Test-Path $logFile) -and ((Get-Item $logFile).Length -gt $logMaxBytes)) {
+        Move-Item -Path $logFile -Destination ($logFile + ".1") -Force
+    }
+    Add-Content -Path $logFile -Value $line
 }
 
 # 前回のPing時間をログから復元
@@ -108,7 +124,8 @@ if (-not $Force -and $lastPing) {
     $elapsed = $now - $lastPing
     if ($elapsed.TotalMinutes -lt $WindowMinutes) {
         $remain = [math]::Ceiling($WindowMinutes - $elapsed.TotalMinutes)
-        Write-Log ("SKIP  {0} min since last ping (need {1}); {2} min to go" -f `
+        # SKIP は毎時発生してログの大半を占めるうえ後から読む価値がないため、画面のみ
+        Write-Log -ConsoleOnly ("SKIP  {0} min since last ping (need {1}); {2} min to go" -f `
             [math]::Floor($elapsed.TotalMinutes), $WindowMinutes, $remain)
         return # 前回から指定時間（5h = 300min）経っていなければ以降をスキップ
     }

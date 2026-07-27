@@ -135,6 +135,8 @@ State          : 255 min until next ping is due
 
 状態とログの保存先は、スクリプトの置き場所と関係なく `%USERPROFILE%\.claude\window-keeper\` です（`state.json` と `ping.log`）。
 
+`ping.log` に残るのは実際に意味のあるイベント（PING / STATE / WARN / ERROR / DRYRUN）だけです。毎時の実行で出る「まだ時間ではない」という `SKIP` は画面に表示されるだけでファイルには書かれないため、ログは年に数十行程度にしかなりません。万一 1 MB を超えた場合は `ping.log.1` に退避して新しいログを作り直します（保持は1世代のみ）。
+
 ---
 
 ## 7. 設定オプション
@@ -254,7 +256,7 @@ ping スクリプトは PATH で見つからないとき `%USERPROFILE%\.local\b
 | `ERROR 'claude' command not found in PATH.` | PowerShell で `claude --version` を確認。通らなければ Claude Code CLI を再インストールするか PATH を設定 |
 | `このシステムではスクリプトの実行が無効になっている` | 本 README のコマンド形式（`powershell -ExecutionPolicy Bypass -File ...`）で実行しているか確認 |
 | タスク登録が「アクセスが拒否されました」 | UAC のダイアログで「はい」を選ぶ（`register-task.ps1` は非管理者なら自動で昇格を要求します） |
-| 自動実行されていない | `%USERPROFILE%\.claude\window-keeper\ping.log` を確認。ログが増えていなければタスクの `State` が `Ready` か確認 |
+| 自動実行されていない | `-Status` で `Last ping` が更新されているか確認（`SKIP` はログに残らないため、ログが増えないこと自体は異常ではありません）。更新されていなければタスクスケジューラで `State` が `Ready` か、`Last Run Result` が `0x0` かを確認 |
 | Git Bash やコマンドプロンプト経由で `-File` が失敗する | Windows パスの `\` が消えることがあります。**フォワードスラッシュ `/`** でパスを書くと確実です |
 
 ---

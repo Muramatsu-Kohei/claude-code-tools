@@ -38,7 +38,8 @@ Claude Code の 5 時間セッション制限（レートリミット）のウ�
 | ファイル | 内容 |
 |---|---|
 | `state.json` | `{ "lastPing": "<ISO8601>" }` 前回送信時刻のみ |
-| `ping.log` | 実行ログ（SKIP / PING / STATE / ERROR / DRYRUN の追記） |
+| `ping.log` | 実行ログ（PING / STATE / WARN / ERROR / DRYRUN の追記）。毎時発生する `SKIP` は画面表示のみでファイルには残さない |
+| `ping.log.1` | `ping.log` が 1 MB を超えたときの退避先（1世代のみ保持、以前の内容は破棄） |
 
 ---
 
@@ -46,7 +47,7 @@ Claude Code の 5 時間セッション制限（レートリミット）のウ�
 
 1. `state.json` から `lastPing` を読む
 2. `-Status`: 前回時刻・経過・推定リセット（`lastPing + WindowMinutes`）を表示して終了（送信・更新なし）
-3. `-Force` でない かつ 経過 < `WindowMinutes` → `SKIP` ログを残して終了
+3. `-Force` でない かつ 経過 < `WindowMinutes` → `SKIP` を画面表示して終了（ファイルには残さない）
 4. `-DryRun`: 送信・状態更新をせずログのみ
 5. それ以外: `claude -p "Reply with only the word: ok" --model <Model>` を実行
 6. 成功したら `state.json` を現在時刻で更新し、推定リセット時刻をログ出力
