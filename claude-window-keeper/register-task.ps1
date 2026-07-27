@@ -1,4 +1,8 @@
-﻿<#
+﻿# Get-Help register-task.ps1 で表示される文字列
+# ↓の空行2行は必須。詰めるとコメントベースヘルプと認識されなくなる
+
+
+<#
 .SYNOPSIS
   Register (or update) a Windows Scheduled Task that runs claude-window-ping.ps1
   at logon and periodically, keeping the Claude Code rate-limit window
@@ -36,6 +40,8 @@
   .\register-task.ps1 -IntervalHours 2 -WindowMinutes 300
   .\register-task.ps1 -Unregister
 #>
+
+# 実行時のパラメータ（WindowMinutes と Model は ping スクリプトへそのまま渡す）
 [CmdletBinding()]
 param(
     [string]$TaskName = "ClaudeWindowKeeper",
@@ -45,14 +51,17 @@ param(
     [switch]$Unregister
 )
 
+# エラーで処理中断
 $ErrorActionPreference = "Stop"
 
-# Registering/unregistering a scheduled task needs admin rights on this
-# machine. If we are not elevated, relaunch this script via UAC and stop.
+# タスクの登録・削除には管理者権限が必要
+# 昇格していなければ UAC 経由で自分自身を起動し直し、この実行はここで終了する
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host "Administrator rights required. Requesting elevation (UAC prompt)..."
+    # 昇格後の実行に引数を引き継ぐ。-NoExit は結果を読めるように昇格側の窓を残すため
     $fwd = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', ('"{0}"' -f $PSCommandPath))
+    # 明示的に指定された引数だけを転送する（switch は値ではなく名前だけを渡す）
     foreach ($kv in $PSBoundParameters.GetEnumerator()) {
         if ($kv.Value -is [switch]) {
             if ($kv.Value.IsPresent) { $fwd += ('-{0}' -f $kv.Key) }
@@ -64,11 +73,13 @@ if (-not $isAdmin) {
         Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $fwd
         Write-Host "Elevated window launched. Check its output there, then close it."
     } catch {
+        # UAC で「いいえ」を選んだ場合もここに来る。異常終了ではないのでメッセージのみ
         Write-Host "Elevation cancelled or failed: $($_.Exception.Message)"
     }
-    return
+    return # 実処理は昇格した側で行うため、この実行はここで終わり
 }
 
+# タスクの削除（実行時に -Unregister がつけられたとき）
 if ($Unregister) {
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
@@ -76,39 +87,50 @@ if ($Unregister) {
     } else {
         Write-Host "No scheduled task named '$TaskName' found."
     }
-    return
+    return # 削除のみでこれ以降の処理（登録）は行わない
 }
 
+# ping スクリプトは同一フォルダにある前提で解決する
+# タスクには絶対パスが埋め込まれるため、後でフォルダを移動したら再登録が必要
 $scriptPath = Join-Path $PSScriptRoot "claude-window-ping.ps1"
 if (-not (Test-Path $scriptPath)) {
     throw "Cannot find ping script at: $scriptPath"
 }
 
+# タスクが実行するコマンドライン
+# -NoProfile はプロファイル読み込みによる遅延と副作用を避けるため
 $argLine = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -WindowMinutes {1} -Model {2}' -f `
     $scriptPath, $WindowMinutes, $Model
 
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argLine
 
+# 起動直後にウィンドウを開き直すためのログオン時トリガー
 $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+# PC を点けたままウィンドウが明けた場合に拾うための定期トリガー
+# 「今日の 0:01 に1回」を起点に指定間隔で無期限（10年）繰り返す形にしている
 $periodicTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(1) `
     -RepetitionInterval (New-TimeSpan -Hours $IntervalHours) `
     -RepetitionDuration (New-TimeSpan -Days 3650)
 
+# StartWhenAvailable: PC が停止・スリープ中に逃したトリガーを復帰後に実行する
+# バッテリー関連の2つ: ノート PC で電源に繋いでいなくても動かすため
+# ExecutionTimeLimit: claude が応答しない場合にタスクが居座らないよう10分で打ち切る
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
 
-# Run as S4U ("whether the user is logged on or not"). The task then executes in
-# a non-interactive background session, so no console window ever appears on the
-# desktop -- this is what eliminates the brief PowerShell/conhost flash that
-# -WindowStyle Hidden alone cannot suppress. S4U needs no stored password.
+# S4U（「ユーザーがログオンしているかどうかにかかわらず実行する」）で動かす
+# 非対話セッションで実行されるためコンソール窓が一切出ず、-WindowStyle Hidden だけでは
+# 消せない PowerShell/conhost の一瞬のちらつきを解消できる
+# S4U はパスワードの保存が不要（RunLevel Limited なので権限も昇格しない）
 $principal = New-ScheduledTaskPrincipal `
     -UserId ("{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME) `
     -LogonType S4U `
     -RunLevel Limited
 
+# -Force で同名タスクを上書き登録する（設定変更後の再実行やパス変更時の再登録に対応）
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $action `

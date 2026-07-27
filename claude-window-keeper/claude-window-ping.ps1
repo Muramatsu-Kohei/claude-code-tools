@@ -1,4 +1,7 @@
 ﻿# Get-Help claude-window-ping.ps1 で表示される文字列
+# ↓の空行2行は必須。詰めるとコメントベースヘルプと認識されなくなる
+
+
 <#
 .SYNOPSIS
   Keeps the Claude Code rate-limit window at a predictable start time.
