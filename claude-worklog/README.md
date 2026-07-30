@@ -262,6 +262,25 @@ worklog move --from utility --to C:\claude\ClaudeCode --session 7f285cdb
 | `worklog summarize --project <key> --session <id>` | 自動要約の本体。session-end が切り離して起動する |
 | `worklog summarize ... --dry-run` | 要約に送信される内容と文字数を課金なしで確認する |
 
+## テスト
+
+```
+node test/run.js            # 全部走らせる
+node test/run.js move       # 名前の一部で絞る
+```
+
+素の node だけで走る(`npm install` も設定も不要)。偽 `HOME` と偽リポジトリを
+`test/.tmp/` に作って動かすので、実際の `~/.claude/worklog` は触らない。
+
+| ファイル | 見ているもの |
+| --- | --- |
+| `test/transcript.test.js` | `transcript_path` の受け渡し(子ディレクトリで開いても `turns`/`edits` が入るか)、リポジトリ単位のキー |
+| `test/scope.test.js` | スコープの導出、`list --scope`、注入(引き継ぎ+索引)、`handoff <ツール名>` |
+| `test/move.test.js` | `move` の選択・生存セッションの扱い・書き戻し・引数エラー |
+
+`git` を実行できることが前提(偽リポジトリを `git init` する)。テストは実装の内部関数を
+呼ばず、コマンドの出力とログファイルの中身だけを見ている。
+
 ## おすすめの運用
 
 | 場面 | やること |
