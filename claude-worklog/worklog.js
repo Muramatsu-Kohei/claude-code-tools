@@ -506,8 +506,10 @@ function liveSessions() {
 //  SessionStart フック
 // ---------------------------------------------------------------------------
 
-// 1セッション分を注入用の 1〜2 行にする
-function renderContextLine(s) {
+// 1セッション分を注入用の 1〜2 行にする。
+// next(次にやること)は直近 1 件だけ行内に出す。それ以外は後段の「未完タスク」に集約されるため、
+// 全セッションで出すと同じ文字列が二重に入って注入量を無駄に食う。
+function renderContextLine(s, opts = {}) {
   const when = fmtTime(s.startTs);
   const branch = s.branch ? `[${s.branch}]` : '';
   const st = s.stats || {};
@@ -521,7 +523,9 @@ function renderContextLine(s) {
     ? truncate(s.summary, 90)
     : `要約なし${st.files && st.files.length ? `: ${st.files.slice(0, 3).join(', ')}` : ''}`;
   const lines = [`- ${when} ${branch} ${head}${factStr}`.replace(/\s+/g, ' ')];
-  if (s.next && s.next.length) lines.push(`    次にやる予定だったこと: ${s.next.map((n) => truncate(n, 60)).join(' / ')}`);
+  if (opts.showNext && s.next && s.next.length) {
+    lines.push(`    次にやる予定だったこと: ${s.next.map((n) => truncate(n, 60)).join(' / ')}`);
+  }
   return lines.join('\n');
 }
 
@@ -559,14 +563,16 @@ function buildContext(key, cwd, currentSid, cfg) {
   if (sessions.length) {
     const recent = sessions.slice(0, cfg.contextSessions);
     parts.push('## 直近の作業ログ (claude-worklog)');
-    parts.push(recent.map(renderContextLine).join('\n'));
+    parts.push(recent.map((s, i) => renderContextLine(s, { showNext: i === 0 })).join('\n'));
 
-    // 未完タスクは「直近セッションで next に挙がっていて、その後のセッションで
-    // done に入っていないもの」。完全な追跡は無理なので目安として出す
-    const laterDone = new Set(sessions.slice(0, cfg.contextSessions).flatMap((s) => s.done || []));
-    const pending = uniq(recent.flatMap((s) => s.next || [])).filter((n) => !laterDone.has(n));
+    // 未完タスクは「next に挙がっていて、その後のセッションで done に入っていないもの」。
+    // 完全な追跡は無理なので目安として出す。直近 1 件の next は既に行内に出ているので除く
+    const laterDone = new Set(recent.flatMap((s) => s.done || []));
+    const shown = new Set(recent[0].next || []);
+    const pending = uniq(recent.slice(1).flatMap((s) => s.next || []))
+      .filter((n) => !laterDone.has(n) && !shown.has(n));
     if (pending.length) {
-      parts.push(`\n持ち越している可能性のある未完タスク: ${pending.slice(0, 5).map((p) => truncate(p, 70)).join(' / ')}`);
+      parts.push(`\nさらに前から持ち越している可能性のある未完タスク: ${pending.slice(0, 5).map((p) => truncate(p, 70)).join(' / ')}`);
     }
   }
 
