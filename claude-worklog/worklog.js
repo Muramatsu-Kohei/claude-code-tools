@@ -1033,7 +1033,14 @@ function cmdHandoff(flags) {
   const sessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })))
     .sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
   const currentSid = one(flags, 'session', process.env.CLAUDE_CODE_SESSION_ID);
-  const h = latestHandoff(sessions.filter((s) => s.sid !== currentSid));
+  // 通常は「他のセッションが残した引き継ぎ」を見たい。ただし他に無い場合に「記録されていない」と
+  // 出るのは紛らわしいので(自分が直前に /finish で書いた場合など)、自セッションのものを注記付きで出す
+  let h = latestHandoff(sessions.filter((s) => s.sid !== currentSid));
+  let isOwn = false;
+  if (!h) {
+    h = latestHandoff(sessions);
+    isOwn = Boolean(h);
+  }
   if (!h) {
     console.log('引き継ぎ文が記録されていない。セッション終了時に /finish を実行すると記録される。');
     return;
@@ -1047,6 +1054,7 @@ function cmdHandoff(flags) {
   if (h.from.summary) console.log(dim(`前回: ${h.from.summary}`));
   console.log('');
   console.log(h.text);
+  if (isOwn) console.log(dim('\n(注: 他セッションの引き継ぎは無く、これはこのセッション自身が記録したもの)'));
   if (!h.explicit) console.log(dim('\n(/finish の引き継ぎ文ではなく「次にやること」から生成)'));
 }
 

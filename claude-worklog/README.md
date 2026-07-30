@@ -48,8 +48,20 @@ $ claude                     # 同じディレクトリで新しいセッショ�
 2. **自動＋自走(任意)** — `config.json` の `autoStartFromHandoff` を `true` にすると、
    引き継ぎが最初のユーザー発言として投入され、セッションを開いた瞬間に続きを実行し始める。
    意図しない自走は事故になり得るので既定は無効。72 時間より古い引き継ぎは自走の対象にしない。
-3. **手動** — `worklog handoff` で表示する。`worklog handoff --raw | clip` で貼り付け用に
-   クリップボードへ入るので、別マシンや別ツールへ渡せる。
+3. **手動(`/handoff`)** — セッションの途中でも引き継ぎを取り込める。現在の作業ツリーの状態と
+   食い違っていないかを確認したうえで、最初の一手を提示する。
+   別プロジェクトの引き継ぎを見たいときは `/handoff repo-F` のように引数で指定する。
+   コンテキストへ入れず文字列だけ欲しい場合は `worklog handoff --raw`
+   (Windows なら `worklog handoff --raw | clip` でクリップボードに入る)。
+
+### 自動注入が働かない条件
+
+自動(1)は次の場合に働かない。そのときは `/handoff` を使う。
+
+- **別のディレクトリ**でセッションを開いた(記録は作業ディレクトリ単位)
+- `--resume` で再開した、または `/compact` の直後(同じ会話の続きなので二重に入れない)
+- セッションを開いた**後**に、別のセッションが `/finish` で引き継ぎを書いた
+- フックを設定した直後で、まだ 1 度も記録が無い
 
 ## セットアップ
 
@@ -88,21 +100,29 @@ $ claude                     # 同じディレクトリで新しいセッショ�
 "PowerShell(node C:/絶対パス/claude-worklog/worklog.js *)"
 ```
 
-### 2. スキル(`/wrap` `/finish`)を配置する
+### 2. スキル(`/wrap` `/finish` `/handoff`)を配置する
 
-`skills/` の 2 つのフォルダを `~/.claude/skills/` にコピーする。
+`skills/` の 3 つのフォルダを `~/.claude/skills/` にコピーする。
 
 ```powershell
-Copy-Item .\skills\wrap   "$env:USERPROFILE\.claude\skills\" -Recurse -Force
-Copy-Item .\skills\finish "$env:USERPROFILE\.claude\skills\" -Recurse -Force
+Copy-Item .\skills\* "$env:USERPROFILE\.claude\skills\" -Recurse -Force
 ```
 
 ```bash
-cp -r ./skills/wrap ./skills/finish ~/.claude/skills/
+cp -r ./skills/* ~/.claude/skills/
 ```
 
-**両ファイル内の `node C:/claude/ClaudeCode/claude-worklog/worklog.js` を自分の絶対パスに
+**各ファイル内の `node C:/claude/ClaudeCode/claude-worklog/worklog.js` を自分の絶対パスに
 書き換える。**書き換えを忘れると記録コマンドが失敗する。
+
+| コマンド | 用途 |
+| --- | --- |
+| `/wrap` | 記録だけ。作業の途中でも何度でも叩ける |
+| `/finish` | 終了手続き一括(ドキュメント反映・検証・コミット・記憶更新・記録・引き継ぎ) |
+| `/handoff [プロジェクト名]` | 前セッションの引き継ぎを取り込み、現状との食い違いを確認して続きを再開する |
+
+**スキルとフックはセッション起動時に読み込まれる。**配置した直後の実行中セッションでは使えないので、
+新しいセッションを開いてから確認する。
 
 ### 3. 確認
 
@@ -196,6 +216,16 @@ worklog add --summary "一行要約"
 
 `/finish` は git を触るので打つ場所を選ぶ。1 つにまとめると「まだコミットしたくないから叩かない」
 が起きて記録が抜ける。`/wrap` は記録だけなので作業の途中でも何度でも叩ける。
+
+### なぜ引き継ぎの取り込みを `/handoff` として分けたか
+
+自動注入はセッションを**開いた瞬間**にしか働かない。しかし実際には「開いた後に別セッションが
+引き継ぎを書いた」「別のディレクトリで開いてしまった」「`--resume` で再開した」といった
+取りこぼしが起きる。そのため、いつでも手で取り込める経路を用意している。
+
+`/handoff` は取り込むだけでなく、引き継ぎが**現在の作業ツリーと食い違っていないか**を先に確認する。
+並列セッションがある環境では、引き継ぎを書いた時点と再開する時点で状態が変わっていることが
+あり、古い前提のまま進めるのが最も危険だから。
 
 ### SessionEnd が発火しない場合
 
