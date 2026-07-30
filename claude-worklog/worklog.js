@@ -789,6 +789,14 @@ function cmdSummarize(flags) {
   const digest = buildDigest(cwd, sessions, key, sid, cfg);
   if (!digest.trim()) return;
 
+  // 課金対象になる入力を目で確認できるようにする。コストが読めないと自動要約を
+  // 有効にしておく判断ができないため
+  if (one(flags, 'dry-run')) {
+    console.log(digest);
+    console.log(`\n--- 送信されるのはここまで (${digest.length} 文字 / 上限 ${cfg.digestMaxChars}) ---`);
+    return;
+  }
+
   const bin = resolveClaudeBin();
   if (!bin) {
     logError('cmdSummarize', new Error('claude 実行ファイルが見つからない(WORKLOG_CLAUDE_BIN で指定可)'));
