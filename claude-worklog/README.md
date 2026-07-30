@@ -274,6 +274,7 @@ node test/run.js move       # 名前の一部で絞る
 
 | ファイル | 見ているもの |
 | --- | --- |
+| `test/add.test.js` | `add` の引数解釈(`--` で始まる値を捨てていないか) |
 | `test/transcript.test.js` | `transcript_path` の受け渡し(子ディレクトリで開いても `turns`/`edits` が入るか)、リポジトリ単位のキー |
 | `test/scope.test.js` | スコープの導出、`list --scope`、注入(引き継ぎ+索引)、`handoff <ツール名>` |
 | `test/move.test.js` | `move` の選択・生存セッションの扱い・書き戻し・引数エラー |

@@ -190,6 +190,13 @@ const bold = (s) => (USE_COLOR ? `\x1b[1m${s}\x1b[0m` : s);
 const cyan = (s) => (USE_COLOR ? `\x1b[36m${s}\x1b[0m` : s);
 const yellow = (s) => (USE_COLOR ? `\x1b[33m${s}\x1b[0m` : s);
 
+// 値そのものが -- で始まることがある(引き継ぎ文に --to のようなオプション名を書く場合)。
+// 「次の語が -- で始まるなら値なし」と判断すると、その値が黙って捨てられて記録が欠ける。
+// フラグ名になり得る形(空白や日本語を含まない短い語)だけをフラグとして扱う
+function looksLikeFlag(s) {
+  return typeof s === 'string' && /^--[a-zA-Z][\w-]*(=|$)/.test(s);
+}
+
 // 繰り返し指定できるフラグを扱いたいので、値は常に配列で持つ
 function parseArgs(argv) {
   const flags = {};
@@ -206,7 +213,7 @@ function parseArgs(argv) {
       } else {
         name = a.slice(2);
         const next = argv[i + 1];
-        if (next != null && !next.startsWith('--')) {
+        if (next != null && !looksLikeFlag(next)) {
           value = next;
           i++;
         } else {
@@ -216,7 +223,7 @@ function parseArgs(argv) {
       (flags[name] = flags[name] || []).push(value);
     } else if (/^-[a-zA-Z]$/.test(a)) {
       const next = argv[i + 1];
-      (flags[a.slice(1)] = flags[a.slice(1)] || []).push(next != null && !next.startsWith('--') ? (i++, next) : true);
+      (flags[a.slice(1)] = flags[a.slice(1)] || []).push(next != null && !looksLikeFlag(next) ? (i++, next) : true);
     } else {
       positional.push(a);
     }
