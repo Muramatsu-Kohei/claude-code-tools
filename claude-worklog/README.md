@@ -397,8 +397,10 @@ SessionStart で「`start` はあるが `end` が無い」かつ「そのセッ�
 ## アンインストール
 
 1. `~/.claude/settings.json` の `hooks` から `SessionStart` / `SessionEnd` の該当エントリを消す
-2. `~/.claude/skills/wrap` と `~/.claude/skills/finish` を消す
-3. 記録を破棄する場合は `~/.claude/worklog/` を消す(残しておいても他に影響はない)
+   (併せて `permissions.allow` に足した `worklog.js` の 2 行も消す)
+2. `~/.claude/skills/` の `wrap` `finish` `handoff` を消す
+3. ラッパーを置いた場合は PATH 上の `worklog` と `worklog.cmd` を消す
+4. 記録を破棄する場合は `~/.claude/worklog/` を消す(残しておいても他に影響はない)
 
 ## ライセンス
 
