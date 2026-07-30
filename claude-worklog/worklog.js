@@ -469,6 +469,18 @@ function scopeOfRel(rel) {
   return CONTAINER_DIRS.has(name) && seg.length >= 3 ? `${seg[0]}/${seg[1]}` : name;
 }
 
+// 今いるディレクトリ自体がツールの中かどうか。子ディレクトリで起動したときは
+// 変更ファイルからの推測より確実なので、注入するスコープの決定に優先して使う
+function scopeOfDir(root, cwd) {
+  const rel = path.relative(root || '', normPath(cwd));
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  const seg = rel.split(path.sep).filter(Boolean);
+  if (!seg.length) return null;
+  const name = seg[0];
+  if (DENY_DIRS.has(name) || name.startsWith('.')) return null;
+  return CONTAINER_DIRS.has(name) && seg.length >= 2 ? `${seg[0]}/${seg[1]}` : name;
+}
+
 // このセッションはどのツールの作業だったか。null はリポジトリ全体の作業を意味する
 function deriveScope(session, root, multiTool) {
   if (session.scope) return session.scope; // --scope の明示指定は人の判断なので常に優先
@@ -689,6 +701,7 @@ function liveSessions() {
 function renderContextLine(s, opts = {}) {
   const when = fmtTime(s.startTs);
   const branch = s.branch ? `[${s.branch}]` : '';
+  const scope = opts.scope ? `${opts.scope}: ` : '';
   const st = s.stats || {};
   const facts = [];
   if (st.commits && st.commits.length) facts.push(`${st.commits.length} commit`);
@@ -699,11 +712,41 @@ function renderContextLine(s, opts = {}) {
   const head = s.summary
     ? truncate(s.summary, 90)
     : `要約なし${st.files && st.files.length ? `: ${st.files.slice(0, 3).join(', ')}` : ''}`;
-  const lines = [`- ${when} ${branch} ${head}${factStr}`.replace(/\s+/g, ' ')];
+  const lines = [`- ${when} ${branch} ${scope}${head}${factStr}`.replace(/\s+/g, ' ')];
   if (opts.showNext && s.next && s.next.length) {
     lines.push(`    次にやる予定だったこと: ${s.next.map((n) => truncate(n, 60)).join(' / ')}`);
   }
   return lines.join('\n');
+}
+
+// 一方が他方の中にあるか。親子で開いた 2 セッションを「同じ作業ツリー」と見なすため
+function inSameTree(a, b) {
+  const x = normPath(a);
+  const y = normPath(b);
+  if (!x || !y) return false;
+  return x === y || x.startsWith(y + path.sep) || y.startsWith(x + path.sep);
+}
+
+// 主スコープ以外で未完の作業が残っているツールを 1 行ずつ。
+// 放置されたツールが毎回並ぶのを避けるため、古いものは日数で切る
+function scopeIndex(sessions, scopes, primary, cfg) {
+  const seen = new Set();
+  const out = [];
+  const limitTs = Date.now() - cfg.scopeIndexMaxAgeDays * 86400 * 1000;
+  for (const s of sessions) { // sessions は新しい順
+    const scope = scopes.get(s.sid);
+    if (!scope || scope === primary || seen.has(scope)) continue;
+    // 未完を残さずに終えた回は飛ばし、そのツールの直近の未完まで遡る。
+    // /handoff <ツール名> が拾う引き継ぎと索引の内容を一致させるため。
+    // 片付いた作業がいつまでも並ぶのは日数上限のほうで防ぐ
+    const pending = s.handoff || (s.next && s.next.length ? s.next[0] : null);
+    if (!pending) continue;
+    seen.add(scope); // ツールごとに 1 行
+    if ((s.startTs || 0) < limitTs) continue;
+    out.push(`  ${scope} (${fmtTime(s.startTs).split(' ')[0]})  ${truncate(pending.split('\n')[0], 70)}`);
+    if (out.length >= cfg.scopeIndexMax) break;
+  }
+  return out;
 }
 
 // 「次回の始め方」を持つ直近セッションを探す。/finish が書いた引き継ぎ文が対象で、
@@ -728,19 +771,46 @@ function buildContext(key, cwd, currentSid, cfg) {
   const sessions = loadSessions(key).filter((s) => s.sid !== currentSid);
   const parts = [];
 
-  // 引き継ぎは最優先で先頭に置く。ここが読まれないと仕組み全体が意味を失う
-  const handoff = latestHandoff(sessions);
+  // どのツールの続きを渡すか。全ツール分の引き継ぎを入れると、まさに避けたかった
+  // 「無関係な引き継ぎ」が増えるだけなので、主スコープ 1 本だけを全文にする。
+  // cwd がツールの中にあるならそれが最も確実。ルートで開いたなら直近の作業に合わせる
+  const root = repoRoot(cwd);
+  const multi = isMultiTool(root, cfg);
+  const scopes = new Map(sessions.map((s) => [s.sid, multi ? scopeOf(s, cfg) : null]));
+  const primary = multi
+    ? (scopeOfDir(root, cwd) || scopes.get(sessions.length ? sessions[0].sid : null) || null)
+    : null;
+
+  // 引き継ぎは最優先で先頭に置く。ここが読まれないと仕組み全体が意味を失う。
+  // スコープなし(リポジトリ全体の作業)の記録は、どのツールを触るときも関係するので常に候補
+  const candidates = multi
+    ? sessions.filter((s) => scopes.get(s.sid) === primary || scopes.get(s.sid) == null)
+    : sessions;
+  const handoff = latestHandoff(candidates);
   if (handoff) {
-    parts.push(`## 次回の始め方 (${fmtTime(handoff.ts)} のセッションからの引き継ぎ)`);
+    const from = scopes.get(handoff.from.sid);
+    parts.push(`## 次回の始め方 (${from ? `${from} / ` : ''}${fmtTime(handoff.ts)} のセッションからの引き継ぎ)`);
     parts.push(handoff.text);
     if (!handoff.explicit) parts.push('(/finish による引き継ぎ文はないため、記録された「次にやること」から生成した)');
     parts.push('');
   }
 
+  // 他のツールに未完の作業があることだけを 1 行ずつ知らせる。全文は /handoff <ツール名> で引ける。
+  // 未完が無ければ何も出さないので、スコープの判定を外しても実害が出にくい
+  if (multi) {
+    const index = scopeIndex(sessions, scopes, primary, cfg);
+    if (index.length) {
+      parts.push('他に未完の作業があるツール:');
+      parts.push(index.join('\n'));
+      parts.push('別のツールを触るなら /handoff <ツール名> で切り替える。');
+      parts.push('');
+    }
+  }
+
   if (sessions.length) {
     const recent = sessions.slice(0, cfg.contextSessions);
     parts.push('## 直近の作業ログ (claude-worklog)');
-    parts.push(recent.map((s, i) => renderContextLine(s, { showNext: i === 0 })).join('\n'));
+    parts.push(recent.map((s, i) => renderContextLine(s, { showNext: i === 0, scope: scopes.get(s.sid) })).join('\n'));
 
     // 未完タスクは「next に挙がっていて、その後のセッションで done に入っていないもの」。
     // 完全な追跡は無理なので目安として出す。直近 1 件の next は既に行内に出ているので除く
@@ -756,12 +826,17 @@ function buildContext(key, cwd, currentSid, cfg) {
   // 並列セッションの取り違えが今回いちばん困っている点なので、同じ作業ツリーで他に
   // 動いているセッションがあれば明示する(同じファイルを同時に触る事故の予防)。
   // 別プロジェクトのセッションは対処のしようがないため、あえて出さない(注入量を節約する)
-  const sameCwd = liveSessions()
+  // 完全一致ではなく前方一致で見る。「親で 1 つ、子で 1 つ」という最も事故りやすい
+  // 組み合わせが、完全一致では警告されないため
+  const sameTree = liveSessions()
     .filter((s) => s.sessionId !== currentSid)
-    .filter((s) => s.cwd && cwd && path.resolve(s.cwd) === path.resolve(cwd));
-  if (sameCwd.length) {
-    const names = sameCwd.map((s) => `${s.name || s.sessionId.slice(0, 8)}(pid ${s.pid})`).join(', ');
-    parts.push(`\n注意: 同じディレクトリで別の Claude Code セッションが稼働中: ${names}。同じファイルの同時編集に注意すること。`);
+    .filter((s) => inSameTree(s.cwd, cwd));
+  if (sameTree.length) {
+    const names = sameTree.map((s) => {
+      const where = normPath(s.cwd) === normPath(cwd) ? '' : ` (${s.cwd})`;
+      return `${s.name || s.sessionId.slice(0, 8)}(pid ${s.pid})${where}`;
+    }).join(', ');
+    parts.push(`\n注意: 同じ作業ツリーで別の Claude Code セッションが稼働中: ${names}。同じファイルの同時編集に注意すること。`);
   }
 
   if (!parts.length) return null;
@@ -1223,14 +1298,15 @@ function cmdLive() {
     const summary = rec && rec.summary ? ` ${dim(`直近の記録: ${truncate(rec.summary, 50)}`)}` : '';
     console.log(`  ${status} ${cyan(s.name || s.sessionId.slice(0, 8))} ${s.cwd || '?'} ${dim(`pid ${s.pid} / ${elapsed}`)}${summary}`);
   }
-  // 同一ディレクトリでの並列は編集衝突の原因になるので目立たせる
-  const byCwd = new Map();
+  // 同じ作業ツリーでの並列は編集衝突の原因になるので目立たせる。
+  // ディレクトリ単位ではなくリポジトリ単位で数える(親で 1 つ・子で 1 つが最も危ない)
+  const byRoot = new Map();
   for (const s of live) {
-    const c = path.resolve(s.cwd || '?');
-    byCwd.set(c, (byCwd.get(c) || 0) + 1);
+    const r = repoRoot(s.cwd || '') || '?';
+    byRoot.set(r, (byRoot.get(r) || 0) + 1);
   }
-  for (const [c, n] of byCwd) {
-    if (n > 1) console.log(yellow(`  ! ${c} で ${n} セッションが並列稼働中`));
+  for (const [r, n] of byRoot) {
+    if (n > 1) console.log(yellow(`  ! ${r} で ${n} セッションが並列稼働中`));
   }
 }
 
@@ -1245,10 +1321,21 @@ function cmdContext(flags) {
 
 // 引き継ぎ文だけを取り出す。別セッションや別マシンへ手で渡したいとき用。
 // Windows なら `worklog handoff | clip` でそのままクリップボードに入る。
-function cmdHandoff(flags) {
+function cmdHandoff(flags, scopeArg) {
+  const cfg = loadConfig();
   const keys = resolveTargetKeys(flags);
-  const sessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })))
+  let sessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })))
     .sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
+  // 位置引数でツールを指定して引き継ぎを切り替える(注入される索引から辿るための入口)
+  const scope = scopeArg || one(flags, 'scope');
+  if (typeof scope === 'string') {
+    const hit = sessions.filter((s) => matchScope(s, scope, cfg));
+    if (!hit.length) {
+      console.log(`スコープ「${scope}」の記録がない。worklog list --all で確認する。`);
+      return;
+    }
+    sessions = hit;
+  }
   const currentSid = one(flags, 'session', process.env.CLAUDE_CODE_SESSION_ID);
   // 通常は「他のセッションが残した引き継ぎ」を見たい。ただし他に無い場合に「記録されていない」と
   // 出るのは紛らわしいので(自分が直前に /finish で書いた場合など)、自セッションのものを注記付きで出す
@@ -1267,7 +1354,7 @@ function cmdHandoff(flags) {
     console.log(h.text);
     return;
   }
-  console.log(`${bold(`次回の始め方 (${fmtTime(h.ts)} / ${displayName(h.from, loadConfig()) || shortProject(keys[0])})`)}`);
+  console.log(`${bold(`次回の始め方 (${fmtTime(h.ts)} / ${displayName(h.from, cfg) || shortProject(keys[0])})`)}`);
   if (h.from.summary) console.log(dim(`前回: ${h.from.summary}`));
   console.log('');
   console.log(h.text);
@@ -1325,7 +1412,9 @@ function cmdHelp() {
   worklog today [--days N] [--verbose]
                           今日(または直近 N 日)の作業を全プロジェクト横断で表示
   worklog live            起動中のセッションと並列状況を表示
-  worklog handoff [--raw] 前セッションが残した「次回の始め方」を表示
+  worklog handoff [<ツール名>] [--raw]
+                          前セッションが残した「次回の始め方」を表示。ツール名を
+                          付けるとそのスコープの引き継ぎに切り替える
                           (Windows なら worklog handoff --raw | clip で貼り付け用にコピー)
   worklog context         次セッションに注入されるテキストを確認
   worklog export [--all] [--since YYYY-MM-DD] > WORKLOG.md
@@ -1366,7 +1455,7 @@ function safeJson(s) {
 function main() {
   const argv = process.argv.slice(2);
   const cmd = argv[0] || 'help';
-  const { flags } = parseArgs(argv.slice(1));
+  const { flags, positional } = parseArgs(argv.slice(1));
 
   switch (cmd) {
     case 'session-start': return cmdSessionStart(flags);
@@ -1376,7 +1465,7 @@ function main() {
     case 'list': case 'ls': return cmdList(flags);
     case 'today': return cmdToday(flags);
     case 'live': return cmdLive(flags);
-    case 'handoff': return cmdHandoff(flags);
+    case 'handoff': return cmdHandoff(flags, positional[0]);
     case 'context': return cmdContext(flags);
     case 'export': return cmdExport(flags);
     case 'help': case '--help': case '-h': return cmdHelp();
