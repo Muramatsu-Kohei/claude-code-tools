@@ -231,7 +231,7 @@ function foldSessions(records) {
     if (!map.has(sid)) {
       map.set(sid, {
         sid,
-        startTs: null, endTs: null, cwd: null, branch: null, head: null, source: null,
+        startTs: null, endTs: null, cwd: null, branch: null, head: null, source: null, tp: null,
         summary: null, summarySource: null,
         done: [], next: [], docs: [], handoff: null,
         stats: null, reason: null, aiTitle: null, autoSummary: null,
@@ -253,6 +253,7 @@ function foldSessions(records) {
         if (s.source == null) s.source = r.source || null;
         s.cwd = r.cwd || s.cwd;
         s.branch = r.branch || s.branch;
+        s.tp = r.tp || s.tp; // 会話ログの実パス(compact 後の再開でも同じファイルを指す)
         break;
       case 'note':
         // 同一セッションで複数回 /wrap を打てる。要約は最後のものを採り、
@@ -357,8 +358,22 @@ function gitDelta(cwd, startHead) {
   return { head, commits, files: uniq(files).slice(0, 30), dirty: Boolean(st) };
 }
 
-function transcriptPathFor(key, sid) {
-  return path.join(PROJECTS_DIR, key, `${sid}.jsonl`);
+// 会話ログの場所。フック入力の transcript_path が唯一確実な情報源なので、あればそれを使う。
+// 無い場合(フック導入前の古いレコード、手動実行)は Claude Code の命名規則で組み立てる。
+// このキーは cwd 由来でなければならない — Claude Code 側のディレクトリ名は cwd から作られる
+// ため、記録用のプロジェクトキーと一致するとは限らない。
+function transcriptPathFor(tp, cwd, sid) {
+  if (tp && typeof tp === 'string') return tp;
+  return path.join(PROJECTS_DIR, projectKey(cwd || ''), `${sid}.jsonl`);
+}
+
+// フック入力 > コマンドライン の順で会話ログのパスを取る。
+// 値なしフラグ(--transcript 単独)は true になるため文字列だけを通す
+function transcriptFrom(input, flags) {
+  for (const v of [input && input.transcript_path, one(flags, 'transcript')]) {
+    if (typeof v === 'string' && v) return v;
+  }
+  return null;
 }
 
 // ユーザーの「本当の指示」だけを取り出したい。会話ログには以下が同じ type:'user' で混ざる:
@@ -449,8 +464,8 @@ function parseTranscript(p) {
 }
 
 // end レコードに載せる統計をまとめる
-function buildEndStats(cwd, key, sid, startHead, startTs) {
-  const tr = parseTranscript(transcriptPathFor(key, sid));
+function buildEndStats(cwd, tp, sid, startHead, startTs) {
+  const tr = parseTranscript(transcriptPathFor(tp, cwd, sid));
   const delta = gitDelta(cwd, startHead);
   const endTs = Date.now();
   return {
@@ -605,7 +620,7 @@ function finalizeDangling(key, currentSid, cwd) {
   const open = loadSessions(key).filter((s) => !s.endTs && s.sid !== currentSid && !liveSids.has(s.sid));
   for (const s of open) {
     try {
-      const built = buildEndStats(s.cwd || cwd, key, s.sid, s.head, s.startTs);
+      const built = buildEndStats(s.cwd || cwd, s.tp, s.sid, s.head, s.startTs);
       appendRecord(key, {
         k: 'end', sid: s.sid, ts: built.transcript.lastTs || Date.now(),
         reason: 'abandoned', // 正規の終了フックを踏んでいないことを残す
@@ -641,9 +656,13 @@ function cmdSessionStart(flags) {
   const sid = input.session_id || one(flags, 'session', process.env.CLAUDE_CODE_SESSION_ID) || 'unknown';
   const key = projectKey(cwd);
   const source = input.source || 'startup';
+  // 会話ログのパスはフックからしか確実に取れない(cwd から組み立てる推測は
+  // サブディレクトリで起動されると外れる)。ここで拾って start に残しておき、
+  // 終了時・要約時・後追い確定時はこれを使う
+  const tp = transcriptFrom(input, flags);
 
   appendRecord(key, {
-    k: 'start', sid, ts: Date.now(), cwd,
+    k: 'start', sid, ts: Date.now(), cwd, tp,
     branch: gitBranch(cwd), head: gitHead(cwd), source,
   });
 
@@ -695,7 +714,9 @@ function cmdSessionEnd(flags) {
   const reason = input.reason || one(flags, 'reason', 'unknown');
 
   const prior = loadSessions(key).find((s) => s.sid === sid);
-  const built = buildEndStats(cwd, key, sid, prior && prior.head, prior && prior.startTs);
+  // フック入力を優先。start レコードの tp は SessionStart が発火しなかった場合に無い
+  const tp = transcriptFrom(input, flags) || (prior && prior.tp) || null;
+  const built = buildEndStats(cwd, tp, sid, prior && prior.head, prior && prior.startTs);
 
   appendRecord(key, {
     k: 'end', sid, ts: Date.now(), reason,
@@ -706,18 +727,18 @@ function cmdSessionEnd(flags) {
   // /wrap や /finish で手書き要約が既にあるなら、自動要約は不要(質も劣る)
   const hasNote = Boolean(prior && prior.noteTs);
   if (cfg.autoSummary && !hasNote && worthSummarizing(built.stats)) {
-    spawnSummarizer(key, sid, cwd);
+    spawnSummarizer(key, sid, cwd, tp);
   }
   process.stdout.write(JSON.stringify({ suppressOutput: true }));
 }
 
 // 要約は claude の起動を待つ必要があり、フック内で待つと終了が遅れて体感を悪くする。
 // 完全に切り離した子プロセスに投げ、親(フック)は即座に終わる。
-function spawnSummarizer(key, sid, cwd) {
+function spawnSummarizer(key, sid, cwd, tp) {
   try {
-    const child = spawn(process.execPath, [
-      __filename, 'summarize', '--project', key, '--session', sid, '--cwd', cwd,
-    ], { detached: true, stdio: 'ignore', windowsHide: true });
+    const args = [__filename, 'summarize', '--project', key, '--session', sid, '--cwd', cwd];
+    if (tp) args.push('--transcript', tp); // 子プロセスはフック入力を持たないので明示的に渡す
+    const child = spawn(process.execPath, args, { detached: true, stdio: 'ignore', windowsHide: true });
     child.unref();
   } catch (e) {
     logError('spawnSummarizer', e);
@@ -760,9 +781,9 @@ const SUMMARY_PROMPT = [
 ].join('\n');
 
 // 会話全体を渡すと入力が数百KBになり課金が読めないため、要約に効く部分だけを抜いて詰める
-function buildDigest(cwd, sessions, key, sid, cfg) {
+function buildDigest(cwd, sessions, tp, sid, cfg) {
   const s = sessions.find((x) => x.sid === sid) || {};
-  const tr = parseTranscript(transcriptPathFor(key, sid));
+  const tr = parseTranscript(transcriptPathFor(tp || s.tp, s.cwd || cwd, sid));
   const st = s.stats || {};
   const lines = [];
   lines.push(`プロジェクト: ${cwd}${s.branch ? ` (branch ${s.branch})` : ''}`);
@@ -786,11 +807,12 @@ function cmdSummarize(flags) {
   const key = one(flags, 'project');
   const sid = one(flags, 'session');
   const cwd = one(flags, 'cwd', process.cwd());
+  const tp = transcriptFrom(null, flags);
   if (!key || !sid) throw new Error('summarize には --project と --session が必要');
 
   const sessions = loadSessions(key);
   if (sessions.find((s) => s.sid === sid && s.noteTs)) return; // 途中で /wrap されていたら不要
-  const digest = buildDigest(cwd, sessions, key, sid, cfg);
+  const digest = buildDigest(cwd, sessions, tp, sid, cfg);
   if (!digest.trim()) return;
 
   // 課金対象になる入力を目で確認できるようにする。コストが読めないと自動要約を
@@ -1131,7 +1153,7 @@ function cmdHelp() {
 フック(settings.json から呼ばれる。手で叩く必要はない):
   worklog session-start   stdin にフック JSON。start を記録し過去ログを注入
   worklog session-end     stdin にフック JSON。統計を確定し自動要約を起動
-  worklog summarize --project <key> --session <id> [--cwd <path>]
+  worklog summarize --project <key> --session <id> [--cwd <path>] [--transcript <path>]
 
 保存先: ${LOG_DIR}
 設定:   ${CONFIG_PATH}
