@@ -1,0 +1,6 @@
+#!/bin/sh
+# claude-worklog の短縮ラッパー(Git Bash / sh 用)。
+# PATH の通ったディレクトリに置くと `worklog today` のように短く叩ける。
+# cmd / PowerShell 側は同じディレクトリの worklog.cmd が使われる。
+# 配置後、worklog.js のパスを自分の環境に合わせて書き換えること。
+exec node "C:/claude/ClaudeCode/claude-worklog/worklog.js" "$@"

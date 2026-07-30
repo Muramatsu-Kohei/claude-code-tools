@@ -127,7 +127,26 @@ cp -r ./skills/* ~/.claude/skills/
 **スキルとフックはセッション起動時に読み込まれる。**配置した直後の実行中セッションでは使えないので、
 新しいセッションを開いてから確認する。
 
-### 3. 確認
+### 3. `worklog` コマンドを使えるようにする(任意)
+
+毎回 `node <長いパス>/worklog.js` と打つのは現実的でないので、`bin/` のラッパーを
+**PATH の通ったディレクトリ**(例: `~/.local/bin`)にコピーし、中の `worklog.js` の
+パスを自分の環境に書き換える。
+
+```
+cp bin/worklog bin/worklog.cmd ~/.local/bin/
+chmod +x ~/.local/bin/worklog
+```
+
+拡張子なしの `worklog` が Git Bash 用、`worklog.cmd` が cmd / PowerShell 用。
+Windows は拡張子なしのファイルを実行できず、Git Bash は `.cmd` の呼び出しが素直でないため、
+同名で 2 つ置いて使う側に選ばせている。
+
+`worklog.cmd` のコメントを ASCII だけで書いているのは意図的。cmd は `.cmd` を
+OEM コードページ(日本語環境では CP932)で読むため、UTF-8 の日本語コメントが化けて
+コマンドとして解釈され、実行するたびに構文エラーが出る。
+
+### 4. 確認
 
 新しいセッションを開き、以下が動けば設定できている。
 
@@ -142,7 +161,8 @@ worklog context   # 次セッションに注入されるテキスト
 
 ## コマンド
 
-`node <path>/worklog.js <サブコマンド>` で実行する。以下は `worklog` に短縮して記載。
+ラッパーを配置済みなら `worklog <サブコマンド>`、していなければ
+`node <path>/worklog.js <サブコマンド>` で実行する。以下は `worklog` と記載。
 
 ### 閲覧
 
