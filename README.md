@@ -6,6 +6,7 @@ Claude Code の運用を補助する自作ツール群。各ツールは独立�
 | --- | --- |
 | [claude-statusline](claude-statusline/) | コンテキスト使用率・セッションコスト・プラン利用枠を 1 行に収めて常時表示するステータスライン(Node.js 標準機能のみ、依存なし) |
 | [claude-window-keeper](claude-window-keeper/) | 5 時間ごとの利用上限ウィンドウの開始時刻を固定し、リセット時刻を予測できるようにする(PowerShell + タスクスケジューラ) |
+| [claude-worklog](claude-worklog/) | セッションごとの作業記録を自動で溜め、次のセッションに引き継ぐ。`/wrap` `/finish` と SessionStart/SessionEnd フック(Node.js 標準機能のみ、依存なし) |
 
 セットアップ手順は各ツールの README を参照してください。
 
