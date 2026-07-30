@@ -256,11 +256,15 @@ function foldSessions(records) {
         break;
       case 'note':
         // 同一セッションで複数回 /wrap を打てる。要約は最後のものを採り、
-        // 済み・次・ドキュメントは積み上げる(途中の区切りも記録として残したいため)
+        // 済み・ドキュメントは積み上げる(途中の区切りも起きた事実として残したいため)
         if (r.summary) { s.summary = r.summary; s.summarySource = r.via || 'wrap'; s.noteTs = r.ts; }
         s.done = uniq([...s.done, ...(r.done || [])]);
-        s.next = uniq([...s.next, ...(r.next || [])]);
         s.docs = uniq([...s.docs, ...(r.docs || [])]);
+        // 「次にやること」は積み上げず、挙げられていれば最新のものに置き換える。
+        // 残作業は時間とともに減る・書き換わるもので、/wrap を複数回打つと同じ項目が
+        // 並んで引き継ぎが読めなくなるため。空(--next 指定なし)のときは前回の内容を
+        // 残す — 要約だけ書き足した区切りで残作業が消えるほうが害が大きい
+        if (r.next && r.next.length) s.next = uniq(r.next);
         // 引き継ぎ文は積み上げず最後のものだけを残す。「次はここから」は
         // 常に最新の 1 つだけが正しく、古いものが混ざると誤誘導になるため
         if (r.handoff) s.handoff = r.handoff;
