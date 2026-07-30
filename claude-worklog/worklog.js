@@ -117,7 +117,9 @@ function appendRecord(key, rec) {
   fs.appendFileSync(logPath(key), `${JSON.stringify(rec)}\n`, 'utf8');
 }
 
-function readRecords(key) {
+// 行の原文を保ったまま読む。move がファイルを書き戻すとき、壊れた行や将来の
+// 未知の行を取りこぼさずに残すため(JSON にできない行も原文のまま持ち回る)
+function readRawLines(key) {
   let raw;
   try {
     raw = fs.readFileSync(logPath(key), 'utf8');
@@ -128,13 +130,14 @@ function readRecords(key) {
   for (const line of raw.split('\n')) {
     const t = line.trim();
     if (!t) continue;
-    try {
-      out.push(JSON.parse(t));
-    } catch {
-      // 壊れた行は捨てる。1行の破損で全履歴を失わないため
-    }
+    out.push({ text: t, rec: safeJson(t) });
   }
   return out;
+}
+
+function readRecords(key) {
+  // 壊れた行(rec === null)は捨てる。1行の破損で全履歴を失わないため
+  return readRawLines(key).map((l) => l.rec).filter(Boolean);
 }
 
 function listProjectKeys() {
@@ -1406,6 +1409,114 @@ function cmdExport(flags) {
   process.stdout.write(out.join('\n'));
 }
 
+// ---------------------------------------------------------------------------
+//  記録の引っ越し
+// ---------------------------------------------------------------------------
+
+// キー指定を 1 つに解決する。完全一致 > 部分一致の順。既存キーに当たらないときは
+// パスとして解釈する(allowNew。まだ記録のない移動先を --to に書けるようにするため)
+function resolveMoveKey(spec, allowNew) {
+  const all = listProjectKeys();
+  if (all.includes(spec)) return spec;
+  const hit = all.filter((k) => k.toLowerCase().includes(spec.toLowerCase()));
+  if (hit.length === 1) return hit[0];
+  if (hit.length > 1) throw new Error(`「${spec}」は ${hit.length} 件のプロジェクトに一致する: ${hit.join(', ')}`);
+  if (!allowNew) throw new Error(`「${spec}」に一致するプロジェクトがない。worklog list --all で確認する`);
+  // 既存キーに当たらなかったのでパス扱いにする。打ち間違いがそのまま新しいキーに
+  // なってしまうため、ディスク上に無いことだけは伝える(消えたディレクトリの
+  // 記録を移す正当な用途もあるのでエラーにはしない)
+  const key = repoKey(spec);
+  if (!existsSafe(normPath(spec))) console.log(yellow(`! 移動先 ${spec} はディスク上に無い。新しいキー ${key} を作る`));
+  return key;
+}
+
+// ディレクトリの改名・移動でキーが変わると、それ以前の記録が今のキーから見えなくなる。
+// その孤児をまとめて今のキーへ移す。レコード内の cwd は「どこで実行されたか」という
+// 事実なので書き換えない(スコープは読み取り時に導出されるため移動後も正しく付く)
+function cmdMove(flags) {
+  const fromSpec = one(flags, 'from');
+  const toSpec = one(flags, 'to');
+  if (typeof fromSpec !== 'string' || typeof toSpec !== 'string') {
+    console.error('使い方: worklog move --from <部分一致> --to <部分一致|パス> (--all | --session <id>) [--dry-run] [--force]');
+    process.exitCode = 1;
+    return;
+  }
+  const from = resolveMoveKey(fromSpec, false);
+  const to = resolveMoveKey(toSpec, true);
+  if (from === to) {
+    console.error(`移動元と移動先が同じキー(${from})になっている。`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const raw = readRawLines(from);
+  if (!raw.length) {
+    console.error(`${from} に記録がない。`);
+    process.exitCode = 1;
+    return;
+  }
+  const sessions = foldSessions(raw.map((l) => l.rec).filter(Boolean));
+
+  const sidSpecs = many(flags, 'session');
+  const wantAll = Boolean(one(flags, 'all', false));
+  if (!wantAll && !sidSpecs.length) {
+    console.error('--all(ファイル内の全セッション)か --session <id>(繰り返し可・先頭一致)を指定する。');
+    process.exitCode = 1;
+    return;
+  }
+  // セッション ID は長いので先頭一致で受ける(一覧の 8 桁表示をそのまま貼れる)
+  const selected = wantAll
+    ? sessions
+    : sessions.filter((s) => sidSpecs.some((spec) => s.sid.startsWith(spec)));
+  const unknown = sidSpecs.filter((spec) => !sessions.some((s) => s.sid.startsWith(spec)));
+  if (unknown.length) {
+    console.error(`${from} に無いセッション: ${unknown.join(', ')}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // 生存セッションを移すと、あとで SessionEnd が古いキー側へ end を書き、start の無い
+  // 断片が残る(foldSessions は種類を問わず sid でエントリを作るので、開始時刻不明の
+  // セッションとして一覧に現れる)。既定では外し、--force で押し切れるようにする
+  const force = Boolean(one(flags, 'force', false));
+  const liveSids = new Set(liveSessions().map((s) => s.sessionId));
+  const skipped = force ? [] : selected.filter((s) => liveSids.has(s.sid));
+  const moving = selected.filter((s) => !skipped.includes(s));
+  const movingSids = new Set(moving.map((s) => s.sid));
+  const isMoving = (l) => Boolean(l.rec) && movingSids.has(l.rec.sid);
+  // 壊れた行と sid の無い行は畳み込みに現れないので、選択されず自動的に元へ残る
+  const moveLines = raw.filter(isMoving).map((l) => l.text);
+  const keepLines = raw.filter((l) => !isMoving(l)).map((l) => l.text);
+
+  const dryRun = Boolean(one(flags, 'dry-run', false));
+  console.log(bold(`${dryRun ? '[dry-run] ' : ''}${from} → ${to}`));
+  for (const s of moving) {
+    console.log(`  移動 ${fmtTime(s.startTs)} ${cyan(s.sid.slice(0, 8))} ${truncate(s.summary || '(要約なし)', 50)}`);
+  }
+  for (const s of skipped) {
+    console.log(yellow(`  スキップ(起動中) ${fmtTime(s.startTs)} ${s.sid.slice(0, 8)} — 移すには --force`));
+  }
+  if (!moving.length) {
+    console.error('移動できる記録がない。');
+    process.exitCode = 1;
+    return;
+  }
+  console.log(dim(`  ${moving.length} セッション / ${moveLines.length} レコードを移す(元に残るのは ${keepLines.length} レコード)`));
+  if (dryRun) return;
+
+  // 先に追記し、成功してから元を削る。途中で失敗したとき、記録が消えるより
+  // 重複して残るほうが復旧しやすいため(重複は移動先を手で直せば済む)
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  fs.appendFileSync(logPath(to), `${moveLines.join('\n')}\n`, 'utf8');
+  if (keepLines.length) {
+    fs.writeFileSync(logPath(from), `${keepLines.join('\n')}\n`, 'utf8');
+  } else {
+    fs.rmSync(logPath(from));
+    console.log(dim(`  空になった ${path.basename(logPath(from))} を削除した`));
+  }
+  console.log('完了。worklog list で確認する。');
+}
+
 function cmdHelp() {
   console.log(`claude-worklog - Claude Code のセッション作業ログ
 
@@ -1424,6 +1535,13 @@ function cmdHelp() {
   worklog context         次セッションに注入されるテキストを確認
   worklog export [--all] [--since YYYY-MM-DD] > WORKLOG.md
                           Markdown に書き出す
+
+保守:
+  worklog move --from <部分一致> --to <部分一致|パス> (--all | --session <id>)
+               [--dry-run] [--force]
+                          ディレクトリの改名・移動で見えなくなった記録を今の
+                          プロジェクトへ引っ越す。起動中セッションの記録は
+                          既定で外す(--force で押し切る)。まず --dry-run で確認する
 
 記録(通常は /wrap・/finish 経由で呼ばれる):
   worklog add --summary "一行要約" [--done "..."] [--next "..."] [--doc "..."]
@@ -1474,6 +1592,7 @@ function main() {
     case 'handoff': return cmdHandoff(flags, positional[0]);
     case 'context': return cmdContext(flags);
     case 'export': return cmdExport(flags);
+    case 'move': return cmdMove(flags);
     case 'help': case '--help': case '-h': return cmdHelp();
     default:
       console.error(`不明なコマンド: ${cmd}`);
