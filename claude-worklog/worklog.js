@@ -63,6 +63,10 @@ const DEFAULT_CONFIG = {
   // 意図せず作業が走るのは事故になり得るので既定は false(コンテキストに入れるだけ)。
   autoStartFromHandoff: false,
   handoffMaxAgeHours: 72,  // 古すぎる引き継ぎは自動投入しない(状況が変わっているため)
+  // スコープ(1リポジトリ内のツール単位)の扱い。'auto' は自動判定、'off'/'on' で上書きする
+  scopeMode: 'auto',
+  scopeIndexMax: 3,          // 引き継ぎの索引に出す他スコープの最大件数
+  scopeIndexMaxAgeDays: 14,  // これより古い未完は索引に出さない(放置分が毎回並ぶのを防ぐ)
 };
 
 // ---------------------------------------------------------------------------
@@ -241,7 +245,7 @@ function foldSessions(records) {
       map.set(sid, {
         sid,
         startTs: null, endTs: null, cwd: null, branch: null, head: null, source: null, tp: null,
-        summary: null, summarySource: null,
+        summary: null, summarySource: null, scope: null,
         done: [], next: [], docs: [], handoff: null,
         stats: null, reason: null, aiTitle: null, autoSummary: null,
         noteTs: null,
@@ -278,6 +282,8 @@ function foldSessions(records) {
         // 引き継ぎ文は積み上げず最後のものだけを残す。「次はここから」は
         // 常に最新の 1 つだけが正しく、古いものが混ざると誤誘導になるため
         if (r.handoff) s.handoff = r.handoff;
+        // --scope の明示指定。自動導出より優先されるので、最後に指定されたものを残す
+        if (r.scope) s.scope = r.scope;
         break;
       case 'auto':
         s.autoSummary = r.summary || s.autoSummary;
@@ -383,6 +389,131 @@ function gitDelta(cwd, startHead) {
   }
 
   return { head, commits, files: uniq(files).slice(0, 30), dirty: Boolean(st) };
+}
+
+// ---------------------------------------------------------------------------
+//  スコープ(1リポジトリ内のツール単位)
+//
+//  repo-A のように 1 リポジトリへ複数のツールが同居する構成では、プロジェクト単位の記録が
+//  混ざって読めなくなる。そこで最上位ディレクトリ名をスコープとして扱う。
+//  要点は「リポジトリが複数ツール構成かの判定」と「セッションがどのツールの作業だったかの
+//  判定」を分けること。前者は目印ファイル、後者は変更ファイル数で決める。目印でセッションを
+//  分類すると、README をまだ持たない開発中のツール —— つまり今いちばん触っているもの ——
+//  だけが分類されない、という逆の結果になる。
+//
+//  スコープはレコードに保存せず読み取り時に導出する(--scope の明示指定だけは保存する)。
+//  判定材料は既存レコードに揃っているので、後からツールが増えたり判定式を直したりしたときに
+//  過去のセッションにも遡ってラベルが付く。backfill が要らない。
+// ---------------------------------------------------------------------------
+
+// ディレクトリが「独立したツール」であることの目印
+const MARKERS = ['README.md', 'package.json', 'pyproject.toml', 'Cargo.toml', 'go.mod', 'LICENSE'];
+
+// ツール名になり得ない最上位ディレクトリ(リポジトリ共通の置き場)
+const DENY_DIRS = new Set(['docs', 'doc', 'test', 'tests', 'src', 'lib', 'bin', 'scripts',
+  'assets', 'images', 'dist', 'build', 'obj', 'out', 'target', 'legal', 'shared', 'common',
+  'tmp', 'temp', 'node_modules', '.git', '.github', '.vscode', '.claude']);
+
+// 中身が個々のツールである入れ物。2 階層目までをスコープ名にする(例: tools/tool-d)
+const CONTAINER_DIRS = new Set(['tools', 'packages', 'apps', 'projects', 'crates', 'services']);
+
+const MULTI_TOOL_MIN = 2;
+
+function readdirSafe(dir) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
+function existsSafe(p) {
+  try {
+    fs.accessSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// 目印ファイルを持つ最上位ディレクトリが 2 つ以上あればスコープを有効にする。
+// fs を見るのはルート直下(と入れ物ディレクトリの直下)だけなので安価。1 コマンド内で使い回す。
+const multiToolCache = new Map();
+
+function isMultiTool(root, cfg) {
+  if (cfg.scopeMode === 'off') return false;
+  if (cfg.scopeMode === 'on') return true;
+  if (!root) return false;
+  if (multiToolCache.has(root)) return multiToolCache.get(root);
+
+  let n = 0;
+  for (const e of readdirSafe(root)) {
+    if (DENY_DIRS.has(e) || e.startsWith('.')) continue;
+    const dirs = CONTAINER_DIRS.has(e) ? readdirSafe(path.join(root, e)).map((x) => `${e}/${x}`) : [e];
+    for (const d of dirs) {
+      if (MARKERS.some((m) => existsSafe(path.join(root, d, m)))) { n++; break; }
+    }
+    if (n >= MULTI_TOOL_MIN) break;
+  }
+  const hit = n >= MULTI_TOOL_MIN;
+  multiToolCache.set(root, hit);
+  return hit;
+}
+
+// リポジトリルート相対のパスからスコープ名を取る。ルート直下のファイルは候補にしない
+function scopeOfRel(rel) {
+  const seg = String(rel || '').split('/').filter(Boolean);
+  if (seg.length < 2) return null;
+  const name = seg[0];
+  if (DENY_DIRS.has(name) || name.startsWith('.')) return null;
+  return CONTAINER_DIRS.has(name) && seg.length >= 3 ? `${seg[0]}/${seg[1]}` : name;
+}
+
+// このセッションはどのツールの作業だったか。null はリポジトリ全体の作業を意味する
+function deriveScope(session, root, multiTool) {
+  if (session.scope) return session.scope; // --scope の明示指定は人の判断なので常に優先
+  if (!multiTool) return null;
+
+  const st = session.stats || {};
+  let rels = st.files && st.files.length ? st.files.slice() : [];
+  if (!rels.length) {
+    // start レコードが無いセッションでは git 差分が取れず files が空になる。
+    // 会話ログ由来の editedFiles(絶対パス)から補う。スクラッチパッドなど
+    // リポジトリ外のパスが混ざるので、ルート配下のものだけを拾う
+    for (const abs of st.editedFiles || []) {
+      const r = path.relative(root, normPath(abs));
+      if (r && !r.startsWith('..') && !path.isAbsolute(r)) rels.push(r.split(path.sep).join('/'));
+    }
+  }
+
+  const count = new Map();
+  const lastIdx = new Map();
+  rels.forEach((rel, i) => {
+    const name = scopeOfRel(rel);
+    if (!name) return;
+    count.set(name, (count.get(name) || 0) + 1);
+    lastIdx.set(name, i); // 同数のときは後に出てくる(= より新しく触った)ほうを採る
+  });
+  if (!count.size) return null;
+
+  return [...count.entries()]
+    .sort((a, b) => b[1] - a[1] || (lastIdx.get(b[0]) || 0) - (lastIdx.get(a[0]) || 0))[0][0];
+}
+
+// セッションのスコープ。cwd から git ルートを引いて判定する
+function scopeOf(session, cfg) {
+  const root = repoRoot(session && session.cwd);
+  if (!root) return session && session.scope ? session.scope : null;
+  return deriveScope(session, root, isMultiTool(root, cfg));
+}
+
+// 一覧・注入で使う表示名。キーは非英数字を潰してあり分割できない(ハイフンを含む
+// ディレクトリ名で壊れる)ので、記録に残っている cwd から作る
+function displayName(session, cfg) {
+  const root = repoRoot(session && session.cwd);
+  const repo = root ? path.basename(root) : shortProject(session && session.project);
+  const scope = scopeOf(session, cfg);
+  return scope ? `${repo}/${scope}` : repo;
 }
 
 // 会話ログの場所。フック入力の transcript_path が唯一確実な情報源なので、あればそれを使う。
@@ -958,7 +1089,11 @@ function renderSession(s, opts = {}) {
   // 手書き(wrap/finish)は無印、自動要約は "~"、Claude Code の自動タイトル流用は "?" を付けて
   // 情報の確度を見分けられるようにする。`??` なのは無印が空文字で falsy になるため
   const src = { wrap: '', finish: '', auto: '~', title: '?' }[s.summarySource] ?? '';
-  const proj = opts.showProject && s.project ? ` ${cyan(shortProject(s.project))}` : '';
+  // 複数プロジェクトを混ぜて出すときは「リポジトリ/ツール」、単一プロジェクトの一覧では
+  // ツール名だけを出す(単一ツールのリポジトリでは何も出ない)
+  const cfg = opts.cfg || loadConfig();
+  const label = opts.showProject ? displayName(s, cfg) : scopeOf(s, cfg);
+  const proj = label ? ` ${cyan(label)}` : '';
   const branch = s.branch ? dim(` [${s.branch}]`) : '';
   const summary = s.summary ? `${src}${s.summary}` : dim('(要約なし)');
 
@@ -993,6 +1128,19 @@ function shortProject(key) {
   return parts.slice(-1)[0] || key;
 }
 
+// キーは非英数字を潰してあり元のディレクトリ名を復元できない。同じキーの記録に残る cwd から引く
+function repoLabel(key, sessions) {
+  const s = (sessions || []).find((x) => x.project === key && x.cwd);
+  const root = s ? repoRoot(s.cwd) : '';
+  return root ? path.basename(root) : shortProject(key);
+}
+
+// --scope は部分一致(手で打つときに楽なため)。大文字小文字は無視する
+function matchScope(session, needle, cfg) {
+  const scope = scopeOf(session, cfg);
+  return Boolean(scope) && scope.toLowerCase().includes(String(needle).toLowerCase());
+}
+
 function resolveTargetKeys(flags) {
   if (flags.all) return listProjectKeys();
   const explicit = one(flags, 'project');
@@ -1010,20 +1158,28 @@ function cmdList(flags) {
   const n = Number(one(flags, 'n', 10)) || 10;
   const verbose = Boolean(one(flags, 'verbose', flags.v ? true : false));
   const showProject = keys.length > 1;
+  const cfg = loadConfig();
+  const scopeFilter = one(flags, 'scope');
 
-  const sessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })))
-    .sort((a, b) => (b.startTs || 0) - (a.startTs || 0))
+  const all = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })))
+    .sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
+  // 絞り込みは件数制限より前に掛ける(直近 n 件の中から探すのでは取りこぼす)
+  const sessions = (typeof scopeFilter === 'string' ? all.filter((s) => matchScope(s, scopeFilter, cfg)) : all)
     .slice(0, n);
 
   if (!sessions.length) {
-    console.log('記録がまだない。フックを設定したか、対象プロジェクトが合っているか確認する。');
+    console.log(typeof scopeFilter === 'string'
+      ? `スコープ「${scopeFilter}」に一致する記録がない。`
+      : '記録がまだない。フックを設定したか、対象プロジェクトが合っているか確認する。');
     return;
   }
-  console.log(bold(showProject ? '直近の作業ログ (全プロジェクト)' : `直近の作業ログ (${keys.map(shortProject).join(', ')})`));
-  for (const s of sessions) console.log(renderSession(s, { verbose, showProject }));
+  const where = showProject ? '全プロジェクト' : keys.map((k) => repoLabel(k, all)).join(', ');
+  console.log(bold(`直近の作業ログ (${where}${typeof scopeFilter === 'string' ? ` / scope ${scopeFilter}` : ''})`));
+  for (const s of sessions) console.log(renderSession(s, { verbose, showProject, cfg }));
 }
 
 function cmdToday(flags) {
+  const cfg = loadConfig();
   const keys = flags.project ? resolveTargetKeys(flags) : listProjectKeys();
   const days = Number(one(flags, 'days', 1)) || 1;
   const since = new Date();
@@ -1046,9 +1202,9 @@ function cmdToday(flags) {
       console.log(`\n${bold(day)}`);
       currentDay = day;
     }
-    console.log(renderSession(s, { showProject: true, verbose: Boolean(one(flags, 'verbose', false)) }));
+    console.log(renderSession(s, { showProject: true, verbose: Boolean(one(flags, 'verbose', false)), cfg }));
   }
-  const projects = uniq(sessions.map((s) => shortProject(s.project)));
+  const projects = uniq(sessions.map((s) => displayName(s, cfg)));
   console.log(`\n${dim(`${sessions.length} セッション / ${projects.length} プロジェクト: ${projects.join(', ')}`)}`);
 }
 
@@ -1111,7 +1267,7 @@ function cmdHandoff(flags) {
     console.log(h.text);
     return;
   }
-  console.log(`${bold(`次回の始め方 (${fmtTime(h.ts)} / ${shortProject(h.from.project || keys[0])})`)}`);
+  console.log(`${bold(`次回の始め方 (${fmtTime(h.ts)} / ${displayName(h.from, loadConfig()) || shortProject(keys[0])})`)}`);
   if (h.from.summary) console.log(dim(`前回: ${h.from.summary}`));
   console.log('');
   console.log(h.text);
@@ -1120,6 +1276,7 @@ function cmdHandoff(flags) {
 }
 
 function cmdExport(flags) {
+  const cfg = loadConfig();
   const keys = flags.all ? listProjectKeys() : resolveTargetKeys(flags);
   const sinceStr = one(flags, 'since');
   const from = sinceStr ? Date.parse(sinceStr) : null;
@@ -1142,7 +1299,7 @@ function cmdExport(flags) {
       day = d;
     }
     const st = s.stats || {};
-    out.push(`### ${fmtTime(s.startTs)} ${shortProject(s.project)}${s.branch ? ` [${s.branch}]` : ''}`);
+    out.push(`### ${fmtTime(s.startTs)} ${displayName(s, cfg)}${s.branch ? ` [${s.branch}]` : ''}`);
     out.push('');
     out.push(`- 要約: ${s.summary || '(なし)'}${s.summarySource === 'auto' ? ' (自動生成)' : s.summarySource === 'title' ? ' (自動タイトル)' : ''}`);
     if (s.done && s.done.length) out.push(`- やったこと:\n${s.done.map((x) => `  - ${x}`).join('\n')}`);
@@ -1161,8 +1318,10 @@ function cmdHelp() {
   console.log(`claude-worklog - Claude Code のセッション作業ログ
 
 閲覧:
-  worklog list [--project <名前>|--all] [-n 10] [--verbose]
+  worklog list [--project <名前>|--all] [--scope <名前>] [-n 10] [--verbose]
                           直近のセッションを一覧(既定は現在のディレクトリのプロジェクト)
+                          プロジェクトは git リポジトリ単位。--scope でリポジトリ内の
+                          ツール(例: claude-worklog)に絞る
   worklog today [--days N] [--verbose]
                           今日(または直近 N 日)の作業を全プロジェクト横断で表示
   worklog live            起動中のセッションと並列状況を表示
@@ -1185,6 +1344,8 @@ function cmdHelp() {
 保存先: ${LOG_DIR}
 設定:   ${CONFIG_PATH}
         autoSummary / summaryModel / contextSessions / contextMaxChars
+        scopeMode: 'auto' はリポジトリ直下に目印ファイル(README.md など)を持つ
+        ディレクトリが2つ以上あるときスコープを有効にする。'off'/'on' で固定できる
         autoStartFromHandoff: true にすると、新セッション開始時に引き継ぎを
         最初の発言として自動投入し、前回の続きから動き出す(既定 false)
 `);
