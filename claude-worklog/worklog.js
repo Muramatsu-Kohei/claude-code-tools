@@ -88,10 +88,19 @@ function logError(where, err) {
   }
 }
 
+// パス表記の揺れはそのままキーの分裂になる(非英数字を潰すだけなので、ドライブ文字の
+// 大小・末尾のスラッシュ・相対表記が別プロジェクト扱いになってしまう)。キーを作る前に必ず通す。
+function normPath(p) {
+  const s = String(p == null ? '' : p).trim();
+  if (!s) return '';
+  const r = path.resolve(s);
+  return /^[a-z]:/.test(r) ? r[0].toUpperCase() + r.slice(1) : r;
+}
+
 // cwd からログのファイル名を作る。Claude Code が projects/ 配下で使う変換と同じ規則にして
 // おくと、トランスクリプトのパスをそのまま導出できる。例: C:\claude\ClaudeCode -> C--claude-ClaudeCode
 function projectKey(cwd) {
-  return String(cwd || '').replace(/[^a-zA-Z0-9]/g, '-');
+  return normPath(cwd).replace(/[^a-zA-Z0-9]/g, '-');
 }
 
 function logPath(key) {
@@ -331,6 +340,22 @@ function gitHead(cwd) {
   return git(cwd, ['rev-parse', 'HEAD']);
 }
 
+// 作業の単位はディレクトリではなくリポジトリ。親で開いても子で開いても同じプロジェクトに
+// 記録されるよう、キーは git のルートから作る。git 管理外なら従来どおり cwd。
+// git の起動は 1 回 5〜50ms 掛かるうえフックは毎回叩かれるので、プロセス内で覚えておく。
+const repoRootCache = new Map();
+
+function repoRoot(cwd) {
+  const base = normPath(cwd);
+  if (!base) return '';
+  if (!repoRootCache.has(base)) repoRootCache.set(base, normPath(git(base, ['rev-parse', '--show-toplevel']) || base));
+  return repoRootCache.get(base);
+}
+
+function repoKey(cwd) {
+  return projectKey(repoRoot(cwd));
+}
+
 // セッション開始時の HEAD から現在までの「やったこと」を git 側から見る
 function gitDelta(cwd, startHead) {
   const head = gitHead(cwd);
@@ -344,7 +369,9 @@ function gitDelta(cwd, startHead) {
   // 未追跡ファイルはこれに出ないので porcelain から補う
   const files = [];
   if (startHead) {
-    const diff = git(cwd, ['diff', '--name-only', startHead]);
+    // --no-relative: diff.relative=true の設定下でも、サブディレクトリからの実行で
+    // パスがリポジトリルート相対のまま返るようにする(status --porcelain と揃える)
+    const diff = git(cwd, ['diff', '--name-only', '--no-relative', startHead]);
     if (diff) files.push(...diff.split('\n').map((l) => l.trim()).filter(Boolean));
   }
   const st = git(cwd, ['status', '--porcelain']);
@@ -654,7 +681,7 @@ function cmdSessionStart(flags) {
   const input = safeJson(readStdin()) || {};
   const cwd = input.cwd || one(flags, 'cwd', process.cwd());
   const sid = input.session_id || one(flags, 'session', process.env.CLAUDE_CODE_SESSION_ID) || 'unknown';
-  const key = projectKey(cwd);
+  const key = repoKey(cwd);
   const source = input.source || 'startup';
   // 会話ログのパスはフックからしか確実に取れない(cwd から組み立てる推測は
   // サブディレクトリで起動されると外れる)。ここで拾って start に残しておき、
@@ -710,7 +737,7 @@ function cmdSessionEnd(flags) {
   const input = safeJson(readStdin()) || {};
   const cwd = input.cwd || one(flags, 'cwd', process.cwd());
   const sid = input.session_id || one(flags, 'session', process.env.CLAUDE_CODE_SESSION_ID) || 'unknown';
-  const key = projectKey(cwd);
+  const key = repoKey(cwd);
   const reason = input.reason || one(flags, 'reason', 'unknown');
 
   const prior = loadSessions(key).find((s) => s.sid === sid);
@@ -877,7 +904,7 @@ function resolveSid(flags, key) {
 
 function cmdAdd(flags) {
   const cwd = one(flags, 'cwd', process.cwd());
-  const key = projectKey(cwd);
+  const key = repoKey(cwd);
   const sid = resolveSid(flags, key);
   if (!sid) {
     console.error('セッションを特定できなかった。--session <id> を指定するか、フックが動いているか確認する。');
@@ -973,9 +1000,9 @@ function resolveTargetKeys(flags) {
     // 完全なキーでも部分一致でも受ける(手で打つときに楽なため)
     const all = listProjectKeys();
     const hit = all.filter((k) => k === explicit || k.toLowerCase().includes(explicit.toLowerCase()));
-    return hit.length ? hit : [projectKey(explicit)];
+    return hit.length ? hit : [repoKey(explicit)];
   }
-  return [projectKey(one(flags, 'cwd', process.cwd()))];
+  return [repoKey(one(flags, 'cwd', process.cwd()))];
 }
 
 function cmdList(flags) {
@@ -1033,7 +1060,7 @@ function cmdLive() {
   }
   console.log(bold(`起動中のセッション (${live.length})`));
   for (const s of live) {
-    const key = projectKey(s.cwd || '');
+    const key = repoKey(s.cwd || '');
     const rec = loadSessions(key).find((x) => x.sid === s.sessionId);
     const elapsed = s.startedAt ? fmtDuration(Date.now() - s.startedAt) : '';
     const status = s.status === 'busy' ? yellow('busy') : dim(s.status || '?');
@@ -1054,7 +1081,7 @@ function cmdLive() {
 function cmdContext(flags) {
   const cfg = loadConfig();
   const cwd = one(flags, 'cwd', process.cwd());
-  const key = projectKey(cwd);
+  const key = repoKey(cwd);
   const sid = one(flags, 'session', process.env.CLAUDE_CODE_SESSION_ID);
   const ctx = buildContext(key, cwd, sid, cfg);
   console.log(ctx ? ctx.text : '(注入できる履歴がない)');
