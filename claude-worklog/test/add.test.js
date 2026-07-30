@@ -42,4 +42,15 @@ check('要約が入る', note.summary === '引数解釈の確認', JSON.stringif
 const verbose = run(['list', '--all', '--verbose', '-n', '1']).out;
 check('値なしフラグは次のフラグを飲み込まない', verbose.includes('done:'), verbose);
 
+// --project は summarize だけ生の値がそのままパスになる。LOG_DIR の外へ出られないこと。
+// summarize はフック経路なので例外は表に出さず errors.log に残して exit 0 になる
+const escape = run(['summarize', '--project', '../../escaped', '--session', SID, '--dry-run']);
+check('フック経路なので exit 0 のまま', escape.code === 0, `code=${escape.code} ${escape.err}`);
+check('要約の中身を出力しない', !escape.out.includes('送信されるのはここまで'), escape.out);
+const errLog = fs.existsSync(path.join(logDir, 'errors.log'))
+  ? fs.readFileSync(path.join(logDir, 'errors.log'), 'utf8') : '';
+check('不正なキーとして errors.log に残る', errLog.includes('--project が不正'), errLog || '(errors.log なし)');
+check('LOG_DIR の外にファイルを作らない',
+  !fs.existsSync(path.join(home, '.claude', 'escaped.ndjson')) && !fs.existsSync(path.join(home, 'escaped.ndjson')));
+
 finish();

@@ -48,10 +48,15 @@ function sidsIn(key) {
   return (lines(key) || []).map((l) => { try { return JSON.parse(l).sid; } catch { return '?'; } });
 }
 
-// 起動中セッションの一覧に偽の 1 件を置く。pid の生存確認が走るので自分の pid を使う
-function fakeLive(sid, pid) {
-  fs.writeFileSync(path.join(SESSIONS_DIR, '1.json'),
-    JSON.stringify({ pid: pid == null ? process.pid : pid, sessionId: sid, kind: 'interactive', status: 'idle' }), 'utf8');
+// 起動中セッションの一覧に偽の 1 件を置く。pid の生存確認が走るので自分の pid を使う。
+// cwd を渡さない場合は「移動元プロジェクトで稼働中」の判定に引っかからない
+// (対象セッションを選択から外す挙動だけを切り離して見たいため)
+function fakeLive(sid, opts = {}) {
+  fs.writeFileSync(path.join(SESSIONS_DIR, '1.json'), JSON.stringify({
+    pid: opts.pid == null ? process.pid : opts.pid,
+    sessionId: sid, kind: 'interactive', status: 'idle',
+    ...(opts.cwd ? { cwd: opts.cwd } : {}),
+  }), 'utf8');
 }
 
 // --- 1. dry-run は何も書かない -------------------------------------------------
@@ -75,6 +80,8 @@ check('元に A は残っていない', !sidsIn('C--claude-utility').includes(SI
 check('元に B は残る', sidsIn('C--claude-utility').filter((s) => s === SID_B).length === 3);
 check('壊れた行と sid なし行は元に残る', (lines('C--claude-utility') || []).length === 5, JSON.stringify(lines('C--claude-utility')));
 check('元ファイルは残る', lines('C--claude-utility') !== null);
+// 書き戻しは一時ファイル経由(rename)。置き換えたあとに残骸を残さない
+check('一時ファイルを残さない', !fs.readdirSync(logDir).some((f) => f.endsWith('.tmp')), fs.readdirSync(logDir).join(','));
 check('移動先の一覧に A が出る', run(['list', '--project', 'C--claude-ClaudeCode', '-n', '10']).out.includes('A の作業'));
 check('cwd は書き換えない', fs.readFileSync(path.join(logDir, 'C--claude-ClaudeCode.ndjson'), 'utf8').includes('C:\\\\claude\\\\utility'));
 
@@ -109,9 +116,26 @@ check('選択が全部生存中なら exit 1', r.code === 1, `code=${r.code} ${r
 check('移動先は無変更', (lines('C--claude-ClaudeCode') || []).length === 2);
 
 reset();
-fakeLive(SID_B, 999999); // 落ちたプロセスの残骸
+fakeLive(SID_B, { pid: 999999 }); // 落ちたプロセスの残骸
 r = run(['move', '--from', 'utility', '--to', 'ClaudeCode', '--session', 'bbbbbbbb']);
 check('死んだ pid は無視して移動', r.code === 0 && sidsIn('C--claude-ClaudeCode').includes(SID_B), r.err + r.out);
+
+// --- 4b. 移動元プロジェクトで別セッションが稼働中なら実行しない -------------------
+// 読んでから書き戻すまでの間に追記された行が失われるため
+reset();
+console.log('4b. 移動元で別セッションが稼働中');
+fakeLive('zzzz-0000', { cwd: 'C:\\claude\\utility' }); // 移動対象ではないが同じプロジェクト
+r = run(['move', '--from', 'utility', '--to', 'ClaudeCode', '--all']);
+check('稼働中なら exit 1', r.code === 1, `code=${r.code} ${r.out}`);
+check('理由を説明する', r.err.includes('稼働中') && r.err.includes('失われる'), r.err);
+check('何も書き換えない', (lines('C--claude-utility') || []).length === 8 && (lines('C--claude-ClaudeCode') || []).length === 2);
+r = run(['move', '--from', 'utility', '--to', 'ClaudeCode', '--all', '--force']);
+check('--force なら実行できる', r.code === 0 && sidsIn('C--claude-ClaudeCode').includes(SID_A), r.err + r.out);
+// 呼び出し元セッション自身は実行中に追記しないので止めない
+reset();
+fakeLive('self-1234', { cwd: 'C:\\claude\\utility' });
+r = run(['move', '--from', 'utility', '--to', 'ClaudeCode', '--all'], { env: { CLAUDE_CODE_SESSION_ID: 'self-1234' } });
+check('自分自身のセッションは止めない', r.code === 0 && sidsIn('C--claude-ClaudeCode').includes(SID_A), r.err + r.out);
 
 // --- 5. 引数のエラー ----------------------------------------------------------
 reset();
