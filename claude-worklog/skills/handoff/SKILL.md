@@ -17,11 +17,13 @@ disable-model-invocation: true
 
 ## 手順
 
-1. `ARGUMENTS` にプロジェクト名が指定されている場合は、そのプロジェクトの引き継ぎを取り直す。
-   指定が無ければ上の内容をそのまま使う。
+1. `ARGUMENTS` に名前が指定されている場合は、その引き継ぎを取り直す。指定が無ければ上の内容を
+   そのまま使う。**同じリポジトリ内の別ツール**(注入テキストの「他に未完の作業があるツール」に
+   並んでいたもの)なら位置引数、別リポジトリなら `--project` を使う。
 
    ```
-   node C:/claude/ClaudeCode/claude-worklog/worklog.js handoff --project <名前>
+   node C:/claude/ClaudeCode/claude-worklog/worklog.js handoff <ツール名>
+   node C:/claude/ClaudeCode/claude-worklog/worklog.js handoff --project <プロジェクト名>
    ```
 
 2. 引き継ぎが記録されていない場合は、その事実を伝えて終わる。**勝手に別の作業を始めないこと。**

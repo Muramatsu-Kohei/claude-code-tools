@@ -1,7 +1,6 @@
-# スコープ対応 使い方(予定)
+# スコープ(1リポジトリの中のツール単位)の使い方
 
-`claude-worklog` に「1リポジトリの中のツール単位」を導入する計画の、利用者向けの説明。
-**まだ実装していない。**実装仕様は [scope-spec.md](scope-spec.md)。
+`claude-worklog` の「1リポジトリの中のツール単位」の説明。実装仕様は [scope-spec.md](scope-spec.md)。
 
 ---
 
@@ -45,16 +44,17 @@
 ## 新しいセッションで注入されるもの
 
 ```
-前回: claude-worklog に短縮ラッパーを同梱し、README 整備と next 重複の修正
-  [claude-worklog / 07-30]
-  まず worklog today --days 7 を叩き、~ 印の件数を数える。
-  作業ツリーは clean。main から 8 コミット、push なし。
+## 次回の始め方 (claude-worklog / 07/30 14:02 のセッションからの引き継ぎ)
+まず worklog today --days 7 を叩き、~ 印の件数を数える。
+作業ツリーは clean。main から 8 コミット、push なし。
 
 他に未完の作業があるツール:
-  claude-statusline (07-28)  WSL 手順の追記が途中
-  claude-window-keeper (07-25)  常駐時の CPU 使用率の確認待ち
-
+  claude-statusline (07/28)  WSL 手順の追記が途中
+  claude-window-keeper (07/25)  常駐時の CPU 使用率の確認待ち
 別のツールを触るなら /handoff <ツール名> で切り替える。
+
+## 直近の作業ログ (claude-worklog)
+- 07/30 14:02 [main] claude-worklog: 短縮ラッパーを同梱し README を整備 (8 commit, 13 files)
 ```
 
 - **全文は1本だけ。**全ツール分を入れると「無関係な引き継ぎ」が増えるだけなので入れない

@@ -1137,15 +1137,20 @@ function cmdAdd(flags) {
     appendRecord(key, { k: 'start', sid, ts: Date.now(), cwd, branch: gitBranch(cwd), head: gitHead(cwd), source: 'backfilled' });
   }
 
+  // --scope は自動導出を上書きする。人の判断のほうが正しいので、指定があれば保存して常に優先する
+  const scope = one(flags, 'scope');
+
   appendRecord(key, {
     k: 'note', sid, ts: Date.now(),
     via: one(flags, 'via', 'wrap'),
     summary: summary || null,
     done, next, docs,
     handoff: handoff || null,
+    ...(typeof scope === 'string' && scope ? { scope } : {}),
   });
 
   const bits = [];
+  if (typeof scope === 'string' && scope) bits.push(`スコープ ${scope}`);
   if (summary) bits.push(`要約「${truncate(summary, 40)}」`);
   if (done.length) bits.push(`済み ${done.length} 件`);
   if (next.length) bits.push(`次 ${next.length} 件`);
@@ -1423,7 +1428,8 @@ function cmdHelp() {
 記録(通常は /wrap・/finish 経由で呼ばれる):
   worklog add --summary "一行要約" [--done "..."] [--next "..."] [--doc "..."]
               [--handoff "次回の始め方(繰り返し指定で複数行)"] [--handoff-stdin]
-              [--session <id>] [--via wrap|finish]
+              [--session <id>] [--via wrap|finish] [--scope <ツール名>]
+                          --scope は自動判定(変更ファイルの多いディレクトリ)を上書きする
 
 フック(settings.json から呼ばれる。手で叩く必要はない):
   worklog session-start   stdin にフック JSON。start を記録し過去ログを注入
