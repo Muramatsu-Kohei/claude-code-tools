@@ -1,0 +1,830 @@
+'use strict';
+// usage.jsonl を集計し、「5時間枠を何回使い切ったら週次(7日)枠に当たるか」を推定する。
+//
+// 考え方: 5時間枠の到達幅(five_pct の最大−最小)と、その間に週次枠が進んだ幅
+// (seven_pct の最後−最初)には比例関係があるはずなので、原点を通る線形回帰で
+// 「5h枠を100%まで使い切ったら7dが何%進むか」の傾きを推定する。その逆数が
+// 「週次枠に当たるまでの5h枠満タン回数」。
+//
+// collect.js / statusline.js は動作確認済みなので変更しない。ここは読み取り専用の
+// 集計ツールで、外部パッケージには依存しない(Node 標準ライブラリのみ)。
+
+const fs = require('fs');
+const path = require('path');
+
+// ---------------------------------------------------------------------------
+// 定数
+// ---------------------------------------------------------------------------
+
+// five_pct の到達幅がこれ未満の window は、傾き推定に対してノイズが大きすぎるので
+// 回帰からは除外する(ただし一覧には出す)。値そのものは要件で指定された既定値。
+const MIN_FIVE_RANGE_FOR_REGRESSION = 5;
+
+const HOME = process.env.USERPROFILE || process.env.HOME || '.';
+const DEFAULT_LOG = path.join(HOME, '.claude', 'usage-tracker', 'usage.jsonl');
+
+// ---------------------------------------------------------------------------
+// CLI 引数
+// ---------------------------------------------------------------------------
+
+function parseArgs(argv) {
+  const opts = { log: DEFAULT_LOG, html: null, json: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--log') opts.log = argv[++i];
+    else if (a === '--html') opts.html = argv[++i];
+    else if (a === '--json') opts.json = true;
+    // 未知の引数は無視する。フラグの追加で古い呼び出しを壊さないため。
+  }
+  // --html 省略時は「ログと同じ usage-tracker ディレクトリ配下の report.html」。
+  // --log を差し替えても、その隣に出す方が使いやすいのでログのディレクトリに合わせる。
+  if (!opts.html) opts.html = path.join(path.dirname(opts.log), 'report.html');
+  return opts;
+}
+
+// ---------------------------------------------------------------------------
+// 数値・日時ヘルパー
+// ---------------------------------------------------------------------------
+
+const isNum = (v) => typeof v === 'number' && isFinite(v);
+
+// five_reset / seven_reset は実測では Unix epoch 秒(数値)だが、将来 ISO8601 文字列
+// で来る可能性も考えて両対応にする。どちらも「その瞬間」を表す ms 値に正規化し、
+// 数値表現・文字列表現のどちらで来ても同じ window として束ねられるようにする。
+function normalizeResetMs(v) {
+  if (v == null) return null;
+  if (typeof v === 'number' && isFinite(v)) return v * 1000;
+  if (typeof v === 'string') {
+    const t = Date.parse(v);
+    return isFinite(t) ? t : null;
+  }
+  return null;
+}
+
+function fmtPct(v, digits = 1) {
+  return v == null ? '—' : `${v.toFixed(digits)}%`;
+}
+
+function fmtDateTime(ms) {
+  if (ms == null || !isFinite(ms)) return '—';
+  return new Date(ms).toLocaleString('ja-JP', {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit',
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 読み込み・パース
+// ---------------------------------------------------------------------------
+
+function loadRows(logPath) {
+  let text;
+  try {
+    text = fs.readFileSync(logPath, 'utf8');
+  } catch (e) {
+    return { rows: [], totalLines: 0, skipped: 0, readError: e.message };
+  }
+
+  const lines = text.split('\n').filter((l) => l.trim() !== '');
+  const rows = [];
+  let skipped = 0;
+
+  for (const line of lines) {
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      skipped++;
+      continue;
+    }
+    const tsMs = Date.parse(obj.ts);
+    if (!isFinite(tsMs)) {
+      // ts が読めない行は時系列に置けないので集計に使えない。
+      skipped++;
+      continue;
+    }
+    rows.push({
+      tsMs,
+      five_pct: isNum(obj.five_pct) ? obj.five_pct : null,
+      five_reset_ms: normalizeResetMs(obj.five_reset),
+      seven_pct: isNum(obj.seven_pct) ? obj.seven_pct : null,
+      seven_reset_ms: normalizeResetMs(obj.seven_reset),
+      model: obj.model || null,
+    });
+  }
+
+  rows.sort((a, b) => a.tsMs - b.tsMs);
+  return { rows, totalLines: lines.length, skipped, readError: null };
+}
+
+// ---------------------------------------------------------------------------
+// window(5時間枠)への集約
+// ---------------------------------------------------------------------------
+
+function buildWindows(rows) {
+  // five_reset_ms が同じ行の集まりが1つの window。Map は挿入順を保持するので、
+  // rows が ts 昇順である限り、window も自然に時系列順になる。
+  const map = new Map();
+
+  for (const r of rows) {
+    // five_reset が読めない行は「どの window か」を確定できないので 'unknown' に
+    // まとめる。実運用ではまず起きないはずだが、集計を壊さないための保険。
+    const key = r.five_reset_ms == null ? 'unknown' : String(r.five_reset_ms);
+    let w = map.get(key);
+    if (!w) {
+      w = {
+        fiveResetMs: r.five_reset_ms,
+        startMs: r.tsMs,
+        endMs: r.tsMs,
+        rowCount: 0,
+        fiveMin: null,
+        fiveMax: null,
+        sevenFirst: null,
+        sevenLast: null,
+        sevenResetFirst: r.seven_reset_ms,
+        crossedWeeklyReset: false,
+        models: new Map(),
+      };
+      map.set(key, w);
+    }
+
+    w.endMs = r.tsMs;
+    w.rowCount++;
+
+    if (r.five_pct != null) {
+      w.fiveMin = w.fiveMin == null ? r.five_pct : Math.min(w.fiveMin, r.five_pct);
+      w.fiveMax = w.fiveMax == null ? r.five_pct : Math.max(w.fiveMax, r.five_pct);
+    }
+    if (r.seven_pct != null) {
+      if (w.sevenFirst == null) w.sevenFirst = r.seven_pct;
+      w.sevenLast = r.seven_pct;
+    }
+    // seven_reset が window の途中で変わった = 週次枠がリセットされた瞬間を跨いだ。
+    // このとき seven_pct の増分は「リセット後の低い値 − リセット前の高い値」で
+    // 負に振れて回帰を汚すので、あとでフラグとして落とす。
+    if (r.seven_reset_ms != null) {
+      if (w.sevenResetFirst == null) w.sevenResetFirst = r.seven_reset_ms;
+      else if (w.sevenResetFirst !== r.seven_reset_ms) w.crossedWeeklyReset = true;
+    }
+
+    const modelKey = r.model || '不明';
+    w.models.set(modelKey, (w.models.get(modelKey) || 0) + 1);
+  }
+
+  const windows = [];
+  for (const w of map.values()) {
+    const fiveRange = (w.fiveMin != null && w.fiveMax != null) ? w.fiveMax - w.fiveMin : null;
+    const sevenDelta = (w.sevenFirst != null && w.sevenLast != null) ? w.sevenLast - w.sevenFirst : null;
+
+    let mainModel = null, mainModelCount = -1;
+    for (const [name, count] of w.models) {
+      if (count > mainModelCount || (count === mainModelCount && name < mainModel)) {
+        mainModel = name;
+        mainModelCount = count;
+      }
+    }
+
+    // 回帰から除外する理由。null なら回帰に使える window。
+    let excludedReason = null;
+    if (w.crossedWeeklyReset) excludedReason = 'weekly_reset_crossed';
+    else if (fiveRange == null) excludedReason = 'five_pct_unavailable';
+    else if (fiveRange < MIN_FIVE_RANGE_FOR_REGRESSION) excludedReason = 'five_range_below_threshold';
+    else if (sevenDelta == null) excludedReason = 'seven_pct_unavailable';
+
+    windows.push({
+      fiveResetMs: w.fiveResetMs,
+      startMs: w.startMs,
+      endMs: w.endMs,
+      rowCount: w.rowCount,
+      fiveMin: w.fiveMin,
+      fiveMax: w.fiveMax,
+      fiveRange,
+      sevenFirst: w.sevenFirst,
+      sevenLast: w.sevenLast,
+      sevenDelta,
+      crossedWeeklyReset: w.crossedWeeklyReset,
+      mainModel,
+      models: Object.fromEntries(w.models),
+      excludedReason,
+    });
+  }
+  return windows;
+}
+
+// ---------------------------------------------------------------------------
+// 回帰(原点を通る直線)
+// ---------------------------------------------------------------------------
+
+function regress(points) {
+  // points: [{x: five到達幅, y: seven増分}]。x, y はどちらも「%」単位。
+  const n = points.length;
+  if (n < 2) return { n, insufficient: true };
+
+  let sxy = 0, sxx = 0, sx = 0, sy = 0;
+  for (const p of points) {
+    sxy += p.x * p.y;
+    sxx += p.x * p.x;
+    sx += p.x;
+    sy += p.y;
+  }
+
+  // 最小二乗(原点通過): slope = Σxy / Σxx
+  const slopeLS = sxx > 0 ? sxy / sxx : null;
+  // 単純平均: 各 window の「%あたり進み幅」の合計比。外れ値1点に引っ張られにくい
+  // 目安として、最小二乗の結果と並べて外れ値の影響を見るために出す。
+  const slopeAvg = sx > 0 ? sy / sx : null;
+
+  // 決定係数 R^2。原点通過モデルなので、平均で中心化する通常の R^2 は定義が崩れる
+  // (切片ゼロの制約下では残差平方和が Σ(y-ȳ)^2 より大きくなり得て負値になりうる)。
+  // ここでは原点基準の非中心 R^2 = 1 - Σ(y-ŷ)^2 / Σy^2 を使う。
+  let r2 = null;
+  if (slopeLS != null) {
+    let sse = 0, sst = 0;
+    for (const p of points) {
+      const yhat = slopeLS * p.x;
+      sse += (p.y - yhat) ** 2;
+      sst += p.y * p.y;
+    }
+    r2 = sst > 0 ? 1 - sse / sst : null;
+  }
+
+  // 「5h枠を100%まで使い切ったら7dが何%進むか」= slope * 100
+  // 「週次リミットに当たるまでの5h枠満タン回数」= 100 / (slope * 100) = 1 / slope
+  const fullFillPctLS = slopeLS != null ? slopeLS * 100 : null;
+  const fullFillPctAvg = slopeAvg != null ? slopeAvg * 100 : null;
+  const windowsToLimitLS = fullFillPctLS ? 100 / fullFillPctLS : null;
+  const windowsToLimitAvg = fullFillPctAvg ? 100 / fullFillPctAvg : null;
+
+  return {
+    n, insufficient: false, slopeLS, slopeAvg, r2,
+    fullFillPctLS, fullFillPctAvg, windowsToLimitLS, windowsToLimitAvg,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 集計本体
+// ---------------------------------------------------------------------------
+
+function analyze(logPath) {
+  const { rows, totalLines, skipped, readError } = loadRows(logPath);
+  const windows = buildWindows(rows);
+  const regressionPoints = windows
+    .filter((w) => w.excludedReason == null)
+    .map((w) => ({ x: w.fiveRange, y: w.sevenDelta }));
+  const regression = regress(regressionPoints);
+
+  return {
+    logPath,
+    readError,
+    totalLines,
+    skippedLines: skipped,
+    parsedRows: rows.length,
+    periodStart: rows.length ? rows[0].tsMs : null,
+    periodEnd: rows.length ? rows[rows.length - 1].tsMs : null,
+    windows,
+    effectiveWindowCount: regressionPoints.length,
+    regression,
+    rowsForChart: rows,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// コンソール出力
+// ---------------------------------------------------------------------------
+
+const EXCLUDE_LABEL = {
+  weekly_reset_crossed: '週次リセット跨ぎ',
+  five_pct_unavailable: '5h%データなし',
+  five_range_below_threshold: `到達幅<${MIN_FIVE_RANGE_FOR_REGRESSION}%`,
+  seven_pct_unavailable: '7d%データなし',
+};
+
+function printSummary(result) {
+  console.log('=== Claude Code 使用量レポート ===');
+  console.log(`ログ: ${result.logPath}`);
+  if (result.readError) {
+    console.log(`ログを読み込めませんでした: ${result.readError}`);
+    return;
+  }
+  console.log(`期間: ${fmtDateTime(result.periodStart)} 〜 ${fmtDateTime(result.periodEnd)}`);
+  console.log(`総行数: ${result.totalLines}(パース不能行: ${result.skippedLines})`);
+  console.log(`5h枠 window 数: ${result.windows.length}(回帰に使えた window: ${result.effectiveWindowCount})`);
+  console.log('');
+
+  console.log('--- window 一覧 ---');
+  console.log('開始時刻              5h到達%   7d増分%   主モデル        備考');
+  for (const w of result.windows) {
+    const note = w.excludedReason ? `除外: ${EXCLUDE_LABEL[w.excludedReason] || w.excludedReason}` : '';
+    console.log(
+      `${fmtDateTime(w.startMs).padEnd(20)}  ${fmtPct(w.fiveRange).padStart(7)}  ${fmtPct(w.sevenDelta).padStart(7)}  ${(w.mainModel || '—').padEnd(14)}  ${note}`
+    );
+  }
+  console.log('');
+
+  const reg = result.regression;
+  if (reg.insufficient) {
+    const need = 2 - reg.n;
+    console.log(`--- 推定 ---`);
+    console.log(`データ不足: 回帰に使える window が ${reg.n} 件しかない。あと最低 ${need} 窓分のデータが必要。`);
+    return;
+  }
+
+  console.log('--- 推定(5h枠を100%使い切ったときの7d進み幅、および週次リミットまでの満タン回数) ---');
+  console.log(`サンプル数: ${reg.n} window`);
+  console.log(`最小二乗(原点通過): 5h100%あたり 7d ${reg.fullFillPctLS.toFixed(3)}% 進む → 満タン ${reg.windowsToLimitLS.toFixed(2)} 回で週次リミット`);
+  console.log(`単純平均:           5h100%あたり 7d ${reg.fullFillPctAvg.toFixed(3)}% 進む → 満タン ${reg.windowsToLimitAvg.toFixed(2)} 回で週次リミット`);
+  console.log(`決定係数 R^2(原点基準): ${reg.r2 != null ? reg.r2.toFixed(4) : '—'}`);
+}
+
+// ---------------------------------------------------------------------------
+// HTML レポート生成(自己完結・外部参照なし・SVG は自前生成)
+// ---------------------------------------------------------------------------
+
+// XSS 対策というより「model 名などに `<` `&` が混じっても壊れない」ための最低限の
+// エスケープ。HTML はここで node 側が一括生成するので innerHTML 相当の埋め込みに
+// なるが、動的な DOM 挿入(ツールチップ描画)側は textContent を使う(下記 JS)。
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+// ---- 時系列チャート(5h% と 7d% を同じ 0-100 軸に重ねる。二軸化はしない) ----
+function buildTimeSeriesSvg(rows, windows) {
+  const W = 960, H = 320;
+  const M = { top: 20, right: 20, bottom: 32, left: 40 };
+  const plotW = W - M.left - M.right;
+  const plotH = H - M.top - M.bottom;
+
+  if (rows.length === 0) {
+    return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="使用率の時系列データがありません"><text x="${W / 2}" y="${H / 2}" text-anchor="middle" class="empty-note">データがありません</text></svg>`;
+  }
+
+  const tMin = rows[0].tsMs, tMax = rows[rows.length - 1].tsMs;
+  // 点が1つ(または全点が同じ時刻)しかないと時間軸のレンジが0になるので、
+  // 目盛りが潰れないよう横1本分だけ幅を持たせる。
+  const tSpan = Math.max(tMax - tMin, 60 * 1000);
+  const x = (t) => M.left + ((t - tMin) / tSpan) * plotW;
+  const y = (v) => M.top + (1 - v / 100) * plotH;
+
+  // window 境界(先頭を除く)に薄い縦線を引く。5h枠の切り替わりが一目で分かるように。
+  const boundaries = windows.slice(1).map((w) => x(w.startMs));
+
+  // 5h%/7d% はそれぞれ null で途切れることがあるので、連続する区間ごとに path を切る。
+  function buildSegments(key) {
+    const segs = [];
+    let cur = [];
+    for (const r of rows) {
+      const v = r[key];
+      if (v == null) {
+        if (cur.length) segs.push(cur);
+        cur = [];
+        continue;
+      }
+      cur.push({ t: r.tsMs, v });
+    }
+    if (cur.length) segs.push(cur);
+    return segs;
+  }
+
+  function pathsFor(key) {
+    return buildSegments(key).map((seg) =>
+      seg.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join(' ')
+    );
+  }
+
+  const fivePaths = pathsFor('five_pct');
+  const sevenPaths = pathsFor('seven_pct');
+
+  // 個々の実測点。データが疎な現状(1〜数点)でも見えるように小さめの丸を打つ。
+  function dotsFor(key, cls) {
+    return rows
+      .filter((r) => r[key] != null)
+      .map((r) => `<circle class="${cls} dot" cx="${x(r.tsMs).toFixed(1)}" cy="${y(r[key]).toFixed(1)}" r="3.5" data-t="${r.tsMs}" data-v="${r[key]}"></circle>`)
+      .join('');
+  }
+
+  // y軸目盛り(0/25/50/75/100)
+  const yTicks = [0, 25, 50, 75, 100].map((v) => `
+    <line x1="${M.left}" x2="${W - M.right}" y1="${y(v)}" y2="${y(v)}" class="grid"></line>
+    <text x="${M.left - 8}" y="${y(v)}" class="axis-label" text-anchor="end" dominant-baseline="middle">${v}</text>
+  `).join('');
+
+  const boundaryLines = boundaries.map((bx) => `<line x1="${bx.toFixed(1)}" x2="${bx.toFixed(1)}" y1="${M.top}" y2="${H - M.bottom}" class="window-boundary"></line>`).join('');
+
+  // 横軸のラベルは開始・終了のみ(密な時系列に全点ラベルを打つと読めなくなるため)。
+  const xLabels = `
+    <text x="${M.left}" y="${H - 8}" class="axis-label" text-anchor="start">${esc(fmtDateTime(tMin))}</text>
+    <text x="${W - M.right}" y="${H - 8}" class="axis-label" text-anchor="end">${esc(fmtDateTime(tMax))}</text>
+  `;
+
+  return `
+<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="5h枠・7d枠使用率の時系列" data-plot-left="${M.left}" data-plot-right="${W - M.right}" data-plot-top="${M.top}" data-plot-bottom="${H - M.bottom}" data-t-min="${tMin}" data-t-span="${tSpan}">
+  <g>${yTicks}</g>
+  <line x1="${M.left}" x2="${W - M.right}" y1="${H - M.bottom}" y2="${H - M.bottom}" class="axis-line"></line>
+  ${boundaryLines}
+  ${fivePaths.map((d) => `<path d="${d}" class="line line-five"></path>`).join('')}
+  ${sevenPaths.map((d) => `<path d="${d}" class="line line-seven"></path>`).join('')}
+  ${dotsFor('five_pct', 'series-five')}
+  ${dotsFor('seven_pct', 'series-seven')}
+  ${xLabels}
+  <g class="crosshair-layer">
+    <line class="crosshair-line" x1="0" x2="0" y1="${M.top}" y2="${H - M.bottom}" style="display:none"></line>
+  </g>
+  <rect class="hover-capture" x="${M.left}" y="${M.top}" width="${plotW}" height="${plotH}" fill="transparent"></rect>
+</svg>
+<div class="tooltip" data-tooltip-for="timeseries" hidden></div>
+`;
+}
+
+// ---- 散布図(x=5h到達幅 / y=7d増分) + 原点通過の回帰直線 ----
+function buildScatterSvg(windows, regression) {
+  const W = 480, H = 420;
+  const M = { top: 20, right: 20, bottom: 36, left: 44 };
+  const plotW = W - M.left - M.right;
+  const plotH = H - M.top - M.bottom;
+
+  const points = windows.filter((w) => w.fiveRange != null && w.sevenDelta != null);
+  if (points.length === 0) {
+    return `<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="散布図データがありません"><text x="${W / 2}" y="${H / 2}" text-anchor="middle" class="empty-note">データがありません</text></svg>`;
+  }
+
+  const xMax = Math.max(100, ...points.map((p) => p.fiveRange));
+  const yMax = Math.max(10, ...points.map((p) => Math.abs(p.sevenDelta)));
+  const yMin = Math.min(0, ...points.map((p) => p.sevenDelta));
+
+  const sx = (v) => M.left + (v / xMax) * plotW;
+  const sy = (v) => M.top + (1 - (v - yMin) / (yMax - yMin)) * plotH;
+
+  const xTicks = [0, 25, 50, 75, 100].filter((v) => v <= xMax + 1e-9).map((v) => `
+    <line x1="${sx(v)}" x2="${sx(v)}" y1="${M.top}" y2="${H - M.bottom}" class="grid"></line>
+    <text x="${sx(v)}" y="${H - M.bottom + 16}" class="axis-label" text-anchor="middle">${v}</text>
+  `).join('');
+
+  const dots = points.map((p) => {
+    const excluded = p.excludedReason != null;
+    const cls = excluded ? 'scatter-dot excluded' : 'scatter-dot';
+    return `<circle class="${cls}" cx="${sx(p.fiveRange).toFixed(1)}" cy="${sy(p.sevenDelta).toFixed(1)}" r="6"
+      data-five="${p.fiveRange.toFixed(2)}" data-seven="${p.sevenDelta.toFixed(2)}"
+      data-note="${excluded ? esc(EXCLUDE_LABEL[p.excludedReason] || p.excludedReason) : ''}"></circle>`;
+  }).join('');
+
+  let regressionLine = '';
+  if (!regression.insufficient && regression.slopeLS != null) {
+    const x1 = 0, y1 = 0;
+    const x2 = xMax, y2 = regression.slopeLS * xMax;
+    regressionLine = `<line x1="${sx(x1)}" y1="${sy(y1)}" x2="${sx(x2)}" y2="${sy(y2)}" class="regression-line"></line>`;
+  }
+
+  return `
+<svg viewBox="0 0 ${W} ${H}" class="chart" role="img" aria-label="5h到達幅と7d増分の散布図と回帰直線">
+  <g>${xTicks}</g>
+  <line x1="${M.left}" x2="${M.left}" y1="${M.top}" y2="${H - M.bottom}" class="axis-line"></line>
+  <line x1="${M.left}" x2="${W - M.right}" y1="${sy(0)}" y2="${sy(0)}" class="axis-line"></line>
+  ${regressionLine}
+  ${dots}
+  <text x="${M.left + plotW / 2}" y="${H - 6}" class="axis-title" text-anchor="middle">5h枠 到達幅(%)</text>
+  <text x="14" y="${M.top + plotH / 2}" class="axis-title" text-anchor="middle" transform="rotate(-90 14 ${M.top + plotH / 2})">7d枠 増分(%)</text>
+</svg>
+<div class="tooltip" data-tooltip-for="scatter" hidden></div>
+`;
+}
+
+function buildWindowTableRows(windows) {
+  return windows.map((w) => {
+    const note = w.excludedReason ? `<span class="badge">除外: ${esc(EXCLUDE_LABEL[w.excludedReason] || w.excludedReason)}</span>` : '';
+    return `<tr>
+      <td>${esc(fmtDateTime(w.startMs))}</td>
+      <td class="num">${esc(fmtPct(w.fiveRange))}</td>
+      <td class="num">${esc(fmtPct(w.sevenDelta))}</td>
+      <td>${esc(w.mainModel || '—')}</td>
+      <td class="num">${w.rowCount}</td>
+      <td>${note}</td>
+    </tr>`;
+  }).join('\n');
+}
+
+function buildHtml(result) {
+  const reg = result.regression;
+
+  const heroValue = reg.insufficient
+    ? 'データ不足'
+    : `${reg.windowsToLimitLS.toFixed(1)} 回`;
+  const heroSub = reg.insufficient
+    ? `回帰に使える window が ${reg.n} 件(最低2件必要。あと ${2 - reg.n} 窓分のデータを待つ)`
+    : `5h枠を満タンにした回数がこれに達すると週次リミットに当たる見込み(最小二乗推定)`;
+
+  const secondaryStats = reg.insufficient ? '' : `
+    <div class="stat-row">
+      <div class="stat-tile">
+        <div class="stat-label">5h100%あたりの7d進み幅(最小二乗)</div>
+        <div class="stat-value">${reg.fullFillPctLS.toFixed(2)}%</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-label">単純平均による満タン回数</div>
+        <div class="stat-value">${reg.windowsToLimitAvg.toFixed(1)} 回</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-label">決定係数 R²(原点基準)</div>
+        <div class="stat-value">${reg.r2 != null ? reg.r2.toFixed(3) : '—'}</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-label">回帰に使った window 数</div>
+        <div class="stat-value">${reg.n}</div>
+      </div>
+    </div>
+  `;
+
+  const timeseriesSvg = buildTimeSeriesSvg(result.rowsForChart, result.windows);
+  const scatterSvg = buildScatterSvg(result.windows, reg);
+  const tableRows = buildWindowTableRows(result.windows);
+
+  // クライアント側でツールチップを描くための最小データ。model 名などは統計情報
+  // から来た文字列(基本は Claude Code 自身が出すものだが)を疑わずに innerHTML で
+  // 埋め込むのは避け、必ず textContent 経由で挿入する(下記スクリプト参照)。
+  const chartData = {
+    rows: result.rowsForChart.map((r) => ({ t: r.tsMs, five: r.five_pct, seven: r.seven_pct })),
+  };
+
+  return `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Claude Code 使用量レポート</title>
+<style>
+  .viz-root {
+    color-scheme: light;
+    --surface:   #fcfcfb;
+    --page:      #f9f9f7;
+    --ink:       #0b0b0b;
+    --ink-2:     #52514e;
+    --ink-muted: #898781;
+    --grid:      #e1e0d9;
+    --axis:      #c3c2b7;
+    --border:    rgba(11,11,11,0.10);
+    --series-five:  #2a78d6; /* categorical slot1: blue */
+    --series-seven: #eb6834; /* categorical slot2: orange */
+    --regression:   #52514e; /* データではなく推定モデルなので secondary ink */
+  }
+  @media (prefers-color-scheme: dark) {
+    .viz-root {
+      color-scheme: dark;
+      --surface:   #1a1a19;
+      --page:      #0d0d0d;
+      --ink:       #ffffff;
+      --ink-2:     #c3c2b7;
+      --ink-muted: #898781;
+      --grid:      #2c2c2a;
+      --axis:      #383835;
+      --border:    rgba(255,255,255,0.10);
+      --series-five:  #3987e5;
+      --series-seven: #d95926;
+      --regression:   #c3c2b7;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: var(--page); color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .viz-root { padding: 24px; max-width: 1040px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .meta { color: var(--ink-2); font-size: 13px; margin: 0 0 20px; }
+  section { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+  section h2 { font-size: 14px; color: var(--ink-2); margin: 0 0 14px; font-weight: 600; }
+
+  .hero { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  .hero-value { font-size: 48px; font-weight: 600; line-height: 1; }
+  .hero-sub { color: var(--ink-2); font-size: 13px; max-width: 480px; }
+
+  .stat-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
+  .stat-tile { flex: 1 1 160px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; }
+  .stat-label { font-size: 12px; color: var(--ink-2); margin-bottom: 4px; }
+  .stat-value { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .chart-grid { display: grid; grid-template-columns: 1.6fr 1fr; gap: 20px; align-items: start; }
+  @media (max-width: 800px) { .chart-grid { grid-template-columns: 1fr; } }
+  .chart { width: 100%; height: auto; overflow: visible; }
+  .empty-note { fill: var(--ink-muted); font-size: 13px; }
+
+  .grid { stroke: var(--grid); stroke-width: 1; }
+  .axis-line { stroke: var(--axis); stroke-width: 1; }
+  .axis-label { fill: var(--ink-muted); font-size: 10px; }
+  .axis-title { fill: var(--ink-2); font-size: 11px; }
+  .window-boundary { stroke: var(--border); stroke-width: 1; }
+  .line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .line-five { stroke: var(--series-five); }
+  .line-seven { stroke: var(--series-seven); }
+  .dot { stroke: var(--surface); stroke-width: 1.5; }
+  .series-five.dot { fill: var(--series-five); }
+  .series-seven.dot { fill: var(--series-seven); }
+  .scatter-dot { fill: var(--series-five); stroke: var(--surface); stroke-width: 2; cursor: pointer; }
+  .scatter-dot.excluded { fill: none; stroke: var(--ink-muted); stroke-width: 1.5; opacity: 0.7; }
+  .regression-line { stroke: var(--regression); stroke-width: 2; stroke-dasharray: 5 4; }
+  .hover-capture { cursor: crosshair; }
+  .crosshair-line { stroke: var(--ink-muted); stroke-width: 1; pointer-events: none; }
+
+  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--ink-2); margin-bottom: 8px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 16px; height: 2px; display: inline-block; }
+  .legend-swatch.five { background: var(--series-five); }
+  .legend-swatch.seven { background: var(--series-seven); }
+  .legend-swatch.regression { background: none; border-top: 2px dashed var(--regression); width: 16px; height: 0; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: left; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  th { color: var(--ink-2); font-weight: 600; font-size: 12px; }
+  .badge { font-size: 11px; color: var(--ink-muted); }
+  .table-wrap { overflow-x: auto; }
+
+  .tooltip {
+    position: fixed; pointer-events: none; z-index: 10;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    max-width: 220px;
+  }
+  .tooltip[hidden] { display: none; }
+  .tooltip .tt-value { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tooltip .tt-label { color: var(--ink-2); }
+</style>
+</head>
+<body>
+<div class="viz-root">
+  <h1>Claude Code 使用量レポート</h1>
+  <p class="meta">ログ: ${esc(result.logPath)} / 期間: ${esc(fmtDateTime(result.periodStart))} 〜 ${esc(fmtDateTime(result.periodEnd))} / 総行数 ${result.totalLines}(パース不能 ${result.skippedLines}) / window数 ${result.windows.length}</p>
+
+  <section>
+    <h2>週次リミットまでの5h枠満タン回数</h2>
+    <div class="hero">
+      <div class="hero-value">${esc(heroValue)}</div>
+      <div class="hero-sub">${esc(heroSub)}</div>
+    </div>
+    ${secondaryStats}
+  </section>
+
+  <section>
+    <h2>時系列(5h枠% / 7d枠%)</h2>
+    <div class="legend">
+      <span class="legend-item"><span class="legend-swatch five"></span>5h枠 使用率</span>
+      <span class="legend-item"><span class="legend-swatch seven"></span>7d枠 使用率</span>
+    </div>
+    ${timeseriesSvg}
+  </section>
+
+  <div class="chart-grid">
+    <section>
+      <h2>window 一覧</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>開始時刻</th><th class="num">5h到達%</th><th class="num">7d増分%</th><th>主モデル</th><th class="num">行数</th><th>備考</th></tr></thead>
+          <tbody>${tableRows}</tbody>
+        </table>
+      </div>
+    </section>
+    <section>
+      <h2>散布図: 5h到達幅 × 7d増分</h2>
+      <div class="legend">
+        <span class="legend-item"><span class="legend-swatch five" style="width:8px;height:8px;border-radius:50%;"></span>window(実測)</span>
+        <span class="legend-item"><span class="legend-swatch regression"></span>回帰直線(原点通過)</span>
+      </div>
+      ${scatterSvg}
+    </section>
+  </div>
+</div>
+<script id="chart-data" type="application/json">${JSON.stringify(chartData)}</script>
+<script>
+(function () {
+  'use strict';
+  // model 名など外部起源の文字列をツールチップに出すときは textContent を使い、
+  // innerHTML 経由での注入を避ける(dataviz skill の指針どおり)。
+  function setText(el, text) {
+    el.textContent = '';
+    el.appendChild(document.createTextNode(text));
+  }
+
+  function fmtDate(ms) {
+    return new Date(ms).toLocaleString('ja-JP', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+  }
+
+  // --- 時系列チャートのクロスヘア + ツールチップ ---
+  var tsSvg = document.querySelector('svg[aria-label*="時系列"]');
+  if (tsSvg) {
+    var raw = document.getElementById('chart-data');
+    var rows = raw ? (JSON.parse(raw.textContent).rows || []) : [];
+    var capture = tsSvg.querySelector('.hover-capture');
+    var crosshair = tsSvg.querySelector('.crosshair-line');
+    var tooltip = document.querySelector('.tooltip[data-tooltip-for="timeseries"]');
+    var left = parseFloat(tsSvg.dataset.plotLeft);
+    var right = parseFloat(tsSvg.dataset.plotRight);
+    var tMin = parseFloat(tsSvg.dataset.tMin);
+    var tSpan = parseFloat(tsSvg.dataset.tSpan);
+
+    function nearestRow(t) {
+      var best = null, bestDiff = Infinity;
+      for (var i = 0; i < rows.length; i++) {
+        var diff = Math.abs(rows[i].t - t);
+        if (diff < bestDiff) { bestDiff = diff; best = rows[i]; }
+      }
+      return best;
+    }
+
+    if (capture && rows.length) {
+      capture.addEventListener('pointermove', function (ev) {
+        var rect = tsSvg.getBoundingClientRect();
+        // viewBox 座標系に変換(SVG が CSS でスケールされていても崩れないように)
+        var px = (ev.clientX - rect.left) / rect.width * tsSvg.viewBox.baseVal.width;
+        var t = tMin + ((px - left) / (right - left)) * tSpan;
+        var row = nearestRow(t);
+        if (!row) return;
+
+        crosshair.setAttribute('x1', px);
+        crosshair.setAttribute('x2', px);
+        crosshair.style.display = '';
+
+        tooltip.innerHTML = '';
+        var title = document.createElement('div');
+        setText(title, fmtDate(row.t));
+        tooltip.appendChild(title);
+        if (row.five != null) {
+          var l1 = document.createElement('div');
+          setText(l1, '5h枠: ' + row.five.toFixed(1) + '%');
+          tooltip.appendChild(l1);
+        }
+        if (row.seven != null) {
+          var l2 = document.createElement('div');
+          setText(l2, '7d枠: ' + row.seven.toFixed(1) + '%');
+          tooltip.appendChild(l2);
+        }
+        tooltip.hidden = false;
+        tooltip.style.left = (ev.clientX + 12) + 'px';
+        tooltip.style.top = (ev.clientY + 12) + 'px';
+      });
+      capture.addEventListener('pointerleave', function () {
+        crosshair.style.display = 'none';
+        tooltip.hidden = true;
+      });
+    }
+  }
+
+  // --- 散布図の各点のツールチップ ---
+  var scatterTooltip = document.querySelector('.tooltip[data-tooltip-for="scatter"]');
+  document.querySelectorAll('.scatter-dot').forEach(function (dot) {
+    dot.addEventListener('pointerenter', function (ev) {
+      if (!scatterTooltip) return;
+      scatterTooltip.innerHTML = '';
+      var l1 = document.createElement('div');
+      setText(l1, '5h到達幅: ' + dot.dataset.five + '%');
+      var l2 = document.createElement('div');
+      setText(l2, '7d増分: ' + dot.dataset.seven + '%');
+      scatterTooltip.appendChild(l1);
+      scatterTooltip.appendChild(l2);
+      if (dot.dataset.note) {
+        var l3 = document.createElement('div');
+        setText(l3, dot.dataset.note);
+        scatterTooltip.appendChild(l3);
+      }
+      scatterTooltip.hidden = false;
+    });
+    dot.addEventListener('pointermove', function (ev) {
+      if (!scatterTooltip) return;
+      scatterTooltip.style.left = (ev.clientX + 12) + 'px';
+      scatterTooltip.style.top = (ev.clientY + 12) + 'px';
+    });
+    dot.addEventListener('pointerleave', function () {
+      if (scatterTooltip) scatterTooltip.hidden = true;
+    });
+  });
+})();
+</script>
+</body>
+</html>
+`;
+}
+
+// ---------------------------------------------------------------------------
+// エントリポイント
+// ---------------------------------------------------------------------------
+
+function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const result = analyze(opts.log);
+
+  fs.mkdirSync(path.dirname(opts.html), { recursive: true });
+  fs.writeFileSync(opts.html, buildHtml(result));
+
+  if (opts.json) {
+    // rowsForChart は HTML 用の内部データなので JSON 出力からは外す。
+    const { rowsForChart, ...jsonResult } = result;
+    console.log(JSON.stringify({ ...jsonResult, htmlPath: opts.html }, null, 2));
+  } else {
+    printSummary(result);
+    console.log('');
+    console.log(`HTML レポート: ${opts.html}`);
+  }
+}
+
+main();
+
+module.exports = { analyze, regress, buildWindows, loadRows };
