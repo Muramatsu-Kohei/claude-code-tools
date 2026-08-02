@@ -46,8 +46,12 @@ const BUCKETS = [
   }
 
   console.log('Opus メインスレッドのターン単価(コンテキスト長別)\n');
-  console.log('コンテキスト長      ターン数    合計$    $/ターン   〜30K比');
-  const base = b[0].n ? b[0].cost / b[0].n : 0;
+  console.log('コンテキスト長      ターン数    合計$    $/ターン  30〜60K比');
+  // 基準は 30〜60K 帯。〜30K 帯はセッション冒頭でキャッシュ作成(1.25倍単価)が集中するため
+  // 単価が跳ね上がっており、コンテキスト肥大の影響を測る基準としては使えない。
+  // CLAUDE.md に載せている倍率(150K超で1.6倍・300K超で3.6倍)もこの基準で算出している。
+  const BASE_IDX = 1;
+  const base = b[BASE_IDX].n ? b[BASE_IDX].cost / b[BASE_IDX].n : 0;
   for (let i = 0; i < BUCKETS.length; i++) {
     if (!b[i].n) continue;
     const per = b[i].cost / b[i].n;
