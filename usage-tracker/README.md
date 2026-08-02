@@ -139,6 +139,22 @@ node guard.js reset                 # 全セッションの発火済みフラグ
 
 **同じ `five_reset` を持つ行の集まりが1つの5時間枠**。枠の識別はこの値で行う(使用率の下落ではなく)。
 
+## transcript ベースの分析ツール(transcript/)
+
+`analyze.js` が読む `usage.jsonl` とはデータソースが別系統。`transcript/` 配下のスクリプトは Claude Code 本体が書く会話 transcript (`~/.claude/projects/**/*.jsonl`) を直接読む。統計取り違え防止のため、どちらの入力を見ているかは常に意識すること。
+
+- `transcript/sessions.js` — セッションごとのコスト・到達コンテキスト長・委譲回数(重いツール直接呼び出し vs サブエージェント委譲)を集計し、コスト上位セッションの表を出す。
+- `transcript/turncost.js` — Opus 系メインスレッドのみ抽出し、コンテキスト長バケット別の「1ターンあたり単価」と〜30K比の倍率を出す。
+- `transcript/breakdown.js` — モデル×レイヤー(main/subagent)別のトークン内訳と、tool_result の生バイト量上位を出す。
+
+```powershell
+node transcript/sessions.js
+node transcript/turncost.js
+node transcript/breakdown.js
+```
+
+モデル別単価テーブルは `transcript/pricing.js` に共通化してあり、`sessions.js` / `turncost.js` はここから読み込む(`breakdown.js` はコスト換算をしないため参照しない)。
+
 ## 限界
 
 読み方を誤らないために、分かっている制約を挙げる。
