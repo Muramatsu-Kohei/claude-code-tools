@@ -27,13 +27,34 @@ const DEFAULT_LOG = path.join(HOME, '.claude', 'usage-tracker', 'usage.jsonl');
 // CLI 引数
 // ---------------------------------------------------------------------------
 
+// 時系列グラフの既定の表示範囲。ログは消さずに増え続けるので、描画側で範囲を切らないと
+// 横軸が青天井に伸びて波形が潰れる。単位を日数ではなく週次枠の窓にしているのは、7日固定だと
+// リセットを跨いだ位置で切れてしまい、一番見たい「いまの週次枠をどれだけ使ったか」が
+// 読めなくなるため。窓で切れば 7d% の線は必ずリセット直後から始まる。
+// 集計・回帰はこの値に影響されない(常に全期間を使う)。
+const CHART_WEEKS_DEFAULT = 1;
+// --days を明示したときにだけ使うフォールバック値。
+const CHART_DAYS_FALLBACK = 7;
+
+// 'all' / '0' は「制限なし」を意味する null に落とす。
+// 不正な値でグラフを空にしないよう、解釈できなければ既定値に戻す。
+function parseCount(raw, fallback) {
+  if (raw === 'all' || raw === '0') return null;
+  const n = Number(raw);
+  return isFinite(n) && n > 0 ? n : fallback;
+}
+
 function parseArgs(argv) {
-  const opts = { log: DEFAULT_LOG, html: null, json: false };
+  // weeks と days は排他。両方を同時に効かせると範囲の意味が曖昧になるので、
+  // 後から指定された方を採用してもう一方を無効化する。
+  const opts = { log: DEFAULT_LOG, html: null, json: false, weeks: CHART_WEEKS_DEFAULT, days: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--log') opts.log = argv[++i];
     else if (a === '--html') opts.html = argv[++i];
     else if (a === '--json') opts.json = true;
+    else if (a === '--weeks') { opts.weeks = parseCount(argv[++i], CHART_WEEKS_DEFAULT); opts.days = null; }
+    else if (a === '--days') { opts.days = parseCount(argv[++i], CHART_DAYS_FALLBACK); opts.weeks = null; }
     // 未知の引数は無視する。フラグの追加で古い呼び出しを壊さないため。
   }
   // --html 省略時は「ログと同じ usage-tracker ディレクトリ配下の report.html」。
@@ -350,6 +371,48 @@ function esc(s) {
 }
 
 // ---- 時系列チャート(5h% と 7d% を同じ 0-100 軸に重ねる。二軸化はしない) ----
+// 時系列グラフの表示範囲を直近 days 日に絞る。基準を「いま」ではなく最後の観測点に取るのは、
+// 何日か前のログを後から解析したときに全点が範囲外へ落ちてグラフが空になるのを避けるため。
+function clipToRecentDays(rows, days) {
+  if (!days || rows.length === 0) return rows;
+  const cutoff = rows[rows.length - 1].tsMs - days * 24 * 60 * 60 * 1000;
+  return rows.filter((r) => r.tsMs >= cutoff);
+}
+
+// 週次枠の各窓が始まる行のインデックス。seven_reset_ms が変わった点が窓の境界そのもの
+// (リセット時刻が別の値になった = 枠が入れ替わった)なので、日付計算をせずに区切れる。
+// resets_at が欠けた行(セッション開始直後などに起こりうる)は境界の判定に使わない。
+// 欠けを境界とみなすと、実際にはリセットしていない場所で窓が increments されてしまう。
+function weekWindowStarts(rows) {
+  const starts = [];
+  let prev = null;
+  for (let i = 0; i < rows.length; i++) {
+    const reset = rows[i].seven_reset_ms;
+    if (reset == null) continue;
+    if (prev === null || reset !== prev) {
+      starts.push(i);
+      prev = reset;
+    }
+  }
+  return starts;
+}
+
+// 週次枠の窓単位で直近 weeks 個ぶんに絞る。
+function clipToRecentWeekWindows(rows, weeks) {
+  if (!weeks || rows.length === 0) return rows;
+  const starts = weekWindowStarts(rows);
+  // 手持ちの窓が要求数以下なら切らない。先頭の窓は途中から記録が始まっていることが
+  // 多いが、それを捨てると初回利用時にグラフが空になる。
+  if (starts.length <= weeks) return rows;
+  return rows.slice(starts[starts.length - weeks]);
+}
+
+// 表示範囲の決定。--days を明示したときだけ日数で切り、既定は週次枠の窓単位。
+function clipForChart(rows, opts) {
+  if (opts.days) return clipToRecentDays(rows, opts.days);
+  return clipToRecentWeekWindows(rows, opts.weeks);
+}
+
 function buildTimeSeriesSvg(rows, windows) {
   const W = 960, H = 320;
   const M = { top: 20, right: 20, bottom: 32, left: 40 };
@@ -368,7 +431,12 @@ function buildTimeSeriesSvg(rows, windows) {
   const y = (v) => M.top + (1 - v / 100) * plotH;
 
   // window 境界(先頭を除く)に薄い縦線を引く。5h枠の切り替わりが一目で分かるように。
-  const boundaries = windows.slice(1).map((w) => x(w.startMs));
+  // 表示範囲の外にある境界は捨てる。SVG は overflow: visible なので、残すとプロット領域を
+  // はみ出した位置に縦線が描かれてしまう。
+  const boundaries = windows
+    .slice(1)
+    .filter((w) => w.startMs >= tMin && w.startMs <= tMax)
+    .map((w) => x(w.startMs));
 
   // 5h%/7d% はそれぞれ null で途切れることがあるので、連続する区間ごとに path を切る。
   function buildSegments(key) {
@@ -397,9 +465,15 @@ function buildTimeSeriesSvg(rows, windows) {
   const sevenPaths = pathsFor('seven_pct');
 
   // 個々の実測点。データが疎な現状(1〜数点)でも見えるように小さめの丸を打つ。
+  // 密になると半径3.5の丸が隣と重なって帯にしか見えなくなるので、間隔が6pxを切る量に
+  // なったら等間隔で間引く。折れ線は全点で描いたままなので波形自体は失われない。
+  const maxDots = Math.max(1, Math.floor(plotW / 6));
   function dotsFor(key, cls) {
-    return rows
-      .filter((r) => r[key] != null)
+    const pts = rows.filter((r) => r[key] != null);
+    const step = Math.max(1, Math.ceil(pts.length / maxDots));
+    return pts
+      // 最新の点だけは間引きの位相に関係なく残す。現在値の位置は常に見えていてほしい。
+      .filter((_, i) => i % step === 0 || i === pts.length - 1)
       .map((r) => `<circle class="${cls} dot" cx="${x(r.tsMs).toFixed(1)}" cy="${y(r[key]).toFixed(1)}" r="3.5" data-t="${r.tsMs}" data-v="${r[key]}"></circle>`)
       .join('');
   }
@@ -504,7 +578,7 @@ function buildWindowTableRows(windows) {
   }).join('\n');
 }
 
-function buildHtml(result) {
+function buildHtml(result, opts = {}) {
   const reg = result.regression;
 
   const heroValue = reg.insufficient
@@ -535,7 +609,23 @@ function buildHtml(result) {
     </div>
   `;
 
-  const timeseriesSvg = buildTimeSeriesSvg(result.rowsForChart, result.windows);
+  // 表示範囲を絞るのは時系列グラフだけ。サマリ・回帰・window 一覧は常に全期間を使う。
+  // グラフの見た目を変えたつもりが推定値まで変わっていた、という事故を避けるための線引き。
+  const chartRows = clipForChart(result.rowsForChart, opts);
+  const shownWindows = chartRows.length
+    ? result.windows.filter(
+        (w) => w.startMs >= chartRows[0].tsMs && w.startMs <= chartRows[chartRows.length - 1].tsMs
+      ).length
+    : 0;
+  const totalWeeks = weekWindowStarts(result.rowsForChart).length;
+  const shownWeeks = weekWindowStarts(chartRows).length;
+  const scope = opts.days ? `直近 ${opts.days} 日` : `週次枠の直近 ${opts.weeks} 窓`;
+  // 何を省いたかは必ず書く。黙って切ると「これが全データ」と読まれてしまう。
+  const chartNote =
+    chartRows.length < result.rowsForChart.length
+      ? `${scope}を表示(週次枠 ${totalWeeks} 窓中 ${shownWeeks} 窓 / 全 ${result.rowsForChart.length} 点中 ${chartRows.length} 点 / 5h枠 ${shownWindows} window)。--weeks N で過去N窓、--days N で日数指定、--weeks all で全期間。`
+      : `全期間を表示(週次枠 ${totalWeeks} 窓 / ${chartRows.length} 点 / 5h枠 ${result.windows.length} window)。--weeks N・--days N で範囲を絞れます。`;
+  const timeseriesSvg = buildTimeSeriesSvg(chartRows, result.windows);
   const scatterSvg = buildScatterSvg(result.windows, reg);
   const tableRows = buildWindowTableRows(result.windows);
 
@@ -543,7 +633,9 @@ function buildHtml(result) {
   // から来た文字列(基本は Claude Code 自身が出すものだが)を疑わずに innerHTML で
   // 埋め込むのは避け、必ず textContent 経由で挿入する(下記スクリプト参照)。
   const chartData = {
-    rows: result.rowsForChart.map((r) => ({ t: r.tsMs, five: r.five_pct, seven: r.seven_pct })),
+    // hover は SVG の x 変換(表示範囲基準)と対応させる必要があるため、描画に使ったのと
+    // 同じ範囲の行だけ渡す。全点渡すと範囲外の点が最近傍に選ばれて値がずれる。
+    rows: chartRows.map((r) => ({ t: r.tsMs, five: r.five_pct, seven: r.seven_pct })),
   };
 
   return `<!doctype html>
@@ -552,7 +644,11 @@ function buildHtml(result) {
 <meta charset="utf-8">
 <title>Claude Code 使用量レポート</title>
 <style>
-  .viz-root {
+  /* 変数は :root にも置く。body は .viz-root の祖先なので .viz-root だけに定義すると
+     body の color/background から var() が解決できず、文字色が初期値の黒に落ちる
+     (= 濃いグレーの surface 上に黒文字という読めない組み合わせになる)。
+     .viz-root 側の定義はブロック単位で他所に移植したときのために残す。 */
+  :root, .viz-root {
     color-scheme: light;
     --surface:   #fcfcfb;
     --page:      #f9f9f7;
@@ -567,7 +663,7 @@ function buildHtml(result) {
     --regression:   #52514e; /* データではなく推定モデルなので secondary ink */
   }
   @media (prefers-color-scheme: dark) {
-    .viz-root {
+    :root, .viz-root {
       color-scheme: dark;
       --surface:   #1a1a19;
       --page:      #0d0d0d;
@@ -637,6 +733,7 @@ function buildHtml(result) {
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   th { color: var(--ink-2); font-weight: 600; font-size: 12px; }
   .badge { font-size: 11px; color: var(--ink-muted); }
+  .chart-note { font-size: 11px; color: var(--ink-muted); margin: 0 0 8px; }
   .table-wrap { overflow-x: auto; }
 
   .tooltip {
@@ -670,6 +767,7 @@ function buildHtml(result) {
       <span class="legend-item"><span class="legend-swatch five"></span>5h枠 使用率</span>
       <span class="legend-item"><span class="legend-swatch seven"></span>7d枠 使用率</span>
     </div>
+    <p class="chart-note">${esc(chartNote)}</p>
     ${timeseriesSvg}
   </section>
 
@@ -812,7 +910,7 @@ function main() {
   const result = analyze(opts.log);
 
   fs.mkdirSync(path.dirname(opts.html), { recursive: true });
-  fs.writeFileSync(opts.html, buildHtml(result));
+  fs.writeFileSync(opts.html, buildHtml(result, opts));
 
   if (opts.json) {
     // rowsForChart は HTML 用の内部データなので JSON 出力からは外す。
