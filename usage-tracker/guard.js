@@ -29,12 +29,20 @@ const COLLECT_STATE = path.join(DIR, 'collect-state.json');
 // 最初に閾値を踏んだ1本だけが通知を受けて残りが引き継ぎを残せなくなる。
 const STATE_DIR = path.join(DIR, 'guard-state');
 
+// 各枠を2段構えで見る。1段目で気付かせ、無視されても2段目で最後にもう一度促す。
+// 1段目だけだと、そこで作業を続ける判断をしたセッションは警告なしで上限に激突する。
+//
 // 5h枠は既定 90%。/wrap を完走させる余裕を残しつつ、早すぎて邪魔にならない値。
 const FIVE_THRESHOLD = Number(process.env.CLAUDE_USAGE_GUARD_THRESHOLD) || 90;
-// 週次枠は既定 85%。実測で「5h枠を満タンにすると週次が約12%進む」ため、
-// 15% 残っていれば満タン1回強の余裕がある。週次はリセットまで最大7日あり、
-// 使い切ると数日間まったく動けなくなるので 5h枠より早めに知らせる。
+const FIVE_FINAL = Number(process.env.CLAUDE_USAGE_GUARD_FINAL_THRESHOLD) || 97;
+// 週次枠の1段目は既定 85%。実測で「5h枠を満タンにすると週次が約12%進む」ため、
+// 15% 残っていれば満タン1回強の余裕がある。ここではまだ畳ませず、残量だけ意識させる。
 const WEEK_THRESHOLD = Number(process.env.CLAUDE_USAGE_GUARD_WEEK_THRESHOLD) || 85;
+// 週次枠の2段目は既定 97%。5h枠のガードは週次枠切れを一切防げない(週次が尽きるとき
+// 5h枠は低いままでありうる)ため、この段がないと週次の枠切れは必ず予告なしに来る。
+// 週次1pt は 5h枠の約8.3pt に相当するので、残り3%あれば /wrap には桁違いに足りる。
+// 99% にしないのは、使用率が整数で返るうえ collect-state に最大15分の遅れがあるため。
+const WEEK_FINAL = Number(process.env.CLAUDE_USAGE_GUARD_WEEK_FINAL_THRESHOLD) || 97;
 // collect.js のハートビートは10分間隔。それを超えて古い値は信用しない。
 // 古い値で促すと、枠が切り替わった直後に誤発火しかねない。
 const STALE_MS = 15 * 60 * 1000;
@@ -65,31 +73,50 @@ const fmtTime = (epochSec) => {
 
 // 促し文。コミットさせないのは意図的で、この時点のコードは検証を通っていない。
 // 代わりに dirty かどうかを引き継ぎに残させ、次のセッションが気付けるようにする。
-function buildMessage(hits, st) {
-  const lines = ['[usage-tracker] プラン利用枠が閾値に達しました。'];
+function buildMessage(stages, st) {
+  const anyFinal = stages.five === 'final' || stages.seven === 'final';
+  const lines = [
+    anyFinal
+      ? '[usage-tracker] プラン利用枠の上限が目前です。'
+      : '[usage-tracker] プラン利用枠が閾値に達しました。',
+  ];
 
-  if (hits.five) {
+  if (stages.five) {
+    const tag = stages.five === 'final' ? '【最終】' : '【警告】';
     lines.push(
-      `- 5時間枠: ${Math.round(st.five_pct)}%(閾値 ${FIVE_THRESHOLD}%)/ リセット ${fmtTime(st.five_reset)}`
+      `- 5時間枠: ${Math.round(st.five_pct)}% ${tag} 残り約 ${Math.max(0, 100 - Math.round(st.five_pct))}% / リセット ${fmtTime(st.five_reset)}`
     );
   }
-  if (hits.seven) {
+  if (stages.seven) {
+    const tag = stages.seven === 'final' ? '【最終】' : '【警告】';
     lines.push(
-      `- 週次枠: ${Math.round(st.seven_pct)}%(閾値 ${WEEK_THRESHOLD}%)/ リセット ${fmtTime(st.seven_reset)}`
+      `- 週次枠: ${Math.round(st.seven_pct)}% ${tag} 残り約 ${Math.max(0, 100 - Math.round(st.seven_pct))}% / リセット ${fmtTime(st.seven_reset)}`
     );
   }
   lines.push('');
 
-  if (hits.five) {
-    // 5h枠は数時間で戻る。問題は「いま打ち切られること」なので、畳ませる。
-    lines.push('新しい作業には着手せず、いま手を付けている処理を安全に区切ってください。そのうえで:');
+  // 畳ませるかどうかの分岐。週次枠の1段目だけは「まだ畳まなくてよい」段階で、
+  // それ以外(5h枠に触れた時点、または週次枠の最終段)は畳ませる。
+  const wrapNow = !!stages.five || stages.seven === 'final';
+
+  if (wrapNow) {
+    lines.push(
+      anyFinal
+        ? 'これが最後の通知です。次に止まるときは枠切れで、記録を残す機会はありません。'
+        : '新しい作業には着手せず、いま手を付けている処理を安全に区切ってください。'
+    );
+    lines.push('ただちに以下を実行してください:');
     lines.push('');
     lines.push('1. `git status --short` を実行し、未コミット変更の有無を確認する');
     lines.push('2. その結果(dirty ならファイル名も)を引き継ぎに含める形で `/wrap` を実行する');
     lines.push('');
     lines.push('コミット・ビルド・テストは行わないでください(検証を通していない状態のため)。');
+    if (stages.seven === 'final') {
+      lines.push('週次枠を使い切るとリセットまで数日間まったく作業できません。5時間枠の残量とは');
+      lines.push('無関係に打ち切られるため、残量に余裕があるように見えても続行しないでください。');
+    }
   } else {
-    // 週次枠だけの場合は緊急性が違う。いま畳む必要はないが、残量を意識させる。
+    // 週次枠の1段目。緊急性が違うので、いま畳ませるのではなく残量を意識させる。
     lines.push('このセッションを直ちに畳む必要はありませんが、週次枠を使い切るとリセットまで');
     lines.push('数日間まったく作業できなくなります。大きな作業に着手する前に、残量で足りるかを');
     lines.push('ユーザーに確認してください。区切りがついた時点で `/wrap` を実行し、引き継ぎを');
@@ -97,11 +124,27 @@ function buildMessage(hits, st) {
   }
 
   lines.push('');
-  lines.push('この通知は枠ごとに1回だけです。作業を続けるかどうかはユーザーの判断に従ってください。');
+  lines.push('この通知は枠ごと・段階ごとに1回だけです。作業を続けるかどうかはユーザーの判断に従ってください。');
   return lines.join('\n');
 }
 
-// 促すべき枠を返す。促さない理由が一つでもあればその枠は対象外。
+// ある枠について、いま promote すべき段階を返す('final' / 'warn' / null)。
+// 記録された枠が既にリセット済みなら、その使用率は前の枠のもの。発火済みかは枠の
+// リセット時刻をキーに判定するので、枠が変われば自動的に解除される。
+function stageFor(pct, reset, prevReset, prevStage, warnAt, finalAt) {
+  if (typeof pct !== 'number' || !reset) return null;
+  if (reset * 1000 <= Date.now()) return null;
+
+  // 同じ枠での発火済み段階。枠が変わっていれば未発火として扱う。
+  const done = prevReset === reset ? prevStage : null;
+
+  if (pct >= finalAt && done !== 'final') return 'final';
+  // 最終段を出したあとに警告段を出しても意味がないので抑止する。
+  if (pct >= warnAt && !done) return 'warn';
+  return null;
+}
+
+// 促すべき枠と段階を返す。促さない理由が一つでもあればその枠は対象外。
 function evaluate(sid) {
   const st = readJson(COLLECT_STATE);
   if (!st) return null;
@@ -110,41 +153,25 @@ function evaluate(sid) {
   if (!isFinite(age) || age > STALE_MS) return null;
 
   const prev = readJson(stateFileFor(sid)) || {};
-  const now = Date.now();
-  const hits = { five: false, seven: false };
+  const stages = {
+    five: stageFor(st.five_pct, st.five_reset, prev.five_reset, prev.five_stage, FIVE_THRESHOLD, FIVE_FINAL),
+    seven: stageFor(st.seven_pct, st.seven_reset, prev.seven_reset, prev.seven_stage, WEEK_THRESHOLD, WEEK_FINAL),
+  };
 
-  // 記録された枠が既にリセット済みなら、その使用率は前の枠のもの。
-  // 発火済みかは枠のリセット時刻をキーに判定するので、枠が変われば自動的に解除される。
-  if (
-    typeof st.five_pct === 'number' && st.five_reset &&
-    st.five_reset * 1000 > now && st.five_pct >= FIVE_THRESHOLD &&
-    !(prev.five_reset === st.five_reset && prev.five_fired)
-  ) {
-    hits.five = true;
-  }
-
-  if (
-    typeof st.seven_pct === 'number' && st.seven_reset &&
-    st.seven_reset * 1000 > now && st.seven_pct >= WEEK_THRESHOLD &&
-    !(prev.seven_reset === st.seven_reset && prev.seven_fired)
-  ) {
-    hits.seven = true;
-  }
-
-  if (!hits.five && !hits.seven) return null;
-  return { hits, st, prev };
+  if (!stages.five && !stages.seven) return null;
+  return { stages, st, prev };
 }
 
-function markFired(sid, hits, st, prev) {
+function markFired(sid, stages, st, prev) {
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
     const next = {
       // 発火していない側は以前の記録を保つ。片方の発火でもう片方が消えると
       // 同じ枠で二重に促してしまう。
-      five_reset: hits.five ? st.five_reset : prev.five_reset,
-      five_fired: hits.five ? true : !!prev.five_fired,
-      seven_reset: hits.seven ? st.seven_reset : prev.seven_reset,
-      seven_fired: hits.seven ? true : !!prev.seven_fired,
+      five_reset: stages.five ? st.five_reset : prev.five_reset,
+      five_stage: stages.five || prev.five_stage || null,
+      seven_reset: stages.seven ? st.seven_reset : prev.seven_reset,
+      seven_stage: stages.seven || prev.seven_stage || null,
       ts: new Date().toISOString(),
     };
     fs.writeFileSync(stateFileFor(sid), JSON.stringify(next));
@@ -185,7 +212,7 @@ function main() {
   if (mode === 'status') {
     const st = readJson(COLLECT_STATE);
     const sid = process.argv[3] || '_unknown';
-    console.log(`閾値: 5h=${FIVE_THRESHOLD}% / 7d=${WEEK_THRESHOLD}%`);
+    console.log(`閾値: 5h 警告${FIVE_THRESHOLD}%/最終${FIVE_FINAL}% , 7d 警告${WEEK_THRESHOLD}%/最終${WEEK_FINAL}%`);
     console.log(
       'collect-state:',
       st ? `5h=${st.five_pct}% 7d=${st.seven_pct}% (ts=${st.ts})` : '(なし)'
@@ -195,7 +222,7 @@ function main() {
     console.log(`guard-state: ${files.length} セッション分`);
     for (const f of files) console.log('  ', f, JSON.stringify(readJson(path.join(STATE_DIR, f))));
     const hit = evaluate(sid);
-    console.log(`判定(sid=${sid}):`, hit ? JSON.stringify(hit.hits) : '促さない');
+    console.log(`判定(sid=${sid}):`, hit ? JSON.stringify(hit.stages) : '促さない');
     return;
   }
   if (mode === 'reset') {
@@ -215,8 +242,8 @@ function main() {
   const hit = evaluate(input.session_id);
   if (!hit) return;
 
-  markFired(input.session_id, hit.hits, hit.st, hit.prev);
-  const message = buildMessage(hit.hits, hit.st);
+  markFired(input.session_id, hit.stages, hit.st, hit.prev);
+  const message = buildMessage(hit.stages, hit.st);
 
   if (event === 'Stop') {
     // exit 2 でターンの終了を差し止め、stderr を Claude に渡す。
