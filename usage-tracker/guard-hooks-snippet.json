@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node C:/claude/ClaudeCode/usage-tracker/guard.js",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node C:/claude/ClaudeCode/usage-tracker/guard.js",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
