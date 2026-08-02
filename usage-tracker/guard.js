@@ -61,9 +61,22 @@ const readJson = (file) => {
 const stateFileFor = (sid) =>
   path.join(STATE_DIR, (sid || '_unknown').replace(/[^A-Za-z0-9_.-]/g, '_') + '.json');
 
-const fmtTime = (epochSec) => {
+// リセット時刻は実測では Unix epoch 秒で来るが、analyze.js は ISO8601 文字列も
+// 受け付ける。こちらだけ数値前提にすると、将来表現が変わったとき「期限切れの枠で
+// 発火する」「時刻が Invalid Date になる」という形で静かに壊れるので同じ扱いにする。
+function normalizeResetMs(v) {
+  if (typeof v === 'number' && isFinite(v)) return v * 1000;
+  if (typeof v === 'string') {
+    const t = Date.parse(v);
+    return isFinite(t) ? t : null;
+  }
+  return null;
+}
+
+const fmtTime = (ms) => {
+  if (ms == null || !isFinite(ms)) return '不明';
   try {
-    return new Date(epochSec * 1000).toLocaleString('ja-JP', {
+    return new Date(ms).toLocaleString('ja-JP', {
       month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit',
     });
   } catch {
@@ -73,7 +86,7 @@ const fmtTime = (epochSec) => {
 
 // 促し文。コミットさせないのは意図的で、この時点のコードは検証を通っていない。
 // 代わりに dirty かどうかを引き継ぎに残させ、次のセッションが気付けるようにする。
-function buildMessage(stages, st) {
+function buildMessage(stages, st, resets) {
   const anyFinal = stages.five === 'final' || stages.seven === 'final';
   const lines = [
     anyFinal
@@ -84,13 +97,13 @@ function buildMessage(stages, st) {
   if (stages.five) {
     const tag = stages.five === 'final' ? '【最終】' : '【警告】';
     lines.push(
-      `- 5時間枠: ${Math.round(st.five_pct)}% ${tag} 残り約 ${Math.max(0, 100 - Math.round(st.five_pct))}% / リセット ${fmtTime(st.five_reset)}`
+      `- 5時間枠: ${Math.round(st.five_pct)}% ${tag} 残り約 ${Math.max(0, 100 - Math.round(st.five_pct))}% / リセット ${fmtTime(resets.five)}`
     );
   }
   if (stages.seven) {
     const tag = stages.seven === 'final' ? '【最終】' : '【警告】';
     lines.push(
-      `- 週次枠: ${Math.round(st.seven_pct)}% ${tag} 残り約 ${Math.max(0, 100 - Math.round(st.seven_pct))}% / リセット ${fmtTime(st.seven_reset)}`
+      `- 週次枠: ${Math.round(st.seven_pct)}% ${tag} 残り約 ${Math.max(0, 100 - Math.round(st.seven_pct))}% / リセット ${fmtTime(resets.seven)}`
     );
   }
   lines.push('');
@@ -131,12 +144,13 @@ function buildMessage(stages, st) {
 // ある枠について、いま promote すべき段階を返す('final' / 'warn' / null)。
 // 記録された枠が既にリセット済みなら、その使用率は前の枠のもの。発火済みかは枠の
 // リセット時刻をキーに判定するので、枠が変われば自動的に解除される。
-function stageFor(pct, reset, prevReset, prevStage, warnAt, finalAt) {
-  if (typeof pct !== 'number' || !reset) return null;
-  if (reset * 1000 <= Date.now()) return null;
+// resetMs / prevResetMs は normalizeResetMs 済みの ms 値。
+function stageFor(pct, resetMs, prevResetMs, prevStage, warnAt, finalAt) {
+  if (typeof pct !== 'number' || resetMs == null) return null;
+  if (resetMs <= Date.now()) return null;
 
   // 同じ枠での発火済み段階。枠が変わっていれば未発火として扱う。
-  const done = prevReset === reset ? prevStage : null;
+  const done = prevResetMs === resetMs ? prevStage : null;
 
   if (pct >= finalAt && done !== 'final') return 'final';
   // 最終段を出したあとに警告段を出しても意味がないので抑止する。
@@ -153,24 +167,30 @@ function evaluate(sid) {
   if (!isFinite(age) || age > STALE_MS) return null;
 
   const prev = readJson(stateFileFor(sid)) || {};
+  // フラグ側も ms で持つ。書き出しと読み出しで同じ正規化を通すので、
+  // 表現が混在しても同じ枠は同じキーに落ちる。
+  const resets = {
+    five: normalizeResetMs(st.five_reset),
+    seven: normalizeResetMs(st.seven_reset),
+  };
   const stages = {
-    five: stageFor(st.five_pct, st.five_reset, prev.five_reset, prev.five_stage, FIVE_THRESHOLD, FIVE_FINAL),
-    seven: stageFor(st.seven_pct, st.seven_reset, prev.seven_reset, prev.seven_stage, WEEK_THRESHOLD, WEEK_FINAL),
+    five: stageFor(st.five_pct, resets.five, prev.five_reset_ms, prev.five_stage, FIVE_THRESHOLD, FIVE_FINAL),
+    seven: stageFor(st.seven_pct, resets.seven, prev.seven_reset_ms, prev.seven_stage, WEEK_THRESHOLD, WEEK_FINAL),
   };
 
   if (!stages.five && !stages.seven) return null;
-  return { stages, st, prev };
+  return { stages, st, prev, resets };
 }
 
-function markFired(sid, stages, st, prev) {
+function markFired(sid, stages, resets, prev) {
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
     const next = {
       // 発火していない側は以前の記録を保つ。片方の発火でもう片方が消えると
       // 同じ枠で二重に促してしまう。
-      five_reset: stages.five ? st.five_reset : prev.five_reset,
+      five_reset_ms: stages.five ? resets.five : prev.five_reset_ms,
       five_stage: stages.five || prev.five_stage || null,
-      seven_reset: stages.seven ? st.seven_reset : prev.seven_reset,
+      seven_reset_ms: stages.seven ? resets.seven : prev.seven_reset_ms,
       seven_stage: stages.seven || prev.seven_stage || null,
       ts: new Date().toISOString(),
     };
@@ -242,8 +262,8 @@ function main() {
   const hit = evaluate(input.session_id);
   if (!hit) return;
 
-  markFired(input.session_id, hit.stages, hit.st, hit.prev);
-  const message = buildMessage(hit.stages, hit.st);
+  markFired(input.session_id, hit.stages, hit.resets, hit.prev);
+  const message = buildMessage(hit.stages, hit.st, hit.resets);
 
   if (event === 'Stop') {
     // exit 2 でターンの終了を差し止め、stderr を Claude に渡す。

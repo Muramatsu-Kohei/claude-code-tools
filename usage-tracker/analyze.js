@@ -44,14 +44,24 @@ function parseCount(raw, fallback) {
   return isFinite(n) && n > 0 ? n : fallback;
 }
 
+// 値を伴う引数で値が欠けたまま進むと、後段のパス操作が undefined で例外になり
+// スタックトレースだけが出る。原因の分かるメッセージにしてここで止める。
+function takeValue(name, v) {
+  if (v == null) {
+    console.error(`${name} には値が必要です`);
+    process.exit(1);
+  }
+  return v;
+}
+
 function parseArgs(argv) {
   // weeks と days は排他。両方を同時に効かせると範囲の意味が曖昧になるので、
   // 後から指定された方を採用してもう一方を無効化する。
   const opts = { log: DEFAULT_LOG, html: null, json: false, weeks: CHART_WEEKS_DEFAULT, days: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--log') opts.log = argv[++i];
-    else if (a === '--html') opts.html = argv[++i];
+    if (a === '--log') opts.log = takeValue('--log', argv[++i]);
+    else if (a === '--html') opts.html = takeValue('--html', argv[++i]);
     else if (a === '--json') opts.json = true;
     else if (a === '--weeks') { opts.weeks = parseCount(argv[++i], CHART_WEEKS_DEFAULT); opts.days = null; }
     else if (a === '--days') { opts.days = parseCount(argv[++i], CHART_DAYS_FALLBACK); opts.weeks = null; }
@@ -239,7 +249,7 @@ function buildWindows(rows) {
 function regress(points) {
   // points: [{x: five到達幅, y: seven増分}]。x, y はどちらも「%」単位。
   const n = points.length;
-  if (n < 2) return { n, insufficient: true };
+  if (n < 2) return { n, insufficient: true, reason: 'few_samples' };
 
   let sxy = 0, sxx = 0, sx = 0, sy = 0;
   for (const p of points) {
@@ -269,12 +279,21 @@ function regress(points) {
     r2 = sst > 0 ? 1 - sse / sst : null;
   }
 
+  // 傾きが正でなければ「満タン何回で上限か」は計算できない(1/slope が無限大か負になる)。
+  // 週次枠の分解能は1%しかないため、7d の増分が全 window で0に丸められる期間は実際に
+  // 起こりうる。負に振れるのは、取りこぼした週次リセットを跨いだ window が紛れた場合。
+  // どちらも「まだ測れていない」だけなので、数字を出さずにその旨を返す。
+  if (slopeLS == null || !(slopeLS > 0)) {
+    return { n, insufficient: true, reason: 'no_slope', slopeLS, slopeAvg, r2 };
+  }
+
   // 「5h枠を100%まで使い切ったら7dが何%進むか」= slope * 100
   // 「週次リミットに当たるまでの5h枠満タン回数」= 100 / (slope * 100) = 1 / slope
-  const fullFillPctLS = slopeLS != null ? slopeLS * 100 : null;
+  const fullFillPctLS = slopeLS * 100;
   const fullFillPctAvg = slopeAvg != null ? slopeAvg * 100 : null;
-  const windowsToLimitLS = fullFillPctLS ? 100 / fullFillPctLS : null;
-  const windowsToLimitAvg = fullFillPctAvg ? 100 / fullFillPctAvg : null;
+  const windowsToLimitLS = 100 / fullFillPctLS;
+  // 単純平均側は最小二乗と独立に符号が変わりうるので、こちらも正のときだけ出す。
+  const windowsToLimitAvg = fullFillPctAvg > 0 ? 100 / fullFillPctAvg : null;
 
   return {
     n, insufficient: false, slopeLS, slopeAvg, r2,
@@ -320,6 +339,24 @@ const EXCLUDE_LABEL = {
   seven_pct_unavailable: '7d%データなし',
 };
 
+// 推定が出せないときの説明。コンソールと HTML で同じ文言を使う。
+// 「なぜ出ないか」と「何を待てばよいか」まで書かないと、壊れているのか
+// データ待ちなのかが読み手に区別できない。
+function fewSamplesNote(reg) {
+  return `データ不足: 回帰に使える window が ${reg.n} 件しかない。あと最低 ${2 - reg.n} 窓分のデータが必要。`;
+}
+
+function noSlopeNote(reg) {
+  const slope = reg.slopeLS == null ? '—' : reg.slopeLS.toFixed(4);
+  // 傾きが0か負かで疑うべき原因が違う。0 は単に測れていないだけだが、
+  // 負は週次枠が減ったことを意味するので、データ側の異常を疑う必要がある。
+  const cause =
+    reg.slopeLS < 0
+      ? '7d 増分が負になっている。取りこぼした週次リセットを跨いだ window が混ざっている可能性がある。'
+      : '7d% の分解能は1%しかないため増分が0に丸められた可能性が高い。5h枠を大きく使った window が溜まれば出るようになる。';
+  return `推定不可: 回帰に使えた ${reg.n} window では 7d 増分に正の傾きが出ていない(傾き ${slope})。${cause}`;
+}
+
 function printSummary(result) {
   console.log('=== Claude Code 使用量レポート ===');
   console.log(`ログ: ${result.logPath}`);
@@ -344,16 +381,19 @@ function printSummary(result) {
 
   const reg = result.regression;
   if (reg.insufficient) {
-    const need = 2 - reg.n;
     console.log(`--- 推定 ---`);
-    console.log(`データ不足: 回帰に使える window が ${reg.n} 件しかない。あと最低 ${need} 窓分のデータが必要。`);
+    console.log(reg.reason === 'no_slope' ? noSlopeNote(reg) : fewSamplesNote(reg));
     return;
   }
 
   console.log('--- 推定(5h枠を100%使い切ったときの7d進み幅、および週次リミットまでの満タン回数) ---');
   console.log(`サンプル数: ${reg.n} window`);
   console.log(`最小二乗(原点通過): 5h100%あたり 7d ${reg.fullFillPctLS.toFixed(3)}% 進む → 満タン ${reg.windowsToLimitLS.toFixed(2)} 回で週次リミット`);
-  console.log(`単純平均:           5h100%あたり 7d ${reg.fullFillPctAvg.toFixed(3)}% 進む → 満タン ${reg.windowsToLimitAvg.toFixed(2)} 回で週次リミット`);
+  console.log(
+    reg.windowsToLimitAvg != null
+      ? `単純平均:           5h100%あたり 7d ${reg.fullFillPctAvg.toFixed(3)}% 進む → 満タン ${reg.windowsToLimitAvg.toFixed(2)} 回で週次リミット`
+      : `単純平均:           傾きが正にならないため算出せず`
+  );
   console.log(`決定係数 R^2(原点基準): ${reg.r2 != null ? reg.r2.toFixed(4) : '—'}`);
 }
 
@@ -581,12 +621,12 @@ function buildWindowTableRows(windows) {
 function buildHtml(result, opts = {}) {
   const reg = result.regression;
 
-  const heroValue = reg.insufficient
-    ? 'データ不足'
-    : `${reg.windowsToLimitLS.toFixed(1)} 回`;
-  const heroSub = reg.insufficient
-    ? `回帰に使える window が ${reg.n} 件(最低2件必要。あと ${2 - reg.n} 窓分のデータを待つ)`
-    : `5h枠を満タンにした回数がこれに達すると週次リミットに当たる見込み(最小二乗推定)`;
+  const heroValue = !reg.insufficient
+    ? `${reg.windowsToLimitLS.toFixed(1)} 回`
+    : reg.reason === 'no_slope' ? '推定不可' : 'データ不足';
+  const heroSub = !reg.insufficient
+    ? `5h枠を満タンにした回数がこれに達すると週次リミットに当たる見込み(最小二乗推定)`
+    : reg.reason === 'no_slope' ? noSlopeNote(reg) : fewSamplesNote(reg);
 
   const secondaryStats = reg.insufficient ? '' : `
     <div class="stat-row">
@@ -596,7 +636,7 @@ function buildHtml(result, opts = {}) {
       </div>
       <div class="stat-tile">
         <div class="stat-label">単純平均による満タン回数</div>
-        <div class="stat-value">${reg.windowsToLimitAvg.toFixed(1)} 回</div>
+        <div class="stat-value">${reg.windowsToLimitAvg != null ? `${reg.windowsToLimitAvg.toFixed(1)} 回` : '—'}</div>
       </div>
       <div class="stat-tile">
         <div class="stat-label">決定係数 R²(原点基準)</div>
@@ -923,6 +963,8 @@ function main() {
   }
 }
 
-main();
+// 直接実行されたときだけ走らせる。require で読み込んだだけで report.html を
+// 書き換えてしまうと、集計関数を再利用する側が本番のレポートを壊す。
+if (require.main === module) main();
 
-module.exports = { analyze, regress, buildWindows, loadRows };
+module.exports = { analyze, regress, buildWindows, loadRows, buildHtml };

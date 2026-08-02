@@ -52,6 +52,8 @@ function Remove-HookBlock([string]$text) {
 }
 
 # 過去バージョンのマーカー(begin/end で囲っていなかった頃のもの)も掃除対象にする。
+# StrictMode 下でも未定義参照にならないよう明示的に初期化しておく。
+$legacyFound = $false
 $legacyMark = '// --- usage-tracker hook (installed by'
 if ($content -like "*$legacyMark*") {
   $legacyPattern = "(\r?\n)*" + [regex]::Escape($legacyMark) + "[\s\S]*?\}\s*$"
