@@ -1,6 +1,6 @@
 # Claude アカウント分離：現状の事実とガード設計
 
-最終更新: 2026-08-02 / 状態: **未実装（アカウントは組織の 1 つのみ）**
+最終更新: 2026-08-03 / 状態: **未実装（アカウントは組織の 1 つのみ）**
 
 将来、組織アカウントとは別に個人アカウントを契約した場合に備えた設計メモ。
 「今すぐ何かする」ためではなく、**契約した時点で読み返す**ためのもの。
@@ -106,9 +106,9 @@ project-d, project-e, project-f, project-g, project-h, project-i, project-j, お
 
 ### 3.5 usage-tracker がアカウントを区別しない
 
-`usage-tracker/collect.js` の `row`（L58-74）は
+`usage-tracker/collect.js` が追記する `row` のキーは
 `ts / five_pct / five_reset / seven_pct / seven_reset / model / effort / fast / in_tok / out_tok / cost / sid`。
-**アカウント識別子がない。**
+**アカウント識別子がない。**（行番号ではなく `row` の定義を辿ること。collect.js は今後も触るため）
 
 切り替えると組織の `five_pct: 80` と個人の `five_pct: 5` が 1 本の時系列に混ざり、
 `guard.js` の閾値判定も `analyze.js` の推定も壊れる。
@@ -120,13 +120,13 @@ project-d, project-e, project-f, project-g, project-h, project-i, project-j, お
 
 ### 4.1 使える機構（Claude Code のフック仕様より）
 
-| 機構 | 効果 |
-|---|---|
-| `SessionStart` フックが `{"continue": false, "stopReason": "..."}` を返す | セッション開始をブロック |
-| `PreToolUse` フックが `hookSpecificOutput.permissionDecision: "deny"` を返す | ツール単位で拒否 |
-| `CwdChanged` フック | セッション途中の `cd` を捕捉 |
-| `permissions.deny` に `Read(C:/org-tree/**)` 等 | パス単位の静的拒否 |
-| `forceLoginOrgUUID`（managed settings 専用） | 認証アカウントの組織を強制 |
+| 機構 | 効果 | 確度 |
+|---|---|---|
+| `SessionStart` フックが `{"continue": false, "stopReason": "..."}` を返す | セッション開始をブロック | スキーマ上は可・**実効性は未検証**（§5） |
+| `PreToolUse` フックが `hookSpecificOutput.permissionDecision: "deny"` を返す | ツール単位で拒否 | 確定 |
+| `CwdChanged` フック | セッション途中の `cd` を捕捉 | **存在自体が未確認**（§7） |
+| `permissions.deny` に `Read(C:/org-tree/**)` 等 | パス単位の静的拒否 | 確定 |
+| `forceLoginOrgUUID`（managed settings 専用） | 認証アカウントの組織を強制 | 確定 |
 
 ### 4.2 核心的な制約：identity は取れない（が、プラン種別は取れる）
 
@@ -172,7 +172,8 @@ process.stdin.on('data', (c) => (input += c));
 process.stdin.on('end', () => {
   let cwd = process.cwd();
   try {
-    // SessionStart の入力に cwd が含まれるかは未検証のため、あれば使う程度に留める。
+    // SessionStart の入力には cwd と session_id が入る(claude-worklog の
+    // cmdSessionStart が現に使っている)。process.cwd() は取れなかった場合の保険。
     const d = JSON.parse(input || '{}');
     if (typeof d.cwd === 'string' && d.cwd) cwd = d.cwd;
   } catch {}
@@ -264,7 +265,8 @@ process.stdin.on('data', (c) => (input += c));
 process.stdin.on('end', () => {
   let cwd = process.cwd();
   try {
-    // SessionStart の入力に cwd が含まれるかは未検証のため、あれば使う程度に留める。
+    // SessionStart の入力には cwd と session_id が入る(claude-worklog の
+    // cmdSessionStart が現に使っている)。process.cwd() は取れなかった場合の保険。
     const d = JSON.parse(input || '{}');
     if (typeof d.cwd === 'string' && d.cwd) cwd = d.cwd;
   } catch {}
@@ -307,6 +309,12 @@ process.stdin.on('end', () => {
 `SessionStart` だけだと起動時しか見ないため、セッション途中の `cd` を捕捉する
 `CwdChanged` も併せて登録する。
 
+**ただし `CwdChanged` というフックが実在するかは未確認**（§7）。確認できているフックは
+`SessionStart` / `SessionEnd` / `PreToolUse` / `PostToolUse` / `UserPromptSubmit` /
+`Notification` / `Stop` / `SubagentStop` / `PreCompact` で、この中には無い。
+存在しない場合、セッション途中のツリー移動は下の**補強**（`PreToolUse` で毎回 cwd と
+アカウントを突き合わせる）に頼ることになり、常用前提の構成になる。実装前に確認すること。
+
 **補強**: §3.4 の「ディレクトリは砂場ではない」に対しては、
 個人アカウントのセッションで `PreToolUse`（`Read|Bash|Grep|Glob`）を見て
 `C:/org-tree` へのアクセスを `permissionDecision: "deny"` で止める層を足す。
@@ -323,6 +331,16 @@ process.stdin.on('end', () => {
 ---
 
 ## 5. 個人アカウントを契約するときの前提作業チェックリスト
+
+実装に着手する前に、設計の生死を決める 2 つを先に潰す。どちらも外れると案 A が
+**黙って素通しになる**（止まらないのに止まっているつもりになるのが最悪の壊れ方）。
+
+- [ ] **`SessionStart` フックの `continue: false` が実際にセッションを止めるか実測する**
+      — スキーマ上は可だが未実行検証。効かなければブロック層を `PreToolUse` に移すしかなく、
+      §4.4 の「読めなければ安全側に倒す」設計自体が無効化される
+- [ ] **`CwdChanged` フックが実在するか確認する**（§4.5・§7）
+
+その上で:
 
 - [ ] `~/.claude/CLAUDE.md` に組織固有の記述がないことを確認する（現状は汎用方針のみで OK）
 - [ ] `usage-tracker/collect.js` の `row` にアカウント識別子を追加する（§3.5）
@@ -355,9 +373,16 @@ process.stdin.on('end', () => {
 ## 7. 未確認事項
 
 - ~~`.credentials.json` の中身~~ → 2026-08-02 に確認済み（§4.4）
+- ~~`SessionStart` の stdin JSON に `cwd` が含まれるか~~ → **含まれる**。`claude-worklog` の
+  `cmdSessionStart` が `input.cwd` と `input.session_id` を使って現に動作している（2026-08-03 確認）
 - 個人プラン（Pro / Max）での `subscriptionType` の実際の値
 - `SessionStart` フックが `continue: false` を実際に尊重するか（スキーマ上は可、未実行検証）
-- `SessionStart` の stdin JSON に `cwd` が含まれるか
+  → 実装前の必須検証として §5 に移した
+- **`CwdChanged` フックが実在するか**（§4.1・§4.5 がこれに依存している）。確認できている
+  フックは `SessionStart` / `SessionEnd` / `PreToolUse` / `PostToolUse` / `UserPromptSubmit` /
+  `Notification` / `Stop` / `SubagentStop` / `PreCompact` の 9 種で、この中には無い。
+  なお実行バイナリ（`~/.local/share/claude/versions/*`、約 253 MB）の文字列検索では
+  既知のフック名すべてが 0 件になる（文字列が圧縮されているため）。**この手段では確認できない**
 - `claude --help` の環境変数一覧（実行が権限でブロック）
 - Anthropic の利用規約における複数アカウント保持の正確な条項
 - 所属組織の知財規程
