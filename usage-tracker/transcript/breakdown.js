@@ -1,23 +1,10 @@
 'use strict';
 // トランスクリプトから「どのモデル・どの層」でトークンを使っているかを集計する。
-// ローカルLLMへ委譲した場合に削減しうる上限を見積もるのが目的。
-const fs = require('fs');
-const path = require('path');
-const readline = require('readline');
+// 委譲やモデル切り替えで削減しうる上限を見積もるのが目的。
+const { modelKey, transcriptFiles, records } = require('./lib');
 
-const ROOT = path.join(process.env.USERPROFILE, '.claude', 'projects');
-
-function walk(dir, out = []) {
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) walk(p, out);
-    else if (e.name.endsWith('.jsonl')) out.push(p);
-  }
-  return out;
-}
-
-const agg = new Map(); // key: model|layer
-const toolBytes = new Map(); // tool_result の生バイト量(委譲候補の目安)
+const agg = new Map();       // key: model|layer
+const toolChars = new Map(); // ツール名 → tool_result の総文字数(委譲候補の目安)
 let minT = null, maxT = null;
 
 function bump(key, u) {
@@ -31,14 +18,14 @@ function bump(key, u) {
 }
 
 (async () => {
-  const files = walk(ROOT);
+  const files = transcriptFiles();
   for (const f of files) {
-    const rl = readline.createInterface({ input: fs.createReadStream(f), crlfDelay: Infinity });
-    for await (const line of rl) {
-      if (!line.trim()) continue;
-      let o;
-      try { o = JSON.parse(line); } catch { continue; }
+    // tool_result 側にツール名は入っていないので、直前の assistant の tool_use から
+    // id → 名前を覚えておいて引く。対応表をファイル単位で捨てるのは、id が一意なのは
+    // セッション内で十分であり、全ファイル分を抱えるとメモリが伸び続けるため。
+    const toolName = new Map();
 
+    for await (const o of records(f)) {
       if (o.timestamp) {
         if (!minT || o.timestamp < minT) minT = o.timestamp;
         if (!maxT || o.timestamp > maxT) maxT = o.timestamp;
@@ -47,19 +34,21 @@ function bump(key, u) {
       // アシスタント応答の usage を集計
       const u = o.message && o.message.usage;
       if (o.type === 'assistant' && u) {
-        const model = (o.message.model || 'unknown').replace('claude-', '');
-        const layer = o.isSidechain ? 'subagent' : 'main';
-        bump(`${model}|${layer}`, u);
+        bump(`${modelKey(o.message.model)}|${o.isSidechain ? 'subagent' : 'main'}`, u);
+      }
+      if (o.type === 'assistant' && o.message && Array.isArray(o.message.content)) {
+        for (const c of o.message.content) {
+          if (c.type === 'tool_use' && c.id) toolName.set(c.id, c.name || 'unknown');
+        }
       }
 
       // ユーザー側の tool_result のサイズ = 「外から流し込まれた情報量」
       if (o.type === 'user' && o.message && Array.isArray(o.message.content)) {
         for (const c of o.message.content) {
-          if (c.type === 'tool_result') {
-            const s = typeof c.content === 'string' ? c.content : JSON.stringify(c.content || '');
-            const name = o.toolUseResult && o.toolUseResult.type ? o.toolUseResult.type : 'result';
-            toolBytes.set(name, (toolBytes.get(name) || 0) + s.length);
-          }
+          if (c.type !== 'tool_result') continue;
+          const s = typeof c.content === 'string' ? c.content : JSON.stringify(c.content || '');
+          const name = toolName.get(c.tool_use_id) || 'unknown';
+          toolChars.set(name, (toolChars.get(name) || 0) + s.length);
         }
       }
     }
@@ -82,7 +71,7 @@ function bump(key, u) {
   }
   console.log('\n合計 output=' + tot.out + ' input=' + tot.in + ' cache_creation=' + tot.cc + ' cache_read=' + tot.cr);
 
-  console.log('\n--- tool_result の総量(文字数, 上位) ---');
-  const tb = [...toolBytes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12);
+  console.log('\n--- tool_result の総量(ツール別・文字数, 上位) ---');
+  const tb = [...toolChars.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12);
   for (const [k, v] of tb) console.log(k.padEnd(24) + (v / 1000).toFixed(0).padStart(10) + ' K chars');
 })();
