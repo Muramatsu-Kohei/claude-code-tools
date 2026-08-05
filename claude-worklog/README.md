@@ -123,27 +123,58 @@ $ claude                     # 同じディレクトリで新しいセッショ�
 
 ### 2. スキル(`/wrap` `/finish` `/handoff`)を配置する
 
-`skills/` の 3 つのフォルダを `~/.claude/skills/` にコピーする。
+Claude Code はスキルを `~/.claude/skills/` から読むので、`skills/` の 3 つをそこから見えるように
+する。**コピーではなくリンクを張る。**コピーだとこのリポジトリを直したときに反映漏れが起きる
+(実際に 3 スキルすべてで起きた。理由は後述)。
+
+**同じ名前のディレクトリが既にある場合は先に消す。**以前コピーで配置していた場合が該当する。
+残したままだと Windows はリンク作成が失敗し、macOS / Linux は
+**成功したように見えて** `~/.claude/skills/wrap/wrap` という入れ子ができ、古いコピーが
+そのまま使われ続ける(この手順が防ごうとしている反映漏れが、まさに移行時に再発する)。
+なお下の削除はリンクや古いコピーだけを消すもので、リポジトリの `skills/` は消えない。
+
+Windows はディレクトリジャンクションを使う。管理者権限は要らない。
 
 ```powershell
-Copy-Item .\skills\* "$env:USERPROFILE\.claude\skills\" -Recurse -Force
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\skills" | Out-Null
+foreach ($n in @('wrap','finish','handoff')) {
+  $p = "$env:USERPROFILE\.claude\skills\$n"
+  if (Test-Path $p) { Remove-Item -Recurse -Force $p }
+  New-Item -ItemType Junction -Path $p -Target "C:\絶対パス\claude-worklog\skills\$n"
+}
 ```
 
+macOS / Linux はシンボリックリンクで同じことをする。
+
 ```bash
-cp -r ./skills/* ~/.claude/skills/
+mkdir -p ~/.claude/skills
+for n in wrap finish handoff; do
+  rm -rf ~/.claude/skills/$n
+  ln -s "$PWD/skills/$n" ~/.claude/skills/$n
+done
+```
+
+張れたら、リンク先の中身がリポジトリと一致しているか確認しておく。
+
+```bash
+for n in wrap finish handoff; do diff -q skills/$n/SKILL.md ~/.claude/skills/$n/SKILL.md; done
 ```
 
 **各ファイル内の `node C:/claude/ClaudeCode/claude-worklog/worklog.js` を自分の絶対パスに
-書き換える。**書き換えを忘れると記録コマンドが失敗する。
+書き換える。**書き換えを忘れると記録コマンドが失敗する。リンクにすると書き換え先は
+リポジトリ本体なので、フォークして使う場合はこの 1 行がコミット差分として残る。それでも、
+反映漏れに気づけないコピー運用より安全と判断している。
 
 | コマンド | 用途 |
 | --- | --- |
-| `/wrap` | 記録だけ。作業の途中でも何度でも叩ける |
+| `/wrap` | 記録だけ。作業の途中でも何度でも叩ける。使用量枠の上限警告が出たときは Claude 自身が呼ぶ |
 | `/finish` | 終了手続き一括(ドキュメント反映・検証・コミット・記憶更新・記録・引き継ぎ) |
 | `/handoff [ツール名/プロジェクト名]` | 前セッションの引き継ぎを取り込み、現状との食い違いを確認して続きを再開する |
 
 **スキルとフックはセッション起動時に読み込まれる。**配置した直後の実行中セッションでは使えないので、
-新しいセッションを開いてから確認する。
+新しいセッションを開いてから確認する。これは配置後の**編集**にも当てはまる。リンクにしてあれば
+ファイルの中身は即座に共通だが、frontmatter(`description` や `disable-model-invocation`)は
+起動時に読まれた内容が使われる。呼び出され方を変えたときは、セッションを開き直すまで挙動が変わらない。
 
 ### 3. `worklog` コマンドを使えるようにする(任意)
 
@@ -423,6 +454,24 @@ worklog list --all -n 30
 `/finish` は git を触るので打つ場所を選ぶ。1 つにまとめると「まだコミットしたくないから叩かない」
 が起きて記録が抜ける。`/wrap` は記録だけなので作業の途中でも何度でも叩ける。
 
+この分担は「Claude 自身に呼ばせてよいか」にもそのまま効く。`/wrap` の SKILL.md からは
+`disable-model-invocation` を外してあり、使用量枠の上限警告が出た場面に限って Claude が自分から
+呼ぶ。枠が切れた後は記録を残す機会そのものが無くなるので、ユーザーの指示を待っていては間に合わない。
+一方 `/finish` は検証もコミットも伴うため `disable-model-invocation: true` のままにしてある。
+枠切れ間際は検証を通せない状態であり、そこで git を触らせるべきではない。
+
+### なぜスキルをコピーではなくリンクで配置するか
+
+Claude Code が読むのは `~/.claude/skills/` だけで、このリポジトリの `skills/` は見ていない。
+当初はコピーで運用していたが、コピー元を直してもコピー先が古いままであることに**気づく手段が無い**。
+実際、スコープ対応(`--scope`)を入れたときの反映が 3 スキルすべてで漏れており、
+`/finish` と `/handoff` はしばらく scope を知らない古い指示で動いていた。挙動が壊れるわけではなく
+「新機能が使われないだけ」なので、症状が出ずに埋もれる。
+
+リンクにすれば実体が 1 つになるので、この失敗が構造的に起きなくなる。代わりに、SKILL.md 内の
+絶対パスを書き換えるとリポジトリ本体が変わるという副作用を受け入れている。気づけない不整合より、
+見えるコミット差分の方が扱いやすい。
+
 ### なぜ引き継ぎの取り込みを `/handoff` として分けたか
 
 自動注入はセッションを**開いた瞬間**にしか働かない。しかし実際には「開いた後に別セッションが
@@ -492,7 +541,8 @@ SessionStart で「`start` はあるが `end` が無い」かつ「そのセッ�
 
 1. `~/.claude/settings.json` の `hooks` から `SessionStart` / `SessionEnd` の該当エントリを消す
    (併せて `permissions.allow` に足した `worklog.js` の 2 行も消す)
-2. `~/.claude/skills/` の `wrap` `finish` `handoff` を消す
+2. `~/.claude/skills/` の `wrap` `finish` `handoff` を消す(リンクで配置した場合、消えるのは
+   リンクだけでリポジトリの `skills/` は残る)
 3. ラッパーを置いた場合は PATH 上の `worklog` と `worklog.cmd` を消す
 4. 記録を破棄する場合は `~/.claude/worklog/` を消す(残しておいても他に影響はない)
 
