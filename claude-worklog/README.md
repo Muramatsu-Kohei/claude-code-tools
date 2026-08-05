@@ -127,19 +127,37 @@ Claude Code はスキルを `~/.claude/skills/` から読むので、`skills/` �
 する。**コピーではなくリンクを張る。**コピーだとこのリポジトリを直したときに反映漏れが起きる
 (実際に 3 スキルすべてで起きた。理由は後述)。
 
+**同じ名前のディレクトリが既にある場合は先に消す。**以前コピーで配置していた場合が該当する。
+残したままだと Windows はリンク作成が失敗し、macOS / Linux は
+**成功したように見えて** `~/.claude/skills/wrap/wrap` という入れ子ができ、古いコピーが
+そのまま使われ続ける(この手順が防ごうとしている反映漏れが、まさに移行時に再発する)。
+なお下の削除はリンクや古いコピーだけを消すもので、リポジトリの `skills/` は消えない。
+
 Windows はディレクトリジャンクションを使う。管理者権限は要らない。
 
 ```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\skills" | Out-Null
 foreach ($n in @('wrap','finish','handoff')) {
-  New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\$n" `
-           -Target "C:\絶対パス\claude-worklog\skills\$n"
+  $p = "$env:USERPROFILE\.claude\skills\$n"
+  if (Test-Path $p) { Remove-Item -Recurse -Force $p }
+  New-Item -ItemType Junction -Path $p -Target "C:\絶対パス\claude-worklog\skills\$n"
 }
 ```
 
 macOS / Linux はシンボリックリンクで同じことをする。
 
 ```bash
-for n in wrap finish handoff; do ln -s "$PWD/skills/$n" ~/.claude/skills/$n; done
+mkdir -p ~/.claude/skills
+for n in wrap finish handoff; do
+  rm -rf ~/.claude/skills/$n
+  ln -s "$PWD/skills/$n" ~/.claude/skills/$n
+done
+```
+
+張れたら、リンク先の中身がリポジトリと一致しているか確認しておく。
+
+```bash
+for n in wrap finish handoff; do diff -q skills/$n/SKILL.md ~/.claude/skills/$n/SKILL.md; done
 ```
 
 **各ファイル内の `node C:/claude/ClaudeCode/claude-worklog/worklog.js` を自分の絶対パスに
@@ -523,7 +541,8 @@ SessionStart で「`start` はあるが `end` が無い」かつ「そのセッ�
 
 1. `~/.claude/settings.json` の `hooks` から `SessionStart` / `SessionEnd` の該当エントリを消す
    (併せて `permissions.allow` に足した `worklog.js` の 2 行も消す)
-2. `~/.claude/skills/` の `wrap` `finish` `handoff` を消す
+2. `~/.claude/skills/` の `wrap` `finish` `handoff` を消す(リンクで配置した場合、消えるのは
+   リンクだけでリポジトリの `skills/` は残る)
 3. ラッパーを置いた場合は PATH 上の `worklog` と `worklog.cmd` を消す
 4. 記録を破棄する場合は `~/.claude/worklog/` を消す(残しておいても他に影響はない)
 
