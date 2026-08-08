@@ -314,6 +314,7 @@ node test/run.js move       # 名前の一部で絞る
 | `test/transcript.test.js` | `transcript_path` の受け渡し(子ディレクトリで開いても `turns`/`edits` が入るか)、リポジトリ単位のキー |
 | `test/scope.test.js` | スコープの導出、`list --scope`、注入(引き継ぎ+索引)、`handoff <ツール名>` |
 | `test/move.test.js` | `move` の選択・生存セッションの扱い・書き戻し・引数エラー |
+| `test/restricted.test.js` | `restrictedTrees` によるアカウントをまたいだ読み出し制限。記録は制限しないこと、似た名前の別ツリーを巻き込まないことも含む |
 
 `git` を実行できることが前提(偽リポジトリを `git init` する)。テストは実装の内部関数を
 呼ばず、コマンドの出力とログファイルの中身だけを見ている。
@@ -395,6 +396,32 @@ worklog list --all -n 30
 | `scopeMode` | `"auto"` | リポジトリ内のツール単位(スコープ)の判定。`"off"` で停止、`"on"` で常に有効 |
 | `scopeIndexMax` | `3` | 注入する「他に未完の作業があるツール」の最大件数 |
 | `scopeIndexMaxAgeDays` | `14` | これより古い未完は索引に出さない |
+| `restrictedTrees` | `[]` | 特定ツリー配下の記録を、許可されていないアカウントに見せない(下記) |
+
+### `restrictedTrees`(アカウントをまたいだ読み出し制限)
+
+複数の Claude アカウント(例: 組織の Team アカウントと個人の Pro アカウント)を使い分けている場合に、
+片方のアカウントでしか触らないツリーの作業ログを、もう片方のセッションに見せないようにする。
+
+```json
+{
+  "restrictedTrees": [
+    { "tree": "C:/org-tree", "allow": ["team"] }
+  ]
+}
+```
+
+- `tree`: 保護するディレクトリ(配下のリポジトリもすべて対象)
+- `allow`: 表示してよいアカウントの配列。`~/.claude/.credentials.json` の
+  `claudeAiOauth.subscriptionType`(`"team"` / `"pro"` など)と照合する
+- **制限するのは読み出し・表示だけ。** `worklog list` `worklog today` `worklog export` などから
+  対象ツリーの記録が見えなくなるが、`session-start` / `session-end` / `worklog add` による記録
+  (書き込み)はアカウントに関係なく今までどおり動く。許可されていないアカウントで対象ツリーを
+  作業しても記録自体は残り、後で許可されたアカウントから見える
+- 除外が起きたときは黙って消さない。`today` / `list --all` / `export --all` では
+  「別アカウント専用のツリーのため N 件のプロジェクトを表示していません」と一行添える
+  (SessionStart の自動注入では出力を汚さないよう、この注記は出さない)
+- 既定は空配列。これまでと完全に同じ挙動になる
 
 ## 保存されるもの
 
