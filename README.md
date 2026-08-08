@@ -4,6 +4,7 @@ Claude Code の運用を補助する自作ツール群。各ツールは独立�
 
 | ツール | 概要 |
 | --- | --- |
+| [account-guard](account-guard/) | 複数の Claude アカウントを使い分けるとき、特定のディレクトリツリーを許可したアカウント以外から触れないようにする。PreToolUse フックでツール呼び出しを拒否(Node.js 標準機能のみ、依存なし) |
 | [claude-statusline](claude-statusline/) | コンテキスト使用率・セッションコスト・プラン利用枠を 1 行に収めて常時表示するステータスライン(Node.js 標準機能のみ、依存なし) |
 | [claude-window-keeper](claude-window-keeper/) | 5 時間ごとの利用上限ウィンドウの開始時刻を固定し、リセット時刻を予測できるようにする(PowerShell + タスクスケジューラ) |
 | [claude-worklog](claude-worklog/) | セッションごとの作業記録を自動で溜め、次のセッションに引き継ぐ。`/wrap` `/finish` と SessionStart/SessionEnd フック(Node.js 標準機能のみ、依存なし) |
@@ -17,7 +18,7 @@ Claude Code の運用を補助する自作ツール群。各ツールは独立�
 
 | ドキュメント | 概要 |
 | --- | --- |
-| [account-separation.md](docs/account-separation.md) | 組織アカウントと個人アカウントを併用する場合の事実整理・情報が混ざる経路・ディレクトリ単位でアカウントを強制するガードの設計(未実装) |
+| [account-separation.md](docs/account-separation.md) | 組織アカウントと個人アカウントを併用する場合の事実整理・情報が混ざる経路・ディレクトリ単位でアカウントを強制するガードの設計(実装済み。実装時に前提が 1 つ崩れた経緯も記録) |
 
 ## ライセンス
 
