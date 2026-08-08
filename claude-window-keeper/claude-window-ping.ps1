@@ -60,8 +60,29 @@ param(
 $ErrorActionPreference = "Stop"
 
 $stateDir  = Join-Path $env:USERPROFILE ".claude\window-keeper"
-$stateFile = Join-Path $stateDir "state.json"
 $logFile   = Join-Path $stateDir "ping.log"
+
+# Ping はいまログイン中のアカウントの 5 時間枠を消費する。枠はアカウントごとに独立して
+# いるため、最後に Ping した時刻もアカウント別に持たなければならない。1 つの state を
+# 共有すると、アカウントを切り替えた直後に「まだ枠の途中」と誤判定して Ping を送らず、
+# 枠の開始時刻を固定するというこのツールの目的が果たせなくなる。
+#
+# credentials にアカウント固有の識別子(uuid やメールアドレス)は無いため、プラン種別
+# subscriptionType で代用する（組織は team、個人は pro / max）。
+function Get-ClaudeAccount {
+    $cred = Join-Path $env:USERPROFILE ".claude\.credentials.json"
+    try {
+        $t = (Get-Content $cred -Raw -ErrorAction Stop | ConvertFrom-Json).claudeAiOauth.subscriptionType
+        # 値はファイル名の一部になるので、想定外の文字が来たら採用しない
+        if ($t -and ($t -match '^[a-zA-Z0-9_-]+$')) { return $t }
+    } catch {
+        # 未ログイン・権限不足・将来の構造変更のいずれか。判別不能として 1 つにまとめる
+    }
+    return "unknown"
+}
+
+$account   = Get-ClaudeAccount
+$stateFile = Join-Path $stateDir ("state-{0}.json" -f $account)
 
 if (-not (Test-Path $stateDir)) {
     New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
@@ -74,7 +95,8 @@ $logMaxBytes = 1MB
 # ログ記載用func.
 # -ConsoleOnly を付けた呼び出しは画面表示だけで、ファイルには残さない
 function Write-Log([string]$msg, [switch]$ConsoleOnly) {
-    $line = "{0}  {1}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"), $msg
+    # どのアカウントの枠を消費した Ping なのかを後から追えるようにする
+    $line = "{0}  [{1}] {2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"), $account, $msg
     Write-Host $line
     if ($ConsoleOnly) { return }
 
@@ -102,6 +124,8 @@ $now = Get-Date
 
 # 状況確認のみ（実行時に -Status がつけられたとき）
 if ($Status) {
+    # 枠はアカウントごとに独立しているので、どのアカウントの状態を見ているかを最初に示す
+    Write-Host ("Account        : " + $account)
     if ($lastPing) {
         $elapsed = $now - $lastPing
         $reset   = $lastPing.AddMinutes($WindowMinutes)
