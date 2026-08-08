@@ -1,0 +1,39 @@
+{
+  "_comment": "~/.claude/settings.json の hooks にマージする。既にある配列には要素として足すこと。PreToolUse が実際の防御で、SessionStart と CwdChanged は気づきを早めるための警告のみ(これらのイベントは仕様上ブロックできない)。",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Edit|Write|NotebookEdit|Glob|Grep|Bash|PowerShell|Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node C:/claude/ClaudeCode/account-guard/account-guard.js",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node C:/claude/ClaudeCode/account-guard/account-guard.js",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "CwdChanged": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node C:/claude/ClaudeCode/account-guard/account-guard.js",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
