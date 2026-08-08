@@ -71,7 +71,11 @@ node analyze.js --log <path> --html <path>
 node analyze.js --weeks 2            # 時系列グラフを週次枠の直近2窓ぶんにする(既定は1窓)
 node analyze.js --weeks all          # 時系列グラフを全期間にする
 node analyze.js --days 1             # 週次枠の窓ではなく日数で絞る
+node analyze.js --account team       # 指定したアカウント(acct の値)だけに絞って集計する
+node analyze.js --account all        # 全アカウントを混在させたまま集計する(推定値は参考値扱い)
 ```
+
+複数アカウント(組織 Team + 個人 Pro など)を使い分けている場合、`analyze.js` は**既定でいまログイン中のアカウントだけ**を対象にする(`~/.claude/.credentials.json` の `subscriptionType` で判定)。5時間枠・週次枠はアカウントごとに容量が独立しているため、混在させたまま集計すると window の同一性判定や週次枠の窓分割が壊れる。`--account <名前>` で明示的に切り替えられ、`--account all` を指定したときだけ全アカウントを混在させる(このときは回帰の傾き・満タン回数の推定値が意味を持たない旨の警告をコンソールと HTML の両方に出す)。対象行数が0件になった場合は異常終了せず、アカウントごとの行数内訳を表示する。
 
 HTML レポートには時系列グラフ(5h/7d)、5時間枠ごとの散布図と回帰直線、枠の一覧表が入る。単一ファイルで自己完結している。
 
@@ -130,6 +134,7 @@ node guard.js reset                 # 全セッションの発火済みフラグ
 | フィールド | 内容 |
 | --- | --- |
 | `ts` | 記録時刻 (ISO 8601, UTC) |
+| `acct` | 記録時にログインしていたアカウント(`subscriptionType`。`"team"` / `"pro"` など、判別不能なら `"unknown"`)。マイグレーション前の既存行には無く、`analyze.js` はその場合 `"unknown"` として扱う |
 | `five_pct` / `seven_pct` | 5時間枠 / 週次枠の使用率 (0-100) |
 | `five_reset` / `seven_reset` | リセット時刻。**Unix epoch 秒**で来る(ISO 文字列も許容) |
 | `model` / `effort` / `fast` | そのときのモデル・推論強度・fast モード |

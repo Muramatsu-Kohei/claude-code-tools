@@ -12,18 +12,25 @@
 // あとは Claude が区切りのよい場所を選べばよい。強制はしない。
 //
 // 使用率は statusline に渡される JSON にしか現れず、フックの入力には含まれない。
-// そのため collect.js が最後に書いた collect-state.json を読む。statusline は
+// そのため collect.js が最後に書いた collect-state-<アカウント>.json を読む。statusline は
 // 数十秒おきに描画されるため、この値はフック実行時点でほぼ最新とみなせる。
+//
+// 枠はアカウントごとに独立しているため、判定材料も発火フラグもアカウント別に持つ。
+// 共有すると「いま使っていない方のアカウントの使用率」で促してしまう。
 //
 // 最優先事項は「セッションを壊さないこと」。判断に必要な材料が揃わなければ黙って
 // 何もしない。促しそこねても失うのは引き継ぎ1回分だが、誤動作すれば作業が止まる。
 
 const fs = require('fs');
 const path = require('path');
+// アカウントの判別とファイル命名は collect.js と必ず一致させる必要がある。
+// 書き手と読み手で規則がずれると、guard は黙って何も読めなくなる。
+const collect = require('./collect.js');
 
 const HOME = process.env.USERPROFILE || process.env.HOME || '.';
 const DIR = path.join(HOME, '.claude', 'usage-tracker');
-const COLLECT_STATE = path.join(DIR, 'collect-state.json');
+const ACCOUNT = collect.currentAccount();
+const COLLECT_STATE = collect.statePath(ACCOUNT);
 // 発火済みフラグはセッションごとに別ファイルにする。Claude Code は同時に何本も
 // 動かせるため、1ファイルを共有すると read-modify-write が衝突するうえ、
 // 最初に閾値を踏んだ1本だけが通知を受けて残りが引き継ぎを残せなくなる。
@@ -32,17 +39,28 @@ const STATE_DIR = path.join(DIR, 'guard-state');
 // 各枠を2段構えで見る。1段目で気付かせ、無視されても2段目で最後にもう一度促す。
 // 1段目だけだと、そこで作業を続ける判断をしたセッションは警告なしで上限に激突する。
 //
+// 閾値はアカウントごとに上書きできる。枠の容量比(5h枠1本が週次の何%を食うか)は
+// プランによって違うため、下の既定値をそのまま全アカウントに当てると余裕の見積もりを
+// 誤る。`CLAUDE_USAGE_GUARD_WEEK_THRESHOLD_PRO` のようにアカウント名のサフィックスを
+// 付けた環境変数があればそれを優先し、無ければ全アカウント共通の値を使う。
+function threshold(name, fallback) {
+  const suffix = /^[a-zA-Z0-9_]+$/.test(ACCOUNT) ? `${name}_${ACCOUNT.toUpperCase()}` : null;
+  return Number(suffix && process.env[suffix]) || Number(process.env[name]) || fallback;
+}
+
 // 5h枠は既定 90%。/wrap を完走させる余裕を残しつつ、早すぎて邪魔にならない値。
-const FIVE_THRESHOLD = Number(process.env.CLAUDE_USAGE_GUARD_THRESHOLD) || 90;
-const FIVE_FINAL = Number(process.env.CLAUDE_USAGE_GUARD_FINAL_THRESHOLD) || 97;
-// 週次枠の1段目は既定 85%。実測で「5h枠を満タンにすると週次が約12%進む」ため、
-// 15% 残っていれば満タン1回強の余裕がある。ここではまだ畳ませず、残量だけ意識させる。
-const WEEK_THRESHOLD = Number(process.env.CLAUDE_USAGE_GUARD_WEEK_THRESHOLD) || 85;
+const FIVE_THRESHOLD = threshold('CLAUDE_USAGE_GUARD_THRESHOLD', 90);
+const FIVE_FINAL = threshold('CLAUDE_USAGE_GUARD_FINAL_THRESHOLD', 97);
+// 週次枠の1段目は既定 85%。Team アカウントでの実測「5h枠を満タンにすると週次が約12%
+// 進む」に基づく値で、15% 残っていれば満タン1回強の余裕がある。ここではまだ畳ませず、
+// 残量だけ意識させる。他プランでこの比率が違う場合は上記のサフィックス付き環境変数で
+// 調整する(analyze.js をアカウント別に走らせれば実測値が出る)。
+const WEEK_THRESHOLD = threshold('CLAUDE_USAGE_GUARD_WEEK_THRESHOLD', 85);
 // 週次枠の2段目は既定 97%。5h枠のガードは週次枠切れを一切防げない(週次が尽きるとき
 // 5h枠は低いままでありうる)ため、この段がないと週次の枠切れは必ず予告なしに来る。
 // 週次1pt は 5h枠の約8.3pt に相当するので、残り3%あれば /wrap には桁違いに足りる。
 // 99% にしないのは、使用率が整数で返るうえ collect-state に最大15分の遅れがあるため。
-const WEEK_FINAL = Number(process.env.CLAUDE_USAGE_GUARD_WEEK_FINAL_THRESHOLD) || 97;
+const WEEK_FINAL = threshold('CLAUDE_USAGE_GUARD_WEEK_FINAL_THRESHOLD', 97);
 // collect.js のハートビートは10分間隔。それを超えて古い値は信用しない。
 // 古い値で促すと、枠が切り替わった直後に誤発火しかねない。
 const STALE_MS = 15 * 60 * 1000;
@@ -166,7 +184,10 @@ function evaluate(sid) {
   const age = Date.now() - Date.parse(st.ts);
   if (!isFinite(age) || age > STALE_MS) return null;
 
-  const prev = readJson(stateFileFor(sid)) || {};
+  // セッションの途中で /login すると、以降は別アカウントの枠を消費する。前のアカウントの
+  // 発火済みフラグを引き継ぐと新しい枠の枠切れを予告しそこねるため、未発火として扱う。
+  const stored = readJson(stateFileFor(sid)) || {};
+  const prev = stored.acct === ACCOUNT ? stored : {};
   // フラグ側も ms で持つ。書き出しと読み出しで同じ正規化を通すので、
   // 表現が混在しても同じ枠は同じキーに落ちる。
   const resets = {
@@ -186,6 +207,9 @@ function markFired(sid, stages, resets, prev) {
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
     const next = {
+      // どのアカウントの枠で発火したか。次回の evaluate がこれを見て、
+      // アカウントが変わっていればフラグを引き継がない。
+      acct: ACCOUNT,
       // 発火していない側は以前の記録を保つ。片方の発火でもう片方が消えると
       // 同じ枠で二重に促してしまう。
       five_reset_ms: stages.five ? resets.five : prev.five_reset_ms,
@@ -232,6 +256,7 @@ function main() {
   if (mode === 'status') {
     const st = readJson(COLLECT_STATE);
     const sid = process.argv[3] || '_unknown';
+    console.log(`アカウント: ${ACCOUNT} (${COLLECT_STATE})`);
     console.log(`閾値: 5h 警告${FIVE_THRESHOLD}%/最終${FIVE_FINAL}% , 7d 警告${WEEK_THRESHOLD}%/最終${WEEK_FINAL}%`);
     console.log(
       'collect-state:',

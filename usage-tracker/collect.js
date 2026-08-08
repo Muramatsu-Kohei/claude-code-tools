@@ -15,7 +15,7 @@ const path = require('path');
 const HOME = process.env.USERPROFILE || process.env.HOME || '.';
 const DIR = path.join(HOME, '.claude', 'usage-tracker');
 const LOG = path.join(DIR, 'usage.jsonl');
-const STATE = path.join(DIR, 'collect-state.json');
+const CREDENTIALS = path.join(HOME, '.claude', '.credentials.json');
 
 // 使用率が動かない区間も「消費が止まっていた」という情報なので、変化なしでも
 // この間隔で1点だけ残す。5時間枠の傾きを見るのに十分な粒度。
@@ -25,10 +25,41 @@ const EPS = 0.05;
 
 const num = (v) => typeof v === 'number' && isFinite(v);
 
-// 前回書いた点。読めなければ「初回」として扱えばよいだけなので例外は無視する。
-function readState() {
+// アカウントを判別できなかったときの値。null にせず文字列で持つのは、
+// ファイル名にも集計キーにもそのまま使えて分岐が減るため。
+const ACCOUNT_UNKNOWN = 'unknown';
+
+// 現在ログイン中のアカウント。
+//
+// credentials にはアカウント固有の識別子(uuid やメールアドレス)が無いため、
+// プラン種別 subscriptionType で代用する。組織アカウントは "team"、個人は "pro"/"max"
+// になるので、同種のプランを2つ持たない限り識別子として成立する。
+// トークン本体には触れないし記録もしない。
+//
+// statusline は表示更新のたびに新しい node プロセスとして起動されるため、プロセス内
+// キャッシュは効かない。読むのは 0.5KB 程度のファイルなので毎回読んで差し支えない。
+function currentAccount() {
   try {
-    return JSON.parse(fs.readFileSync(STATE, 'utf8'));
+    const t = JSON.parse(fs.readFileSync(CREDENTIALS, 'utf8'))?.claudeAiOauth?.subscriptionType;
+    return typeof t === 'string' && t ? t : ACCOUNT_UNKNOWN;
+  } catch {
+    // 未ログイン・権限不足・将来の構造変更のいずれか。判別不能として続行する。
+    return ACCOUNT_UNKNOWN;
+  }
+}
+
+// 差分判定の基準はアカウントごとに持つ。5時間枠も週次枠もアカウント単位で独立して
+// いるため、共有すると /login のたびに「使用率が飛んだ」と誤認して間引きが効かなくなる。
+// guard.js もこの命名規則で同じファイルを読む。
+function statePath(acct) {
+  const safe = /^[a-zA-Z0-9_-]+$/.test(acct) ? acct : ACCOUNT_UNKNOWN;
+  return path.join(DIR, `collect-state-${safe}.json`);
+}
+
+// 前回書いた点。読めなければ「初回」として扱えばよいだけなので例外は無視する。
+function readState(acct) {
+  try {
+    return JSON.parse(fs.readFileSync(statePath(acct), 'utf8'));
   } catch {
     return null;
   }
@@ -55,8 +86,12 @@ function record(d) {
 
   const cw = d.context_window || {};
   const now = new Date();
+  const acct = currentAccount();
   const row = {
     ts: now.toISOString(),
+    // どのアカウントの枠を消費したか。枠はアカウントごとに独立しているので、
+    // これが無いと 2 アカウントの使用率が 1 本の時系列に混ざって集計が壊れる。
+    acct,
     five_pct: num(five && five.used_percentage) ? five.used_percentage : null,
     five_reset: (five && five.resets_at) || null,
     seven_pct: num(seven && seven.used_percentage) ? seven.used_percentage : null,
@@ -73,13 +108,13 @@ function record(d) {
     sid: d.session_id || null,
   };
 
-  const prev = readState();
+  const prev = readState(acct);
   if (!shouldWrite(prev, row, now.getTime())) return;
 
   fs.mkdirSync(DIR, { recursive: true });
   fs.appendFileSync(LOG, JSON.stringify(row) + '\n');
   // state は「最後に書いた行」そのもの。ログを読み直さずに差分判定できるようにしている。
-  fs.writeFileSync(STATE, JSON.stringify(row));
+  fs.writeFileSync(statePath(acct), JSON.stringify(row));
 }
 
 module.exports = {
@@ -92,4 +127,7 @@ module.exports = {
   },
   LOG,
   DIR,
+  ACCOUNT_UNKNOWN,
+  currentAccount,
+  statePath,
 };
