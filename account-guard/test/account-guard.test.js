@@ -292,6 +292,41 @@ console.log('account-guard');
   check('未知ツールの Git Bash 形式パスを拒否する', decision(res) === 'deny', JSON.stringify(res));
 }
 {
+  // 区切り記号を列挙して前置文字を見ていた頃、リダイレクトやブレース展開の直後が
+  // 変換されず素通りしていた。特に `>` は保護ツリーへの書き込みが通ってしまう。
+  const home = sandbox('deny-msys-redirect', { subscriptionType: 'pro', rules: ORG });
+  const cases = [
+    ['入力リダイレクトの直後', 'cat </c/org-tree/secret.txt'],
+    ['出力リダイレクトの直後(書き込み)', 'echo x >/c/org-tree/f.txt'],
+    ['区切りを重ねた表記', 'cat /c//org-tree/secret.txt'],
+    ['ブレース展開の中', 'cat {/c/org-tree/secret.txt,x}'],
+  ];
+  for (const [label, command] of cases) {
+    const res = run(home, {
+      hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+      tool_input: { command },
+    });
+    check(`Git Bash 形式を拒否する — ${label}`, decision(res) === 'deny', JSON.stringify(res));
+  }
+}
+{
+  const home = sandbox('deny-double-slash-win', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command: 'cat C://org-tree/secret.txt' },
+  });
+  check('Windows 形式でも区切りを重ねた表記を拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  // 変換が効きすぎないこと。パスの途中の `/c/` は別物なので巻き込まない
+  const home = sandbox('allow-midpath-c', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command: 'cat C:/proj/c/org-tree/x.md' },
+  });
+  check('パス途中の /c/ をドライブ表記と誤認しない', res === null, JSON.stringify(res));
+}
+{
   // 表記の変換が過剰に効いて無関係なパスを巻き込まないこと。
   const home = sandbox('allow-msys-unrelated', { subscriptionType: 'pro', rules: ORG });
   const res = run(home, {
