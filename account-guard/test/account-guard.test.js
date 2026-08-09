@@ -153,5 +153,95 @@ console.log('account-guard');
   check('CwdChanged も警告のみ', decision(res) === null && /org-tree/.test(res?.hookSpecificOutput?.additionalContext || ''), JSON.stringify(res));
 }
 
+// --- Glob / Grep は path 以外にもパスが入る ---
+{
+  const home = sandbox('deny-glob-pattern', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Glob',
+    tool_input: { pattern: 'C:/org-tree/**/*.py' },
+  });
+  check('Glob の pattern による列挙を拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  const home = sandbox('deny-grep-glob', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Grep',
+    tool_input: { pattern: 'secret', glob: 'C:/org-tree/**' },
+  });
+  check('Grep の glob による検索を拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  // 検索語は正規表現であってパスではない。ここを見ると grep しただけで止まる。
+  const home = sandbox('allow-grep-pattern', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Grep',
+    tool_input: { pattern: 'org-tree', path: 'C:/claude/ClaudeCode' },
+  });
+  check('Grep の検索語がツリー名でも拒否しない', res === null, JSON.stringify(res));
+}
+
+// --- 未知のツール(MCP など)は引数からパス形式だけを拾う ---
+{
+  const home = sandbox('deny-mcp-path', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'mcp__filesystem__read_file', tool_input: { path: 'C:/org-tree/secret.py' },
+  });
+  check('未知ツールの絶対パス引数は拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  const home = sandbox('allow-mcp-prose', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'mcp__memory__write', tool_input: { text: 'org-tree の運用についてのメモ' },
+  });
+  check('未知ツールでも散文中のツリー名では拒否しない', res === null, JSON.stringify(res));
+}
+
+// --- ガード自身が異常終了したとき ---
+// 以前は無条件に deny していたため、ガードが壊れた瞬間に全ツールが止まり、ガード自身を
+// 直す Edit も通らなくなった。判定できる範囲 = cwd だけを見て、保護ツリー外は通す。
+{
+  fs.mkdirSync(BASE, { recursive: true });
+  const CRASH = path.join(BASE, 'ag-crash.js');
+  fs.writeFileSync(
+    CRASH,
+    fs.readFileSync(GUARD, 'utf8').replace('function main() {', "function main() {\n  throw new Error('boom');"),
+    'utf8'
+  );
+  const runCrash = (home, input) => {
+    const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+    const out = execFileSync(process.execPath, [CRASH], {
+      env, input: JSON.stringify(input), encoding: 'utf8',
+    });
+    return out.trim() ? JSON.parse(out) : null;
+  };
+
+  const home = sandbox('crash', { subscriptionType: 'pro', rules: ORG });
+  let res = runCrash(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command: 'echo hello' },
+  });
+  check('異常終了しても保護ツリー外の操作は通す', res === null, JSON.stringify(res));
+
+  res = runCrash(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read',
+    tool_input: { file_path: 'a.py' },
+  });
+  check('異常終了かつ cwd が保護ツリー内なら拒否する', decision(res) === 'deny', JSON.stringify(res));
+  check('異常終了の拒否理由に復旧手順が入る',
+    /git checkout/.test(res?.hookSpecificOutput?.permissionDecisionReason || ''), JSON.stringify(res));
+
+  res = runCrash(home, { hook_event_name: 'SessionStart', cwd: 'C:/org-tree/proj' });
+  check('異常終了が SessionStart なら deny でなく警告を返す',
+    res?.hookSpecificOutput?.hookEventName === 'SessionStart' && decision(res) === null, JSON.stringify(res));
+
+  const noRules = sandbox('crash-norules', { subscriptionType: 'pro' });
+  res = runCrash(noRules, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read', tool_input: {},
+  });
+  check('保護ルール未設定なら異常終了でも何も拒否しない', res === null, JSON.stringify(res));
+}
+
 console.log(`\n  ${state.pass} passed, ${state.fail} failed`);
 process.exit(state.fail ? 1 : 0);

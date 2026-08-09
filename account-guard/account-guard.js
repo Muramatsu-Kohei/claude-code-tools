@@ -81,13 +81,19 @@ function isInsideTree(cwd, tree) {
 // ツリー名が出てくるだけで拒否されてしまう。実際、このツリーについて書いたドキュメントを
 // 編集しようとして止まった。保護ツリーのファイルには一切触れていないのに拒否されるのは
 // 明確な誤りで、日常の邪魔になる分だけガードを外したくなる圧力になる。
+//
+// Glob / Grep はパスが入るフィールドが複数ある。`path` だけを見ていた頃は
+// `Glob{pattern:"C:/tree/**"}` や `Grep{glob:"C:/tree/**"}` が素通りし、保護ツリーの
+// 列挙と内容の読み取りができてしまっていた。
+// ただし Grep の `pattern` は検索語(正規表現)であってパスではないので見ない。
+// ここを含めると、ツリー名を検索語にしただけで拒否される上記の誤検知が復活する。
 const PATH_FIELDS = {
   Read: ['file_path'],
   Edit: ['file_path'],
   Write: ['file_path'],
   NotebookEdit: ['notebook_path'],
-  Glob: ['path'],
-  Grep: ['path'],
+  Glob: ['path', 'pattern'],
+  Grep: ['path', 'glob'],
 };
 
 // シェルと委譲は文字列全体を見る。パスがどの位置に現れるか決まっていないうえ、
@@ -103,9 +109,11 @@ const COMMAND_FIELDS = {
 function targetStrings(toolName, toolInput) {
   const ti = toolInput ?? {};
   const fields = PATH_FIELDS[toolName] || COMMAND_FIELDS[toolName];
-  // 知らないツールはどの引数が操作対象か判断できない。素通しにするより引数全体を見て
-  // 安全側に倒す。誤検知はフック登録時の matcher でツールを絞ることで避ける。
-  if (!fields) return [JSON.stringify(ti)];
+  // 知らないツール(MCP のファイルシステム系など)はどの引数が操作対象か判断できない。
+  // 素通しにすると保護が丸ごと外れるので引数全体から拾うが、文字列全体を突き合わせると
+  // 散文中のツリー名にも反応する(上の PATH_FIELDS のコメントにある誤検知)。
+  // 絶対パスの形をした部分文字列だけを取り出せば、実際の操作対象を捉えつつ言及は見逃せる。
+  if (!fields) return JSON.stringify(ti).match(/[a-z]:[\\/][^"'\s,]*/gi) ?? [];
   return fields.map((f) => ti[f]).filter((v) => typeof v === 'string');
 }
 
@@ -164,13 +172,20 @@ function denyMessage(hit, account) {
   ].join('\n');
 }
 
+// stdin(fd 0)は一度読むと消費されるため、読んだ結果を保持して以降は使い回す。
+// これで main() の外 — 異常終了を受け止める catch — からも同じ入力を参照できる。
+// main() に引数で渡す形にしないのは、シグネチャと呼び出し元を別々に書き換える途中で
+// ガードが壊れると、それを直す手段ごと失われるため(実際に起きた)。
+let hookInputCache = null;
 function readHookInput() {
-  if (process.stdin.isTTY) return {};
+  if (hookInputCache) return hookInputCache;
+  if (process.stdin.isTTY) return (hookInputCache = {});
   try {
-    return JSON.parse(fs.readFileSync(0, 'utf8')) || {};
+    hookInputCache = JSON.parse(fs.readFileSync(0, 'utf8')) || {};
   } catch {
-    return {};
+    hookInputCache = {};
   }
+  return hookInputCache;
 }
 
 function main() {
@@ -228,25 +243,62 @@ function main() {
   );
 }
 
+// ガード自身が異常終了したときの後始末。
+//
+// 以前はここで無条件に deny を返していたが、それではガードが壊れた瞬間に
+// 「このマシンの全ツール呼び出し」が止まる。実際に起きたとき、ガード自身を直す Edit も
+// 止まったファイルを読む Read も通らず、Claude Code の外から git で戻すしか手が
+// なくなった。保護ツリーと無関係な作業まで巻き添えにするのは、冒頭に書いた
+// 「判定できたものだけを拒否する」方針にも反する。
+//
+// そこで、例外が起きても判定できる範囲 — cwd が保護ツリーの内側かどうか — だけを見る。
+// 内側なら止め、外側なら通す。内側での取りこぼしは残るが、それは「ガードが壊れている」
+// という異常時に限られ、全停止の代償のほうが大きい。
+function reportCrash(e) {
+  const rules = loadRules();
+  if (!rules.length) return; // 保護ルール未設定なら何も拒否しない。
+
+  const input = readHookInput();
+  const account = currentAccount();
+  const cwd = input.cwd || process.cwd();
+  const hit = rules.find((r) => !r.allow.includes(account) && isInsideTree(cwd, r.tree));
+  if (!hit) return;
+
+  const detail = [
+    `[account-guard] ガードが異常終了しました(原因: ${e && e.message})。`,
+    `作業ディレクトリが ${hit.tree} 配下にあるため、安全側に倒します。`,
+    '',
+    'ガード自体の不具合の可能性があります。保護ツリーの外での作業は影響を受けません。',
+    'ガードを戻すには Claude Code の外から:',
+    '  git checkout -- account-guard/account-guard.js',
+  ].join('\n');
+
+  // 拒否できるのは PreToolUse だけ。それ以外のイベントで deny 形式を返しても破棄されるので、
+  // 警告として文脈に載せる(hookEventName は受け取ったイベントをそのまま返す必要がある)。
+  const event = input.hook_event_name || process.argv[2] || 'PreToolUse';
+  if (event !== 'PreToolUse') {
+    process.stdout.write(
+      JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: detail } })
+    );
+    return;
+  }
+
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: detail,
+      },
+    })
+  );
+}
+
 try {
   main();
 } catch (e) {
-  // ここに来るのは想定外の不具合。黙って素通しにすると「守られているつもり」で
-  // 保護が外れるため、拒否側に倒す。保護ルールが未設定なら何も拒否しない。
   try {
-    if (loadRules().length) {
-      process.stdout.write(
-        JSON.stringify({
-          hookSpecificOutput: {
-            hookEventName: 'PreToolUse',
-            permissionDecision: 'deny',
-            permissionDecisionReason:
-              '[account-guard] ガードが異常終了したため、安全側に倒して操作を拒否しました。\n' +
-              `原因: ${e && e.message}`,
-          },
-        })
-      );
-    }
+    reportCrash(e);
   } catch {
     // 出力すらできない状況では何もできない。
   }
