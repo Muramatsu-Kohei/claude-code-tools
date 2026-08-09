@@ -47,10 +47,11 @@ Claude Code の 5 時間セッション制限（レートリミット）のウ�
 
 1. `state-<account>.json` から `lastPing` を読む（旧 `state.json` しか無い場合、通常実行でアカウントを判別できていれば先に新パスへ移行してから読む。`-Status` や `unknown` の回は移行せず旧ファイルを直接読む）
 2. `-Status`: 前回時刻・経過・推定リセット（`lastPing + WindowMinutes`）を表示して終了（送信・更新なし）
-3. `-Force` でない かつ 経過 < `WindowMinutes` → `SKIP` を画面表示して終了（ファイルには残さない）
-4. `-DryRun`: 送信・状態更新をせずログのみ
-5. それ以外: `claude -p "Reply with only the word: ok" --model <Model>` を実行
-6. 成功したら `state-<account>.json` を現在時刻で更新し、推定リセット時刻をログ出力
+3. アカウントが `unknown`（未ログイン、`/login` 中、別ユーザー資格での実行など）→ `WARN` を残して終了。`-Force` でも送らない
+4. `-Force` でない かつ 経過 < `WindowMinutes` → `SKIP` を画面表示して終了（ファイルには残さない）
+5. `-DryRun`: 送信・状態更新をせずログのみ
+6. それ以外: `claude -p "Reply with only the word: ok" --model <Model>` を実行
+7. 成功したら `state-<account>.json` を現在時刻で更新し、推定リセット時刻をログ出力
 
 **設計上のポイント**
 - 「送るかどうか」の判断はすべて ping 本体が持つ。タスクは単に頻繁に叩くだけ（冪等）。
@@ -61,7 +62,11 @@ Claude Code の 5 時間セッション制限（レートリミット）のウ�
 - 移行はアカウントが `unknown` の回も見送る。`unknown` のまま移すと `state-unknown.json`
   へ退避されて本来のアカウントの記録が失われ、次回「前回 ping なし」と判定して
   意図しない時刻に ping が飛ぶ（このツールが防ぐべき事象そのもの）。
-- **判定の順序は 2 → 3 → 4。** SKIP 判定（3）が DryRun 判定（4）より先に来るため、
+- **`unknown` の回はそもそも ping を送らない。** 枠はアカウントごとに独立しているので、
+  判別できないまま送ると「どの枠をいつ張り直したか」が追えず、記録も `state-unknown.json`
+  へ分かれてしまう。移行済みで旧 `state.json` も無い状況では前回時刻を読めず、SKIP 判定を
+  素通りして本物の ping が飛ぶ経路になる。ログインし直せば解消するので見送るほうが安い。
+- **判定の順序は 2 → 4 → 5。** SKIP 判定（4）が DryRun 判定（5）より先に来るため、
   記録がある状態で `-DryRun` 単体を実行すると SKIP で終了し DRYRUN 行に到達しない。
   送信処理の流れを検証したいときは `-Force -DryRun`（送信・記録なし）を使う。
 - **成否は例外ではなく `$LASTEXITCODE` で判定する。** 理由は下の「9. 配布時の前提・注意」の

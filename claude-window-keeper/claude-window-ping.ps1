@@ -169,6 +169,20 @@ if ($Status) {
     
 }
 
+# アカウントを判別できない回は Ping を送らない。
+#
+# 枠はアカウントごとに独立しているので、判別できないまま送ると「どのアカウントの枠を
+# いつ張り直したか」が追えなくなる。しかも state-unknown.json という別系統に記録が
+# 分かれるため、本来のアカウント側は前回時刻を失ったままになる。移行済みで旧
+# state.json も無い状況では $lastPing が $null になり、下のスキップ判定を素通りして
+# 意図しない時刻に本物の Ping が飛ぶ ― このツールが防ぐべき事象そのものになる。
+# -Force でも送らないのは、押し切っても「どの枠を張り直したのか」が分からないため。
+# ログインし直せば解消するので、記録を汚さず見送るほうが安い。
+if ($account -eq "unknown") {
+    Write-Log "WARN  account not identified; ping skipped (log in, then re-run)"
+    return
+}
+
 # スキップ判定（-Force がある場合は前回からの時間に関係なくPing）
 if (-not $Force -and $lastPing) {
     $elapsed = $now - $lastPing
