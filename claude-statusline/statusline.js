@@ -280,7 +280,10 @@ write(parts.join(`${THEME.sep} | ${RESET}`));
 // 後から復元できない。表示を出し終えたこの位置で時系列として書き出しておく。
 // 表示とは無関係な副作用なので、収集側が壊れていても statusline の出力には影響しない。
 try {
-  require(process.env.CLAUDE_STATUSLINE_HOOK || 'C:/claude/ClaudeCode/usage-tracker/collect.js').record(d);
+  // 既定は同じリポジトリに置かれた usage-tracker。ここに個人マシン固有の絶対パスを
+  // 焼き込むと、他の環境では require が必ず失敗し、下の catch に吸われて「動いているのに
+  // 何も記録されない」状態になる。別の場所に置くときは CLAUDE_STATUSLINE_HOOK で指す。
+  require(process.env.CLAUDE_STATUSLINE_HOOK || `${__dirname}/../usage-tracker/collect.js`).record(d);
 } catch (e) {
   /* 収集は捨てて表示を優先する */
 }

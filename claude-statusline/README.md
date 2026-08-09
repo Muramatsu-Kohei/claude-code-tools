@@ -197,10 +197,10 @@ const THEME = {
 ファイル末尾に、**表示を終えたあとで外部モジュールに入力データを渡すフック**が入っています。ステータスラインには 5 時間枠・週次枠の使用率が毎回渡ってくるので、それを時系列に記録して後から分析するためのものです（作者は `usage-tracker` でターン単価の推移を追うのに使っています）。
 
 ```js
-require(process.env.CLAUDE_STATUSLINE_HOOK || 'C:/claude/ClaudeCode/usage-tracker/collect.js').record(d);
+require(process.env.CLAUDE_STATUSLINE_HOOK || `${__dirname}/../usage-tracker/collect.js`).record(d);
 ```
 
-**既定のパスは作者の環境固有です。** 他の環境ではモジュールが見つからず `require` が失敗しますが、**全体が try/catch に包まれているため表示は壊れません**（存在しないパスを指定して実測済み）。記録が要らなければ、末尾のこのブロックごと削除してかまいません。
+**既定は同じリポジトリに置かれた `usage-tracker` です。** このリポジトリごと使っているなら追加の設定は要りません。`statusline.js` だけを持ち出した場合はモジュールが見つからず `require` が失敗しますが、**全体が try/catch に包まれているため表示は壊れません**（存在しないパスを指定して実測済み）。記録が要らなければ、末尾のこのブロックごと削除してかまいません。
 
 自前の記録先を使う場合は、`record(d)` を持つモジュールを用意して環境変数 `CLAUDE_STATUSLINE_HOOK` にそのパスを渡してください。`d` はステータスラインが受け取った stdin の JSON そのものです。
 
