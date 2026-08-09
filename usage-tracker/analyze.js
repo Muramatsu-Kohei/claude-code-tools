@@ -353,10 +353,12 @@ function regress(points) {
 // 集計本体
 // ---------------------------------------------------------------------------
 
-// account: 対象アカウント名('all' なら絞り込まない)。省略時は全アカウント混在の
-// 生ログをそのまま扱う挙動になってしまうため、呼び出し側(main / CLI)は必ず
-// currentAccount() などで解決した値を渡すこと。
-function analyze(logPath, account) {
+// account: 対象アカウント名(ACCOUNT_ALL なら絞り込まない)。省略時は ACCOUNT_ALL を
+// 既定値とし、全アカウント混在の生ログをそのまま扱う。undefined のまま filterRowsByAccount
+// に渡すと r.acct(loadRows が必ず文字列に正規化する)と一致せず全行が0件に落ちてしまうため、
+// 「絞り込まない」を表す既存の定数を既定値にして空振りを防ぐ。単一アカウントに絞りたい
+// 呼び出し側(main / CLI)は必ず currentAccount() などで解決した値を明示的に渡すこと。
+function analyze(logPath, account = ACCOUNT_ALL) {
   const { rows: allRows, totalLines, skipped, readError } = loadRows(logPath);
   const accountCounts = accountBreakdown(allRows);
   const rows = filterRowsByAccount(allRows, account);

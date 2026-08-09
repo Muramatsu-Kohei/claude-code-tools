@@ -66,6 +66,12 @@ function main() {
   }
 
   const raw = fs.readFileSync(opts.log, 'utf8');
+  // collect.js は record() のたびに同じ usage.jsonl へ追記する。statusline の描画は
+  // いつでも走りうるので、この読み込みから後述の rename までの間に新しい行が
+  // 追記される可能性がある。その行は tmp に反映されないまま rename で消えてしまう
+  // ため、後で rename 直前のサイズと比較して検出できるよう、読み込み直後のサイズを
+  // ここで控えておく。
+  const sizeAtRead = fs.statSync(opts.log).size;
   // 末尾の改行で空要素が出るので落とす。行番号は元ファイルの並びのまま保つ。
   const lines = raw.split('\n');
   const trailingNewline = lines[lines.length - 1] === '';
@@ -124,6 +130,21 @@ function main() {
     fs.unlinkSync(tmp);
     console.error(`\nエラー: 行数が一致しません(${lines.length} → ${check.length})。中止しました。`);
     console.error(`元のログは変更していません。バックアップ: ${backup}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  // rename 直前にもう一度サイズを確認する。行数チェック(上)は tmp とメモリ上の
+  // lines を比較しているだけで、「読み込み後に collect.js が追記した行」は
+  // どちらの数字にも現れないため検出できない。ここでサイズが変わっていれば
+  // その追記分を rename で踏み潰してしまうということなので、中止して
+  // ユーザーに再実行してもらう(実害が出る前に止まる方が、原因不明の欠損より安全)。
+  const sizeBeforeRename = fs.statSync(opts.log).size;
+  if (sizeBeforeRename !== sizeAtRead) {
+    fs.unlinkSync(tmp);
+    console.error(`\nエラー: 書き換え中に ${opts.log} が変更されました(サイズ ${sizeAtRead} → ${sizeBeforeRename} バイト)。中止しました。`);
+    console.error(`元のログは変更していません。バックアップ: ${backup}`);
+    console.error('もう一度実行してください。');
     process.exitCode = 1;
     return;
   }
