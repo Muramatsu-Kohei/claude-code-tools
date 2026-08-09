@@ -55,7 +55,7 @@ P1 と P2 は同じ根に繋がっている。「プロジェクト = ディレ�
 
 ```json
 "editedFiles": ["C:\\claude\\repo-A\\tool-c\\lib\\stage-calc.js",
-                "C:\\Users\\user\\AppData\\Local\\Temp\\claude\\...\\gen_cases.py"]
+                "C:\\Users\\<user>\\AppData\\Local\\Temp\\claude\\...\\gen_cases.py"]
 ```
 
 ### F4 git の出力はサブディレクトリからでもルート相対(検証済み)
@@ -107,19 +107,18 @@ git ルート由来なので、データ移行は不要。**
 「自分の目印ファイルを持つ最上位ディレクトリが2つ以上」で判定した場合。
 
 ```
-複数ツール(7) repo-A           tool-a … tool-b
-複数ツール(7) repo-B           tool-a … 
+複数ツール(7) repo-A       tool-a … tool-b
+複数ツール(7) repo-B       tool-a … 
 複数ツール(3) ClaudeCode   claude-statusline claude-window-keeper claude-worklog
-複数ツール(4) project-e  Library_Poco lib-b lib-a dev   ← 外部ライブラリ混在
-複数ツール(4) project-g    project-p project-l lib-c project-q ← 同上
-単一    (0)  repo-F, legal, project-j, project-n, project-d, project-t,
-             project-k, project-r, project-s
-単一    (1)  repo-E (fmt-a のみ), project-a
+複数ツール(4) repo-C       同梱の外部ライブラリ3個 + dev              ← 外部ライブラリ混在
+複数ツール(4) repo-D       同梱の外部ライブラリ・データセット4個      ← 同上
+単一    (0)  9 個(いずれも目印ファイルを持つ下位ディレクトリなし)
+単一    (1)  2 個(片方は特定の拡張子のファイルのみ)
 ```
 
-1リポジトリ1ツールは正しく「単一」になる(repo-F の `UI` `Widgets` `docs` は
-スコープにならない)。`project-e` と `project-g` は同梱の外部ライブラリを
-ツールと誤認するが、**誤認しても壊れない設計**にする(§4.4 と §7)。
+1リポジトリ1ツールは正しく「単一」になる(下位に `UI` `Widgets` `docs` のような
+ディレクトリがあってもスコープにならない)。`repo-C` と `repo-D` は同梱の外部
+ライブラリをツールと誤認するが、**誤認しても壊れない設計**にする(§4.4 と §7)。
 
 ### F10 ディレクトリ移動による孤児化が既に起きている
 

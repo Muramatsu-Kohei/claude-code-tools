@@ -94,10 +94,9 @@ Anthropic との関係ではほぼ問題にならない（組織が払った座�
 | `projects/<dir>/memory/MEMORY.md` | ディレクトリ単位 | org ツリーに入れば自動で載る |
 | worklog の引き継ぎメモ | **ツール横断** | SessionStart フックが「他に未完の作業があるツール」を列挙する |
 
-**worklog の現状（実測）**: 追跡対象は 6 件（`C--claude-repo-A` / `C--claude-repo-B` / `C--claude-ClaudeCode` /
-`C--claude-repo-F` / `C--claude-repo-E` / `C--Users-user`）で **org-tree は 0 件**。
-一方 `projects/` には `C--org-tree-*` が 複数存在する（project-a, project-b, project-c,
-project-d, project-e, project-f, project-g, project-h, project-i, project-j, および org-tree 直下）。
+**worklog の現状（実測）**: 追跡対象は個人ツリー配下の 6 件のみで、**組織ツリーは 0 件**。
+一方 `projects/`（Claude Code 本体のトランスクリプト置き場）には組織ツリー配下のキーが
+複数存在する。
 
 → **次に org リポジトリで Claude Code を開いた時点で追跡が始まり、以後は個人アカウントの
 セッション開始時にも org の作業内容が提示されうる。** 仮定ではなく、あと 1 回で発生する。
