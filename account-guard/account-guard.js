@@ -54,7 +54,16 @@ function currentAccount() {
 // 末尾スラッシュの差を吸収する。JSON.stringify を通した文字列ではバックスラッシュが
 // `\\` に増えるため、連続分もまとめて1つに潰す。
 function normalize(p) {
-  return String(p).replace(/\\+/g, '/').replace(/\/+$/, '').toLowerCase();
+  return String(p)
+    .replace(/\\+/g, '/')
+    // Git Bash / MSYS のドライブ表記を Windows 形式に寄せる。この環境の Bash ツールは
+    // Git Bash なので、`/c/<tree>` や `/cygdrive/c/<tree>` でも同じ場所に到達できる。
+    // 変換しないと表記を替えるだけで保護をすり抜けられる(実際に素通りしていた)。
+    // パス区切りの途中にある `/c/` を巻き込まないよう、直前が区切り文字か先頭のときだけ直す。
+    .replace(/(^|[\s"'`=;|&(])\/cygdrive\/([a-z])\//gi, '$1$2:/')
+    .replace(/(^|[\s"'`=;|&(])\/([a-z])\//gi, '$1$2:/')
+    .replace(/\/+$/, '')
+    .toLowerCase();
 }
 
 // 保護ツリーを指す絶対パスが文字列中に現れるか。
@@ -105,8 +114,12 @@ const COMMAND_FIELDS = {
   Task: ['prompt', 'description'],
 };
 
-// 文字列に埋もれた絶対パス。ドライブ文字から始まる形だけを見る。
+// 文字列に埋もれた絶対パス。ドライブ文字から始まる形。
 const ABSOLUTE_PATH_TOKEN = /[a-z]:[\\/][^"'\s,]*/gi;
+
+// Git Bash / MSYS 形式の絶対パス。これは path.resolve に渡すと `C:\c\...` と
+// 誤変換されるので、解決はせず normalize() の書き換えに任せて素の形のまま突き合わせる。
+const MSYS_PATH_TOKEN = /(?:\/cygdrive)?\/[a-z]\/[^"'\s,]*/gi;
 
 // 文字列に埋もれた「上に登る」相対パス。`../` を含まない相対指定は cwd の配下にしか
 // 届かず、cwd が保護ツリーの内側なら isInsideTree が先に拒否するので見なくてよい。
@@ -153,12 +166,17 @@ function targetStrings(toolName, toolInput, cwd) {
 
   const out = [];
   for (const text of texts) {
+    const absolute = text.match(ABSOLUTE_PATH_TOKEN) ?? [];
+    const relative = text.match(RELATIVE_PATH_TOKEN) ?? [];
+
+    // シェルや委譲は「保護ツリーを読め」という指示そのものを止めたいので文字列全体も見る。
     if (commandFields) out.push(text);
-    else out.push(...(text.match(ABSOLUTE_PATH_TOKEN) ?? []));
-    // 埋もれた相対パスは個別に切り出して解決する。文字列全体では解決できないため。
-    for (const rel of text.match(RELATIVE_PATH_TOKEN) ?? []) {
-      out.push(resolveFrom(cwd, rel));
-    }
+    else out.push(...absolute, ...(text.match(MSYS_PATH_TOKEN) ?? []));
+
+    // 埋もれたパスは切り出して個別に解決する。文字列全体のままでは `..` を畳めず、
+    // `C:/x/../<tree>/secret` のように途中で上に登る絶対パスが素通りしていた
+    // (mentionsTree は文字列を突き合わせるだけで、パスとしての正規化はしない)。
+    for (const token of [...absolute, ...relative]) out.push(resolveFrom(cwd, token));
   }
   return out.filter(Boolean);
 }

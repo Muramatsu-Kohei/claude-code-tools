@@ -236,6 +236,71 @@ console.log('account-guard');
   check('保護ツリーに届かない相対パスは通す', res === null, JSON.stringify(res));
 }
 
+// --- 途中で上に登る絶対パス ---
+// 文字列を突き合わせるだけでは `..` が畳まれないため、絶対パスの体裁のまま
+// 保護ツリーへ潜り込める。切り出して解決するまで拒否できなかった経路。
+{
+  const home = sandbox('deny-dotdot-bash', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command: 'cat C:/x/../org-tree/secret.txt' },
+  });
+  check('コマンド中の `..` を含む絶対パスを拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  const home = sandbox('deny-dotdot-mcp', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'mcp__fs__read', tool_input: { p: 'C:/claude/../org-tree/secret.txt' },
+  });
+  check('未知ツールの `..` を含む絶対パスを拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+
+// --- Git Bash / MSYS のドライブ表記 ---
+// このマシンの Bash ツールは Git Bash なので `/c/...` で同じ場所に届く。
+// 表記を替えるだけで保護をすり抜けられてはいけない。
+{
+  const home = sandbox('deny-msys-bash', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command: 'cat /c/org-tree/secret.txt' },
+  });
+  check('Git Bash 形式(/c/...)の読み取りを拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  const home = sandbox('deny-msys-cygdrive', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'PowerShell',
+    tool_input: { command: 'Get-Content /cygdrive/c/org-tree/secret.txt' },
+  });
+  check('cygdrive 形式の読み取りを拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  const home = sandbox('deny-msys-grep', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Grep',
+    tool_input: { pattern: 'secret', glob: '/c/org-tree/**' },
+  });
+  check('Git Bash 形式の glob 検索を拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  const home = sandbox('deny-msys-mcp', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'mcp__fs__read', tool_input: { p: '/c/org-tree/secret.txt' },
+  });
+  check('未知ツールの Git Bash 形式パスを拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  // 表記の変換が過剰に効いて無関係なパスを巻き込まないこと。
+  const home = sandbox('allow-msys-unrelated', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command: 'cat /c/claude/ClaudeCode/README.md' },
+  });
+  check('Git Bash 形式でも無関係なパスは通す', res === null, JSON.stringify(res));
+}
+
 // --- 設定が壊れているとき ---
 // 「未作成 = 保護なし」は意図した状態だが、「あるが壊れている」は事故。以前はどちらも
 // 保護なしにしていたため、末尾カンマ1つで全ての保護が無言で消えていた。
