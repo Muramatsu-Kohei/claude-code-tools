@@ -251,6 +251,26 @@ const listBroken = worklog5(['list', '-n', '20']).out;
 check('list でも設定を読めていないことを伝える(--all でなくても)',
   /config\.json.*を読めない/.test(listBroken), listBroken);
 
+// restrictedTrees が配列でない書き損じ。そのまま filter に渡すと例外になり、
+// フック経路では上位の catch に吸われて文脈注入が黙って止まる
+for (const [label, rawCfg] of [
+  ['配列にし忘れたオブジェクト', '{ "restrictedTrees": { "tree": "C:/org-tree", "allow": ["team"] } }'],
+  ['null', '{ "restrictedTrees": null }'],
+]) {
+  const dir = path.join(BASE, `home-badtype-${label.replace(/[^a-z]/gi, '')}`);
+  const { home: h, logDir: d } = sandboxHome(dir, CONFIG);
+  setAccount(h, 'pro');
+  fs.writeFileSync(
+    path.join(d, `${projectKey(TREE)}.ndjson`),
+    fs.readFileSync(path.join(logDir, `${projectKey(TREE)}.ndjson`), 'utf8'),
+  );
+  fs.writeFileSync(path.join(d, 'config.json'), rawCfg, 'utf8');
+  const res = runner(h, OTHER)(['today', '--days', '3650']);
+  check(`restrictedTrees が${label}でも異常終了しない`, res.code === 0, `code=${res.code} ${res.err}`);
+  check(`restrictedTrees が${label}なら壊れた設定として伏せる`,
+    !res.out.includes('保護ツリーの作業') && /config\.json.*を読めない/.test(res.out), res.out);
+}
+
 // 設定ファイルが無いのは意図した状態(既定設定で動く)。壊れているときと同じ扱いにしない
 const { home: home6, logDir: logDir6 } = sandboxHome(path.join(BASE, 'home-noconfig'));
 setAccount(home6, 'pro');

@@ -91,8 +91,16 @@ function loadConfig() {
     return { ...DEFAULT_CONFIG, configBroken: Boolean(e && e.code !== 'ENOENT') };
   }
   try {
+    const parsed = JSON.parse(text);
+    // restrictedTrees が配列でないのも設定ミス。そのまま blockedTrees に渡すと
+    // .filter が無くて例外になり、フック経路では末尾の catch に吸われて文脈注入が
+    // 黙って止まる。「1件だけだから」と配列にし忘れる書き損じは十分あり得るので、
+    // 姉妹ツールの account-guard が rules に対してしているのと同じ扱いにする
+    if (parsed && parsed.restrictedTrees !== undefined && !Array.isArray(parsed.restrictedTrees)) {
+      return { ...DEFAULT_CONFIG, configBroken: true };
+    }
     // configBroken は最後に置く。設定ファイル側に同名のキーがあっても上書きさせない
-    return { ...DEFAULT_CONFIG, ...JSON.parse(text), configBroken: false };
+    return { ...DEFAULT_CONFIG, ...parsed, configBroken: false };
   } catch {
     return { ...DEFAULT_CONFIG, configBroken: true };
   }
@@ -1421,6 +1429,10 @@ function resolveTargetKeys(flags) {
 // 対象プロジェクトが実在すること自体は隠さない(名前は利用者が --project に
 // 自分で書いた値、または cwd から作った値そのもの)
 function explicitProjectRestrictionNote(flags, cfg, account) {
+  // 設定を読めていないときは BLOCK_ALL で全部伏せている。理由は「別アカウント専用の
+  // ツリーだから」ではないので、ここでその説明を出すと誤った案内になる
+  // (本当の理由は restrictionNote 側が出す)
+  if (cfg.configBroken) return null;
   const blocked = blockedTrees(cfg, account);
   if (!blocked.length) return null;
   const explicit = one(flags, 'project');
