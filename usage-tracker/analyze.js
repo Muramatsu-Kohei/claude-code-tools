@@ -518,15 +518,22 @@ function clipToRecentDays(rows, days) {
 // (リセット時刻が別の値になった = 枠が入れ替わった)なので、日付計算をせずに区切れる。
 // resets_at が欠けた行(セッション開始直後などに起こりうる)は境界の判定に使わない。
 // 欠けを境界とみなすと、実際にはリセットしていない場所で窓が increments されてしまう。
+//
+// prev はアカウントごとに別々に持つ(buildWindows が acct を含む複合キーで window を
+// 区切っているのと同じ理由)。--account all では2アカウントの行が ts 順に交互に並ぶため、
+// 単一の prev で追うと「別アカウントの seven_reset に切り替わった」だけで境界と誤判定し、
+// ほぼ全行が窓の開始点になってしまう。
 function weekWindowStarts(rows) {
   const starts = [];
-  let prev = null;
+  const prevByAcct = new Map();
   for (let i = 0; i < rows.length; i++) {
     const reset = rows[i].seven_reset_ms;
     if (reset == null) continue;
+    const acct = rows[i].acct;
+    const prev = prevByAcct.has(acct) ? prevByAcct.get(acct) : null;
     if (prev === null || reset !== prev) {
       starts.push(i);
-      prev = reset;
+      prevByAcct.set(acct, reset);
     }
   }
   return starts;
