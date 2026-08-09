@@ -49,6 +49,28 @@ write(TREE, [{ sid: 'r1', ts: T, summary: '保護ツリーの作業' }]);
 write(SIMILAR, [{ sid: 's1', ts: T, summary: '似た名前ツリーの作業' }]);
 write(OTHER, [{ sid: 'o1', ts: T, summary: '無関係ツリーの作業' }]);
 
+// F2: cwd を持たないセッション(SessionStart 未発火、move で非制限キーへ移された孤児 等)。
+// write() は cwd が偽値だと repo で埋めてしまうため、ここだけ生の NDJSON を直接追記して
+// cwd フィールド自体を欠落させる。キーは無関係ツリー(OTHER)だが、cwd 側の第二の網は
+// キーに関係なく「保護ツリーの外だと証明できないセッション」を fail-closed で扱うべき対象
+const noCwdLines = [
+  JSON.stringify({ k: 'start', sid: 'nc1', ts: T, branch: 'main' }), // cwd フィールドが無い
+  JSON.stringify({ k: 'note', sid: 'nc1', ts: T, via: 'wrap', summary: 'cwd不明セッションの作業' }),
+  JSON.stringify({ k: 'end', sid: 'nc1', ts: T + 1000, reason: 'clear', stats: {} }),
+];
+fs.appendFileSync(path.join(logDir, `${projectKey(OTHER)}.ndjson`), `${noCwdLines.join('\n')}\n`);
+
+// F1: cwd フィールドの大小がツリー設定と違っても保護ツリー配下と判定できる(第二の網)。
+// Windows はファイルシステムが case-insensitive なので、大小の違いだけで制限が無言で
+// すり抜けると危ない。キーは無関係ツリー(OTHER)のまま、cwd だけを大文字化した記録を
+// 直接追記する(F2 と同じ「孤児」想定で、キー単位の網には引っかからない形にする)
+const caseMismatchLines = [
+  JSON.stringify({ k: 'start', sid: 'cm1', ts: T, cwd: TREE.toUpperCase(), branch: 'main' }),
+  JSON.stringify({ k: 'note', sid: 'cm1', ts: T, via: 'wrap', summary: '大小違いcwdセッションの作業' }),
+  JSON.stringify({ k: 'end', sid: 'cm1', ts: T + 1000, reason: 'clear', stats: {} }),
+];
+fs.appendFileSync(path.join(logDir, `${projectKey(OTHER)}.ndjson`), `${caseMismatchLines.join('\n')}\n`);
+
 const { check, finish } = checks();
 const worklog = runner(home, OTHER);
 
@@ -59,6 +81,13 @@ const todayBlocked = worklog(['today', '--days', '3650']).out;
 check('許可されていないアカウントでは today に保護ツリーが出ない', !todayBlocked.includes('保護ツリーの作業'), todayBlocked);
 check('無関係ツリーは today にそのまま出る', todayBlocked.includes('無関係ツリーの作業'), todayBlocked);
 check('除外を黙って隠さない注記が出る', /別アカウント専用のツリーのため 1 件のプロジェクトを表示していません/.test(todayBlocked), todayBlocked);
+// F2: cwd の無いセッションは、キー自体は無関係ツリー(OTHER)でも fail-closed で隠れる
+// (「保護ツリーの外だと証明できない」ため。move 後の孤児などキーだけでは拾えない
+// 取りこぼしを塞ぐのがこの第二の網の役目なので、判定不能を見せる側に倒すと意味が無くなる)
+check('cwd の無いセッションは制限が有効な間は出ない(fail-closed)',
+  !todayBlocked.includes('cwd不明セッションの作業'), todayBlocked);
+check('F1: cwd の大小がツリー設定と違っても保護ツリー配下と判定される',
+  !todayBlocked.includes('大小違いcwdセッションの作業'), todayBlocked);
 
 const listAllBlocked = worklog(['list', '--all', '-n', '20']).out;
 check('list --all でも保護ツリーが出ない', !listAllBlocked.includes('保護ツリーの作業'), listAllBlocked);
@@ -68,6 +97,12 @@ check('似た名前の別ツリー(org-treeo)は誤って除外されない', li
 const listCwdBlocked = worklog(['list', '-n', '20'], { cwd: TREE }).out;
 check('保護ツリーの中で cd して list しても出ない(単独キー解決も塞ぐ)',
   !listCwdBlocked.includes('保護ツリーの作業'), listCwdBlocked);
+// F3: --project も --all も付けない既定呼び出しで cwd 由来のキーが制限に当たった場合、
+// 「記録がまだない」という誤解を招く文言ではなく、制限が理由だと分かる注記を出す
+check('保護ツリーの中で cd して list すると制限の案内が出る(「記録がまだない」ではない)',
+  /別アカウント専用のツリーのため.*表示していない/.test(listCwdBlocked)
+    && !listCwdBlocked.includes('記録がまだない'),
+  listCwdBlocked);
 
 // --project でツリーを名指しした場合。「記録がまだない」だと消えたと誤解して調べ回ることに
 // なるため、制限による除外だと分かる文言(かつ「記録がまだない」は出ない)ことを見る
@@ -99,6 +134,66 @@ setAccount(home, 'team');
 const todayAllowed = worklog(['today', '--days', '3650']).out;
 check('許可されたアカウントでは today に保護ツリーが出る', todayAllowed.includes('保護ツリーの作業'), todayAllowed);
 check('許可されたアカウントでは注記が出ない', !todayAllowed.includes('件のプロジェクトを表示していません'), todayAllowed);
+// F2: 制限そのものが無効(この account では blocked が空)なら、cwd の無いセッションも
+// fail-closed の対象外になり、通常どおり出る
+check('許可されたアカウントでは cwd の無いセッションも出る(制限自体が無効なため)',
+  todayAllowed.includes('cwd不明セッションの作業'), todayAllowed);
+check('許可されたアカウントでは大小違いcwdセッションも出る(制限自体が無効なため)',
+  todayAllowed.includes('大小違いcwdセッションの作業'), todayAllowed);
+
+// F1: config の restrictedTrees.tree 側の大小が実際のキーと違っていても塞ぐ(第一の網、
+// キー単位の前方一致)。projectKey() はパス比較で git を使わないので、実在しないパスの
+// 大文字化でも安全に検証できる
+const { home: home3, logDir: logDir3 } = sandboxHome(
+  path.join(BASE, 'home-case'),
+  { restrictedTrees: [{ tree: TREE.toUpperCase(), allow: ['team'] }] },
+);
+setAccount(home3, 'pro');
+fs.writeFileSync(
+  path.join(logDir3, `${projectKey(TREE)}.ndjson`),
+  fs.readFileSync(path.join(logDir, `${projectKey(TREE)}.ndjson`), 'utf8'),
+);
+const worklog3 = runner(home3, OTHER);
+const todayKeyCaseBlocked = worklog3(['today', '--days', '3650']).out;
+check('F1: config の tree の大小が実際のキーと違っても保護ツリーは隠れる(第一の網)',
+  !todayKeyCaseBlocked.includes('保護ツリーの作業'), todayKeyCaseBlocked);
+
+// F4: move --to が制限キーにしか一致しないとき、resolveMoveKey は listProjectKeys()
+// (制限フィルタ済み)しか見ないと「マッチなし」になり、allowNew のフォールバックで
+// spec を cwd 相対パスとして解釈した「存在しないキー」を捏造してそこへ move してしまう。
+// TREE を使うと「似た名前の別ツリー」SIMILAR が部分一致で先に拾われてしまい再現できないため、
+// 専用のサンドボックスに紛れない名前の保護ツリーを別途用意する
+const MOVE_TREE = path.join(BASE, 'org-tree'); // 課題文中の例と同じ名前にする(保護ツリー、move 専用)
+fs.mkdirSync(MOVE_TREE, { recursive: true });
+execFileSync('git', ['init', '-q'], { cwd: MOVE_TREE, windowsHide: true });
+const { home: home4, logDir: logDir4 } = sandboxHome(
+  path.join(BASE, 'home-move'),
+  { restrictedTrees: [{ tree: MOVE_TREE, allow: ['team'] }] },
+);
+const rec4 = (sid, ts, cwd, summary) => [
+  JSON.stringify({ k: 'start', sid, ts, cwd, branch: 'main' }),
+  JSON.stringify({ k: 'note', sid, ts, via: 'wrap', summary }),
+  JSON.stringify({ k: 'end', sid, ts: ts + 1000, reason: 'clear', stats: {} }),
+].join('\n');
+fs.writeFileSync(path.join(logDir4, `${projectKey(MOVE_TREE)}.ndjson`),
+  `${rec4('bt1', T, MOVE_TREE, '保護ツリー(move用)の作業')}\n`);
+fs.writeFileSync(path.join(logDir4, `${projectKey(OTHER)}.ndjson`),
+  `${rec4('mo1', T, OTHER, '無関係ツリーの作業(move用)')}\n`);
+setAccount(home4, 'pro');
+const worklog4 = runner(home4, OTHER);
+// エラーは worklog.js 側の共通 catch が errors.log にも残すので、比較対象は
+// .ndjson(プロジェクトのログファイル)だけに絞る
+const ndjsonBeforeMove = fs.readdirSync(logDir4).filter((f) => f.endsWith('.ndjson'));
+const moveToBlocked = worklog4(['move', '--from', 'other-repo', '--to', 'org-tree', '--all']);
+check('F4: 制限キーにしか一致しない --to は move を拒否する(exit 1)',
+  moveToBlocked.code === 1, `code=${moveToBlocked.code} ${moveToBlocked.out}${moveToBlocked.err}`);
+check('F4: 拒否の理由が制限だと分かる', /別アカウント専用のツリーのため/.test(moveToBlocked.err), moveToBlocked.err);
+check('F4: 捏造キーの新規ファイルを作らない',
+  fs.readdirSync(logDir4).filter((f) => f.endsWith('.ndjson')).join(',') === ndjsonBeforeMove.join(','),
+  fs.readdirSync(logDir4).join(', '));
+check('F4: 移動元(OTHER)のログも書き換えない',
+  fs.readFileSync(path.join(logDir4, `${projectKey(OTHER)}.ndjson`), 'utf8').includes('無関係ツリーの作業(move用)'),
+  fs.readFileSync(path.join(logDir4, `${projectKey(OTHER)}.ndjson`), 'utf8'));
 
 // --- restrictedTrees が空(既定)なら誰にでも全部出る ---
 const { home: home2, logDir: logDir2 } = sandboxHome(path.join(BASE, 'home-empty'), { restrictedTrees: [] });

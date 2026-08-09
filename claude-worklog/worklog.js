@@ -122,20 +122,27 @@ function blockedTrees(cfg, account) {
 }
 
 // projectKey の前方一致でツリー配下かを見る。"C--org-treeo" のような別ツリーを
-// 巻き込まないよう、続きが '-'(区切り)か文字列終端であることまで確認する
+// 巻き込まないよう、続きが '-'(区切り)か文字列終端であることまで確認する。
+// projectKey() は normPath() 由来でドライブ文字以外の大小をそのまま残すため、
+// ここでも cwdUnderTree() と同じく小文字化してから比較する(Windows は
+// ファイルシステムが case-insensitive なので、大小差だけで制限を素通りさせない)
 function keyUnderTree(key, treePath) {
-  const treeKey = projectKey(treePath);
+  const treeKey = projectKey(treePath).toLowerCase();
   if (!treeKey) return false;
-  return key === treeKey || key.startsWith(`${treeKey}-`);
+  const k = key.toLowerCase();
+  return k === treeKey || k.startsWith(`${treeKey}-`);
 }
 
 // cwd がツリー配下かを見る。inSameTree() は親子どちらの向きでも真になる(並列
 // セッション警告向けの設計)が、ここでは「cwd がツリーの内側にあるか」という
 // 向きだけを見る必要がある(cwd がツリーの親ならまだ配下ではない)ため、
-// 同じ前方一致の発想を使いつつ向きを固定した専用の判定にする
+// 同じ前方一致の発想を使いつつ向きを固定した専用の判定にする。
+// Windows はファイルシステムが case-insensitive なので、比較前に小文字化する
+// (姉妹ツールの account-guard.js の normalize() と揃える。ここを揃えないと
+// ドライブ以外の大小差だけで制限が無言ですり抜けてしまう)
 function cwdUnderTree(cwd, treePath) {
-  const c = normPath(cwd);
-  const t = normPath(treePath);
+  const c = normPath(cwd).toLowerCase();
+  const t = normPath(treePath).toLowerCase();
   if (!c || !t) return false;
   return c === t || c.startsWith(t + path.sep);
 }
@@ -145,7 +152,13 @@ function isKeyBlocked(key, blocked) {
 }
 
 function isCwdBlocked(cwd, blocked) {
-  return Boolean(cwd) && blocked.some((r) => cwdUnderTree(cwd, r.tree));
+  if (!blocked.length) return false;
+  // cwd の無いセッション(SessionStart が発火しなかった、move で非制限キーへ移された
+  // 孤児など)は「保護ツリーの外だった」ことを証明できない。この第二の網はそもそも
+  // キーの網をすり抜けた取りこぼしを拾うために足したものなので、判定不能を
+  // fail-open(見せる)にすると存在意義が消える。制限が1つでも有効なら fail-closed にする
+  if (!cwd) return true;
+  return blocked.some((r) => cwdUnderTree(cwd, r.tree));
 }
 
 // プロジェクトキーの一覧から、現在のアカウントに見せてよくないものを外す
@@ -1380,23 +1393,32 @@ function resolveTargetKeys(flags) {
   return filterVisibleKeys([repoKey(one(flags, 'cwd', process.cwd()))], cfg, account);
 }
 
-// resolveTargetKeys(--project) が空になったとき、それが「本当に記録が無い」のか
-// 「制限で見えないだけ」なのかを cmdList / cmdExport が区別するための注記。
-// 「記録が消えた」と誤解して調べ回るのを防ぐのが目的なので、対象プロジェクトが
-// 実在すること自体は隠さない(名前は利用者が --project に自分で書いた値そのもの)
+// resolveTargetKeys(--project、または無指定時の cwd)が空になったとき、それが
+// 「本当に記録が無い」のか「制限で見えないだけ」なのかを cmdList / cmdExport が
+// 区別するための注記。「記録が消えた」と誤解して調べ回るのを防ぐのが目的なので、
+// 対象プロジェクトが実在すること自体は隠さない(名前は利用者が --project に
+// 自分で書いた値、または cwd から作った値そのもの)
 function explicitProjectRestrictionNote(flags, cfg, account) {
-  const explicit = one(flags, 'project');
-  if (typeof explicit !== 'string') return null;
   const blocked = blockedTrees(cfg, account);
   if (!blocked.length) return null;
-  const raw = listProjectKeysRaw();
-  // フォールバック(部分一致なし)のときの repoKey(explicit) は、ディスク上に
-  // 実在するとは限らない(打ち間違い等)。実在しないキーまで「制限中」と案内すると
-  // 誤情報になるので、素の一覧に無いものは「本当に記録が無い」側として扱う
-  const candidates = matchProjectKeys(raw, explicit).filter((k) => raw.includes(k));
-  if (!candidates.length) return null;
-  if (!candidates.every((k) => isKeyBlocked(k, blocked))) return null; // 一部でも見えるなら通常表示になる
-  return `「${explicit}」は別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。`;
+  const explicit = one(flags, 'project');
+  if (typeof explicit === 'string') {
+    const raw = listProjectKeysRaw();
+    // フォールバック(部分一致なし)のときの repoKey(explicit) は、ディスク上に
+    // 実在するとは限らない(打ち間違い等)。実在しないキーまで「制限中」と案内すると
+    // 誤情報になるので、素の一覧に無いものは「本当に記録が無い」側として扱う
+    const candidates = matchProjectKeys(raw, explicit).filter((k) => raw.includes(k));
+    if (!candidates.length) return null;
+    if (!candidates.every((k) => isKeyBlocked(k, blocked))) return null; // 一部でも見えるなら通常表示になる
+    return `「${explicit}」は別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。`;
+  }
+  // --project 省略時(既定の cwd 解決)。--all は listProjectKeys() で既にキー単位
+  // フィルタ済みで、件数ベースの restrictionNote が別途案内するのでここでは扱わない。
+  // resolveTargetKeys() の既定分岐と同じ repoKey(cwd) を使わないと判定基準がずれる
+  if (flags.all) return null;
+  const cwdKey = repoKey(one(flags, 'cwd', process.cwd()));
+  if (!isKeyBlocked(cwdKey, blocked)) return null;
+  return '現在のディレクトリは別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。';
 }
 
 function cmdList(flags) {
@@ -1626,11 +1648,27 @@ function cmdExport(flags) {
 // キー指定を 1 つに解決する。完全一致 > 部分一致の順。既存キーに当たらないときは
 // パスとして解釈する(allowNew。まだ記録のない移動先を --to に書けるようにするため)
 function resolveMoveKey(spec, allowNew) {
-  const all = listProjectKeys();
+  const all = listProjectKeys(); // restrictedTrees でキー単位フィルタ済み
   if (all.includes(spec)) return spec;
   const hit = all.filter((k) => k.toLowerCase().includes(spec.toLowerCase()));
   if (hit.length === 1) return hit[0];
   if (hit.length > 1) throw new Error(`「${spec}」は ${hit.length} 件のプロジェクトに一致する: ${hit.join(', ')}`);
+
+  // ここまでで hit なし。all は制限フィルタ済みなので、実際には存在するキーが
+  // 制限で見えていないだけの可能性がある。その状態のまま allowNew のフォールバック
+  // (パスとして repoKey() に通す)に進むと、spec を cwd からの相対パスとして解決した
+  // 「ディスク上に無い新規キー」を作ってしまい、記録がそこへ move されてしまう
+  // (「ディスク上に無い」の警告は出るが move 自体は実行されてしまう)。
+  // 制限が理由だと分かっている場合はキーを捏造せず、ここで move そのものを拒否する
+  const blocked = blockedTrees(loadConfig(), currentAccount());
+  if (blocked.length) {
+    const raw = listProjectKeysRaw();
+    const rawHit = raw.includes(spec) ? [spec] : raw.filter((k) => k.toLowerCase().includes(spec.toLowerCase()));
+    if (rawHit.length && rawHit.every((k) => isKeyBlocked(k, blocked))) {
+      throw new Error(`「${spec}」は別アカウント専用のツリーのため move できない。許可されたアカウントに切り替える。`);
+    }
+  }
+
   if (!allowNew) throw new Error(`「${spec}」に一致するプロジェクトがない。worklog list --all で確認する`);
   // 既存キーに当たらなかったのでパス扱いにする。打ち間違いがそのまま新しいキーに
   // なってしまうため、ディスク上に無いことだけは伝える(消えたディレクトリの
