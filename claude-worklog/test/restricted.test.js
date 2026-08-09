@@ -206,4 +206,50 @@ const worklog2 = runner(home2, OTHER);
 const todayEmptyConfig = worklog2(['today', '--days', '3650']).out;
 check('restrictedTrees が空なら制限なしで全部出る', todayEmptyConfig.includes('保護ツリーの作業'), todayEmptyConfig);
 
+// --- today の注記の出し分け(list / export と揃える) ---
+// today は既定で全プロジェクト横断なので件数の注記を出すが、--project で対象を絞ったら
+// 横断していない以上その件数は意味を持たない。代わりに、制限で空になったことを伝える
+setAccount(home, 'pro');
+const todayProjectBlocked = worklog(['today', '--days', '3650', '--project', TREE]).out;
+check('today --project で保護ツリーを名指しすると制限の案内が出る(「記録はまだない」ではない)',
+  /別アカウント専用のツリーのため.*表示していない/.test(todayProjectBlocked)
+    && !todayProjectBlocked.includes('記録はまだない'), todayProjectBlocked);
+const todayProjectOther = worklog(['today', '--days', '3650', '--project', OTHER]).out;
+check('today --project で無関係なツリーを指定したら件数の注記は出ない',
+  !todayProjectOther.includes('件のプロジェクトを表示していません'), todayProjectOther);
+
+// --- config.json が壊れているとき(fail-closed) ---
+// 「未作成」は既定設定で動く意図した状態だが、「あるが壊れている」は事故。以前は
+// どちらも既定に落ちて restrictedTrees が空に戻り、保護ツリーの記録が無警告で出ていた。
+// どのツリーを伏せるべきか判断できない以上、全部伏せる側に倒す
+const { home: home5, logDir: logDir5 } = sandboxHome(path.join(BASE, 'home-broken'), CONFIG);
+setAccount(home5, 'pro');
+for (const repo of [TREE, OTHER]) {
+  fs.writeFileSync(
+    path.join(logDir5, `${projectKey(repo)}.ndjson`),
+    fs.readFileSync(path.join(logDir, `${projectKey(repo)}.ndjson`), 'utf8'),
+  );
+}
+fs.writeFileSync(path.join(logDir5, 'config.json'), '{ "restrictedTrees": [ , ] }', 'utf8');
+const worklog5 = runner(home5, OTHER);
+const todayBroken = worklog5(['today', '--days', '3650']).out;
+check('設定が壊れていたら保護ツリーの記録は出ない', !todayBroken.includes('保護ツリーの作業'), todayBroken);
+check('設定が壊れていたら無関係な記録も伏せる(どれを伏せるべきか判断できないため)',
+  !todayBroken.includes('無関係ツリーの作業'), todayBroken);
+check('設定を読めていないことを注記で伝える', /config\.json.*を読めない/.test(todayBroken), todayBroken);
+const listBroken = worklog5(['list', '-n', '20']).out;
+check('list でも設定を読めていないことを伝える(--all でなくても)',
+  /config\.json.*を読めない/.test(listBroken), listBroken);
+
+// 設定ファイルが無いのは意図した状態(既定設定で動く)。壊れているときと同じ扱いにしない
+const { home: home6, logDir: logDir6 } = sandboxHome(path.join(BASE, 'home-noconfig'));
+setAccount(home6, 'pro');
+fs.writeFileSync(
+  path.join(logDir6, `${projectKey(TREE)}.ndjson`),
+  fs.readFileSync(path.join(logDir, `${projectKey(TREE)}.ndjson`), 'utf8'),
+);
+const todayNoConfig = runner(home6, OTHER)(['today', '--days', '3650']).out;
+check('設定ファイルが無いときは制限なしで動く(壊れているときと区別する)',
+  todayNoConfig.includes('保護ツリーの作業') && !/を読めない/.test(todayNoConfig), todayNoConfig);
+
 finish();

@@ -77,11 +77,24 @@ const DEFAULT_CONFIG = {
 //  基礎ユーティリティ
 // ---------------------------------------------------------------------------
 
+// 設定を読む。configBroken は「設定があるのに読めない」状態を表す。
+//
+// 「未作成」と「あるが壊れている」を区別するのが要点。以前はどちらも既定設定に
+// 落としていたため、config.json に末尾カンマを1つ入れただけで restrictedTrees が
+// 空に戻り、組織ツリーの記録が個人アカウントのセッションに無警告で出ていた。
+// 未設定は意図した状態だが、壊れているのは事故なので伏せる側に倒す(blockedTrees 参照)。
 function loadConfig() {
+  let text;
   try {
-    return { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) };
+    text = fs.readFileSync(CONFIG_PATH, 'utf8');
+  } catch (e) {
+    return { ...DEFAULT_CONFIG, configBroken: Boolean(e && e.code !== 'ENOENT') };
+  }
+  try {
+    // configBroken は最後に置く。設定ファイル側に同名のキーがあっても上書きさせない
+    return { ...DEFAULT_CONFIG, ...JSON.parse(text), configBroken: false };
   } catch {
-    return { ...DEFAULT_CONFIG };
+    return { ...DEFAULT_CONFIG, configBroken: true };
   }
 }
 
@@ -115,7 +128,12 @@ function currentAccount() {
 // 現在のアカウントに見せてよくない restrictedTrees だけを返す。allow に現在の
 // アカウントが含まれていれば制限しない。allow が配列でない設定ミスは「誰にも
 // 見せない」側に倒す(プライバシー機能なので fail-open ではなく fail-closed にする)
+// 設定を読めないときに使う「全部伏せる」ルール。どのツリーを制限すべきか分からない
+// 以上、制限なしとして見せるのはプライバシー機能として逆で、設定を直せば元に戻る。
+const BLOCK_ALL = { tree: '', all: true };
+
 function blockedTrees(cfg, account) {
+  if (cfg.configBroken) return [BLOCK_ALL];
   return (cfg.restrictedTrees || [])
     .filter((r) => r && typeof r.tree === 'string' && r.tree)
     .filter((r) => !(Array.isArray(r.allow) && r.allow.includes(account)));
@@ -148,11 +166,12 @@ function cwdUnderTree(cwd, treePath) {
 }
 
 function isKeyBlocked(key, blocked) {
-  return blocked.some((r) => keyUnderTree(key, r.tree));
+  return blocked.some((r) => r.all || keyUnderTree(key, r.tree));
 }
 
 function isCwdBlocked(cwd, blocked) {
   if (!blocked.length) return false;
+  if (blocked.some((r) => r.all)) return true;
   // cwd の無いセッション(SessionStart が発火しなかった、move で非制限キーへ移された
   // 孤児など)は「保護ツリーの外だった」ことを証明できない。この第二の網はそもそも
   // キーの網をすり抜けた取りこぼしを拾うために足したものなので、判定不能を
@@ -179,6 +198,9 @@ function filterVisibleSessions(sessions, cfg, account) {
 // 除外が発生したことを黙って隠さないための一行。today / list --all / export --all で使う。
 // SessionStart の自動注入(buildContext)は出力を汚したくないのでここを呼ばない
 function restrictionNote(cfg, account) {
+  if (cfg.configBroken) {
+    return `設定 ${CONFIG_PATH} を読めないため、安全側に倒して全ての記録を伏せています`;
+  }
   const blocked = blockedTrees(cfg, account);
   if (!blocked.length) return null;
   const raw = listProjectKeysRaw();
@@ -1431,7 +1453,8 @@ function cmdList(flags) {
   const scopeFilter = one(flags, 'scope');
   // 注記は --all(全プロジェクト横断)のときは件数で、--project の明示指定では
   // 「記録が消えた」との誤解を防ぐための個別の案内で出す(下の空セッション分岐)
-  const note = flags.all ? restrictionNote(cfg, account) : null;
+  // 設定を読めていないことだけは、対象の指定によらず必ず伝える
+  const note = flags.all || cfg.configBroken ? restrictionNote(cfg, account) : null;
 
   // cwd 単位の第二の網もかけておく(move 後の孤児などキーだけでは拾えない取りこぼし対策)
   const all = filterVisibleSessions(
@@ -1471,7 +1494,11 @@ function cmdToday(flags) {
   since.setHours(0, 0, 0, 0);
   since.setDate(since.getDate() - (days - 1));
   const from = since.getTime();
-  const note = restrictionNote(cfg, account); // today は既定で全プロジェクト横断なので常に見る
+  // 注記の出し分けは cmdList / cmdExport と揃える。today は既定で全プロジェクト横断
+  // なので件数ベースの注記を出すが、--project を明示したときは横断していないので
+  // 件数は意味を持たない(代わりに空表示のときへ個別の案内を出す)。
+  // 設定を読めていないことだけは、対象の指定によらず必ず伝える。
+  const note = !flags.project || cfg.configBroken ? restrictionNote(cfg, account) : null;
 
   // cwd 単位の第二の網もかけておく(move 後の孤児などキーだけでは拾えない取りこぼし対策)
   const sessions = filterVisibleSessions(
@@ -1482,7 +1509,14 @@ function cmdToday(flags) {
     .sort((a, b) => (a.startTs || 0) - (b.startTs || 0));
 
   if (!sessions.length) {
-    console.log(days > 1 ? `直近 ${days} 日の記録はない。` : '今日の記録はまだない。');
+    // 「記録が無い」と「制限で見せていない」の区別は cmdList / cmdExport と同じく today でも要る。
+    // --project 省略時は cwd ではなく全プロジェクトが対象なので、cwd 基準の案内は使わない
+    const restricted = flags.project ? explicitProjectRestrictionNote(flags, cfg, account) : null;
+    if (restricted) {
+      console.log(yellow(`! ${restricted}`));
+    } else {
+      console.log(days > 1 ? `直近 ${days} 日の記録はない。` : '今日の記録はまだない。');
+    }
     if (note) console.log(yellow(`! ${note}`));
     return;
   }
@@ -1609,7 +1643,8 @@ function cmdExport(flags) {
   // export はそのままファイルに保存・共有されうるので、除外があった事実を出力の中に残す。
   // 黙って消すと「記録が消えた」と誤解されるため。--all は件数、--project の明示指定は
   // 「記録が無い」との混同を避けるための個別の案内にする
-  if (flags.all) {
+  // 設定を読めていないことだけは、対象の指定によらず必ず残す
+  if (flags.all || cfg.configBroken) {
     const note = restrictionNote(cfg, account);
     if (note) out.push(`\n> ${note}`);
   } else {
