@@ -112,17 +112,29 @@ function Write-Log([string]$msg, [switch]$ConsoleOnly) {
 # 起動すると $lastPing が $null のままスキップ判定（150行目付近）を素通りしてしまい、
 # 次の毎時実行で本物の claude -p Ping が送られて枠が意図しない時刻に張り直る。
 # これはこのツールが防ぐべき事象そのものなので、旧ファイルはリネームして引き継ぐ。
+#
+# ただし移行は一方向で取り消せないので、行き先を間違えないことのほうが大事になる。
+#  - $account が unknown（未ログイン、/login 中で credentials を読めない、タスクが別ユーザーの
+#    資格で走った等）のまま移すと state-unknown.json に退避され、本来のアカウントの記録が
+#    失われる。それこそが上に書いた「素通り」を招くので、判別できない回は移さず読むだけにする。
+#  - -Status は状態を見るだけのつもりで叩かれる。読み取り専用の実行でファイルを動かさない。
+# どちらの場合も旧ファイルをそのまま読み元にすれば、移行を先送りしても判定は正しく働く。
 $legacyStateFile = Join-Path $stateDir "state.json"
+$stateSource     = $stateFile
 if ((Test-Path $legacyStateFile) -and (-not (Test-Path $stateFile))) {
-    Move-Item -Path $legacyStateFile -Destination $stateFile
-    Write-Log ("STATE migrated legacy state.json -> " + (Split-Path $stateFile -Leaf))
+    if ($Status -or $account -eq "unknown") {
+        $stateSource = $legacyStateFile
+    } else {
+        Move-Item -Path $legacyStateFile -Destination $stateFile
+        Write-Log ("STATE migrated legacy state.json -> " + (Split-Path $stateFile -Leaf))
+    }
 }
 
 # 前回のPing時間をログから復元
 $lastPing = $null
-if (Test-Path $stateFile) {
+if (Test-Path $stateSource) {
     try {
-        $state = Get-Content $stateFile -Raw | ConvertFrom-Json
+        $state = Get-Content $stateSource -Raw | ConvertFrom-Json
         if ($state.lastPing) { 
             $lastPing = [datetime]$state.lastPing 
         }
