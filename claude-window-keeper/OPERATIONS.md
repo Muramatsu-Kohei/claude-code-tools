@@ -37,7 +37,7 @@ Claude Code の 5 時間セッション制限（レートリミット）のウ�
 
 | ファイル | 内容 |
 |---|---|
-| `state.json` | `{ "lastPing": "<ISO8601>" }` 前回送信時刻のみ |
+| `state-<account>.json` | `{ "lastPing": "<ISO8601>" }` 前回送信時刻のみ。枠はアカウントごとに独立しているため、ログイン中のアカウント（`subscriptionType`）別にファイルを分ける。旧 `state.json`（無印）が残っていれば初回起動時に自動でリネームして引き継ぐ |
 | `ping.log` | 実行ログ（PING / STATE / WARN / ERROR / DRYRUN の追記）。毎時発生する `SKIP` は画面表示のみでファイルには残さない |
 | `ping.log.1` | `ping.log` が 1 MB を超えたときの退避先（1世代のみ保持、以前の内容は破棄） |
 
@@ -45,17 +45,19 @@ Claude Code の 5 時間セッション制限（レートリミット）のウ�
 
 ## 3. 動作ロジック（ping 本体）
 
-1. `state.json` から `lastPing` を読む
+1. `state-<account>.json` から `lastPing` を読む（旧 `state.json` しか無ければ先に新パスへ移行してから読む）
 2. `-Status`: 前回時刻・経過・推定リセット（`lastPing + WindowMinutes`）を表示して終了（送信・更新なし）
 3. `-Force` でない かつ 経過 < `WindowMinutes` → `SKIP` を画面表示して終了（ファイルには残さない）
 4. `-DryRun`: 送信・状態更新をせずログのみ
 5. それ以外: `claude -p "Reply with only the word: ok" --model <Model>` を実行
-6. 成功したら `state.json` を現在時刻で更新し、推定リセット時刻をログ出力
+6. 成功したら `state-<account>.json` を現在時刻で更新し、推定リセット時刻をログ出力
 
 **設計上のポイント**
 - 「送るかどうか」の判断はすべて ping 本体が持つ。タスクは単に頻繁に叩くだけ（冪等）。
 - そのため 1 時間ごとに起動しても、5 時間未満なら必ず SKIP されコストは発生しない。
 - `-DryRun` / `-Status` は状態を汚さないため、検証に安全に使える。
+  ただし旧 `state.json` → `state-<account>.json` の移行だけは両オプションでも走る。
+  リネームのみで記録は失われず、移行しないと `-Status` の表示が実態とずれるため。
 - **判定の順序は 2 → 3 → 4。** SKIP 判定（3）が DryRun 判定（4）より先に来るため、
   記録がある状態で `-DryRun` 単体を実行すると SKIP で終了し DRYRUN 行に到達しない。
   送信処理の流れを検証したいときは `-Force -DryRun`（送信・記録なし）を使う。
@@ -157,7 +159,7 @@ Get-ScheduledTask -TaskName ClaudeWindowKeeper | Select-Object TaskName,State
 
 - 両スクリプトの構文パス（PowerShell Parser）: OK
 - `-DryRun` / `-Status`: 期待通り（状態を更新しない）
-- `-Force` 実送信: `reply: ok`、`state.json` 更新、推定リセット表示を確認
+- `-Force` 実送信: `reply: ok`、state ファイル（当時は無印 `state.json`。現在はアカウント別の `state-<account>.json`）更新、推定リセット表示を確認
 - `--output-format json` でトークン実測を取得
 - タスク登録: UAC 昇格経由で成功、`State = Ready` を確認
 
@@ -231,7 +233,7 @@ $ErrorActionPreference = "Stop"
 ```
 
 当初の実装は `claude` の呼び出しを `2>&1 | Out-String` で受けて try/catch で囲んでいたため、
-この挙動を踏むと **ping は実際に送信されて枠を消費したのに catch に落ちて `state.json` を更新しない**
+この挙動を踏むと **ping は実際に送信されて枠を消費したのに catch に落ちて state ファイル（`state-<account>.json`）を更新しない**
 状態になっていた。すると次の毎時実行でも「経過 ≧ WindowMinutes」のままなので real ping を毎時送り続け、
 **1 日 4〜5 回のはずが最大 24 回（枠とコストが約 5 倍）** になる。ログには ERROR しか残らず原因も追いにくい。
 

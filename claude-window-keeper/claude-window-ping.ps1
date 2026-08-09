@@ -107,6 +107,17 @@ function Write-Log([string]$msg, [switch]$ConsoleOnly) {
     Add-Content -Path $logFile -Value $line
 }
 
+# アカウント分離導入前は state.json（無印）1本だった名残の移行処理。
+# 新パス state-<account>.json が無いのに旧 state.json だけ残っている場合、移行せずに
+# 起動すると $lastPing が $null のままスキップ判定（150行目付近）を素通りしてしまい、
+# 次の毎時実行で本物の claude -p Ping が送られて枠が意図しない時刻に張り直る。
+# これはこのツールが防ぐべき事象そのものなので、旧ファイルはリネームして引き継ぐ。
+$legacyStateFile = Join-Path $stateDir "state.json"
+if ((Test-Path $legacyStateFile) -and (-not (Test-Path $stateFile))) {
+    Move-Item -Path $legacyStateFile -Destination $stateFile
+    Write-Log ("STATE migrated legacy state.json -> " + (Split-Path $stateFile -Leaf))
+}
+
 # 前回のPing時間をログから復元
 $lastPing = $null
 if (Test-Path $stateFile) {

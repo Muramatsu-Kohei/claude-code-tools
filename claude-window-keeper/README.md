@@ -134,7 +134,7 @@ Est. reset at  : 2026-07-22 07:16:58
 State          : 255 min until next ping is due
 ```
 
-状態とログの保存先は、スクリプトの置き場所と関係なく `%USERPROFILE%\.claude\window-keeper\` です（`state.json` と `ping.log`）。
+状態とログの保存先は、スクリプトの置き場所と関係なく `%USERPROFILE%\.claude\window-keeper\` です（アカウントごとの `state-<account>.json` と `ping.log`）。旧バージョンで使っていた無印の `state.json` が残っている場合は、初回起動時に自動でリネームして引き継がれます。
 
 `ping.log` に残るのは実際に意味のあるイベント（PING / STATE / WARN / ERROR / DRYRUN）だけです。毎時の実行で出る「まだ時間ではない」という `SKIP` は画面に表示されるだけでファイルには書かれないため、ログは年に数十行程度にしかなりません。万一 1 MB を超えた場合は `ping.log.1` に退避して新しいログを作り直します（保持は1世代のみ）。
 
@@ -151,6 +151,10 @@ State          : 255 min until next ping is due
 | `-Force` | off | 経過時間を無視して今すぐ送信 |
 | `-Status` | off | 状態表示のみ（送信・記録なし） |
 | `-DryRun` | off | ロジック確認のみ（送信・記録なし。トークン消費ゼロ） |
+
+> **例外がひとつあります。** 旧 `state.json` から `state-<account>.json` への移行だけは
+> `-Status` / `-DryRun` でも実行されます（ファイル名を変えるだけで、記録は失われません）。
+> 移行しないと `-Status` が「前回 ping なし」と誤って表示してしまうためです。
 
 > **`-DryRun` を後から使うときは `-Force` と併用してください。** 経過時間の判定は `-DryRun` の判定より先に
 > 行われるため、前回の送信から5時間たっていない間は `SKIP` が表示されるだけで `DRYRUN` の行までたどり着きません。
