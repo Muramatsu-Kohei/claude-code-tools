@@ -99,6 +99,14 @@ function loadConfig() {
     if (parsed && parsed.restrictedTrees !== undefined && !Array.isArray(parsed.restrictedTrees)) {
       return { ...DEFAULT_CONFIG, configBroken: true };
     }
+    // tree は絶対パスで書く。判定に使う normPath は path.resolve なので、相対パスだと
+    // worklog を実行した場所を基準に解決されてしまう。同じ設定でも呼び出し位置によって
+    // 守る対象が変わり、別の場所から実行すれば何も守らない — 制限機能として最も避けたい
+    // 壊れ方なので、書き損じとして伏せる側に倒す
+    if (Array.isArray(parsed?.restrictedTrees)
+      && parsed.restrictedTrees.some((r) => r && typeof r.tree === 'string' && r.tree && !path.isAbsolute(r.tree))) {
+      return { ...DEFAULT_CONFIG, configBroken: true };
+    }
     // configBroken は最後に置く。設定ファイル側に同名のキーがあっても上書きさせない
     return { ...DEFAULT_CONFIG, ...parsed, configBroken: false };
   } catch {
@@ -205,7 +213,10 @@ function filterVisibleSessions(sessions, cfg, account) {
 
 // 除外が発生したことを黙って隠さないための一行。today / list --all / export --all で使う。
 // SessionStart の自動注入(buildContext)は出力を汚したくないのでここを呼ばない
-function restrictionNote(cfg, account) {
+// hiddenSessions は cwd 側の第二の網で落ちた件数。キー単位で数えるだけでは、
+// 非制限キーの下にある孤児(move で移された記録など)が件数に現れず、まさにその網が
+// 拾う取りこぼしだけが無言で消える — この注記が防ごうとしている誤解そのものになる。
+function restrictionNote(cfg, account, hiddenSessions = 0) {
   if (cfg.configBroken) {
     return `設定 ${CONFIG_PATH} を読めないため、安全側に倒して全ての記録を伏せています`;
   }
@@ -213,7 +224,13 @@ function restrictionNote(cfg, account) {
   if (!blocked.length) return null;
   const raw = listProjectKeysRaw();
   const hidden = raw.length - filterVisibleKeys(raw, cfg, account).length;
-  return hidden > 0 ? `別アカウント専用のツリーのため ${hidden} 件のプロジェクトを表示していません` : null;
+
+  const parts = [];
+  if (hidden > 0) parts.push(`${hidden} 件のプロジェクト`);
+  if (hiddenSessions > 0) parts.push(`${hiddenSessions} 件のセッション`);
+  // 「と 」の後ろのスペースは意図的。各パートが数字で始まるので、詰めると
+  // 「プロジェクトと2 件」と不揃いになる
+  return parts.length ? `別アカウント専用のツリーのため ${parts.join('と ')}を表示していません` : null;
 }
 
 // フック実行中の失敗は表に出せない(出すとセッションが汚れる)ので、ここだけに残す
@@ -1465,14 +1482,15 @@ function cmdList(flags) {
   const scopeFilter = one(flags, 'scope');
   // 注記は --all(全プロジェクト横断)のときは件数で、--project の明示指定では
   // 「記録が消えた」との誤解を防ぐための個別の案内で出す(下の空セッション分岐)
-  // 設定を読めていないことだけは、対象の指定によらず必ず伝える
-  const note = flags.all || cfg.configBroken ? restrictionNote(cfg, account) : null;
-
   // cwd 単位の第二の網もかけておく(move 後の孤児などキーだけでは拾えない取りこぼし対策)
-  const all = filterVisibleSessions(
-    keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k }))),
-    cfg, account,
-  ).sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
+  const rawSessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })));
+  const visible = filterVisibleSessions(rawSessions, cfg, account);
+  const all = visible.slice().sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
+
+  // 設定を読めていないことだけは、対象の指定によらず必ず伝える
+  const note = flags.all || cfg.configBroken
+    ? restrictionNote(cfg, account, rawSessions.length - visible.length)
+    : null;
   // 絞り込みは件数制限より前に掛ける(直近 n 件の中から探すのでは取りこぼす)
   const sessions = (typeof scopeFilter === 'string' ? all.filter((s) => matchScope(s, scopeFilter, cfg)) : all)
     .slice(0, n);
@@ -1510,15 +1528,16 @@ function cmdToday(flags) {
   // なので件数ベースの注記を出すが、--project を明示したときは横断していないので
   // 件数は意味を持たない(代わりに空表示のときへ個別の案内を出す)。
   // 設定を読めていないことだけは、対象の指定によらず必ず伝える。
-  const note = !flags.project || cfg.configBroken ? restrictionNote(cfg, account) : null;
-
   // cwd 単位の第二の網もかけておく(move 後の孤児などキーだけでは拾えない取りこぼし対策)
-  const sessions = filterVisibleSessions(
-    keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k }))),
-    cfg, account,
-  )
+  const rawSessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })));
+  const visible = filterVisibleSessions(rawSessions, cfg, account);
+  const sessions = visible
     .filter((s) => (s.startTs || 0) >= from)
     .sort((a, b) => (a.startTs || 0) - (b.startTs || 0));
+
+  const note = !flags.project || cfg.configBroken
+    ? restrictionNote(cfg, account, rawSessions.length - visible.length)
+    : null;
 
   if (!sessions.length) {
     // 「記録が無い」と「制限で見せていない」の区別は cmdList / cmdExport と同じく today でも要る。
@@ -1641,10 +1660,9 @@ function cmdExport(flags) {
   const from = sinceStr ? Date.parse(sinceStr) : null;
 
   // cwd 単位の第二の網もかけておく(move 後の孤児などキーだけでは拾えない取りこぼし対策)
-  const sessions = filterVisibleSessions(
-    keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k }))),
-    cfg, account,
-  )
+  const rawSessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })));
+  const visible = filterVisibleSessions(rawSessions, cfg, account);
+  const sessions = visible
     .filter((s) => (from ? (s.startTs || 0) >= from : true))
     .sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
 
@@ -1657,7 +1675,7 @@ function cmdExport(flags) {
   // 「記録が無い」との混同を避けるための個別の案内にする
   // 設定を読めていないことだけは、対象の指定によらず必ず残す
   if (flags.all || cfg.configBroken) {
-    const note = restrictionNote(cfg, account);
+    const note = restrictionNote(cfg, account, rawSessions.length - visible.length);
     if (note) out.push(`\n> ${note}`);
   } else {
     const restricted = explicitProjectRestrictionNote(flags, cfg, account);

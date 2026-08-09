@@ -67,8 +67,10 @@ function normalize(p) {
     // リダイレクト(`</c/...`、`>/c/...`)やブレース展開(`{/c/...`)が漏れる。実際、
     // 列挙していた頃は `echo x >/c/<tree>/f` で保護ツリーへの書き込みが通っていた。
     // パスの途中にある `/c/`(例 `C:/x/c/tree`)は直前が英数字なので巻き込まない。
-    .replace(/(^|[^a-z0-9_.-])\/cygdrive\/([a-z])\//gi, '$1$2:/')
-    .replace(/(^|[^a-z0-9_.-])\/([a-z])\//gi, '$1$2:/')
+    // ドライブのコロン直後(`D:/c/tree`)は Windows パスの一部なので変換しない。
+    // ここを含めると `d:c:/tree` という壊れた文字列になり、ツリー名に当たって誤検知する。
+    .replace(/(^|[^a-z0-9_.:-])\/cygdrive\/([a-z])\//gi, '$1$2:/')
+    .replace(/(^|[^a-z0-9_.:-])\/([a-z])\//gi, '$1$2:/')
     .replace(/\/+$/, '')
     .toLowerCase();
 }
@@ -124,9 +126,17 @@ const COMMAND_FIELDS = {
 // 文字列に埋もれた絶対パス。ドライブ文字から始まる形。
 const ABSOLUTE_PATH_TOKEN = /[a-z]:[\\/][^"'\s,]*/gi;
 
-// Git Bash / MSYS 形式の絶対パス。これは path.resolve に渡すと `C:\c\...` と
-// 誤変換されるので、解決はせず normalize() の書き換えに任せて素の形のまま突き合わせる。
-const MSYS_PATH_TOKEN = /(?:\/cygdrive)?\/[a-z]\/[^"'\s,]*/gi;
+// Git Bash / MSYS 形式の絶対パス。直前がドライブのコロンや識別子の文字なら、それは
+// Windows パスの途中(`D:/c/...`)なので拾わない。
+const MSYS_PATH_TOKEN = /(?<![a-z0-9_.:\-])(?:\/cygdrive)?\/[a-z]\/[^"'\s,]*/gi;
+
+// MSYS 形式を Windows 形式へ直す。そのまま path.resolve に渡すと `C:\c\...` と
+// 誤変換されるが、ドライブ表記に直してからなら渡せる。これをしないと `/c/x/../<tree>` の
+// ように `.` / `..` を含む形が畳まれず、文字列の突き合わせをすり抜ける。
+function fromMsys(token) {
+  const m = /^(?:\/cygdrive)?\/([a-z])\/(.*)$/i.exec(token);
+  return m ? `${m[1]}:/${m[2]}` : null;
+}
 
 // 文字列に埋もれた「上に登る」相対パス。`../` を含まない相対指定は cwd の配下にしか
 // 届かず、cwd が保護ツリーの内側なら isInsideTree が先に拒否するので見なくてよい。
@@ -175,15 +185,20 @@ function targetStrings(toolName, toolInput, cwd) {
   for (const text of texts) {
     const absolute = text.match(ABSOLUTE_PATH_TOKEN) ?? [];
     const relative = text.match(RELATIVE_PATH_TOKEN) ?? [];
+    const msys = text.match(MSYS_PATH_TOKEN) ?? [];
 
     // シェルや委譲は「保護ツリーを読め」という指示そのものを止めたいので文字列全体も見る。
     if (commandFields) out.push(text);
-    else out.push(...absolute, ...(text.match(MSYS_PATH_TOKEN) ?? []));
+    else out.push(...absolute, ...msys);
 
-    // 埋もれたパスは切り出して個別に解決する。文字列全体のままでは `..` を畳めず、
-    // `C:/x/../<tree>/secret` のように途中で上に登る絶対パスが素通りしていた
+    // 埋もれたパスは切り出して個別に解決する。文字列全体のままでは `.` / `..` を畳めず、
+    // `C:/x/../<tree>/secret` や `/c/./<tree>` のような形が素通りしていた
     // (mentionsTree は文字列を突き合わせるだけで、パスとしての正規化はしない)。
     for (const token of [...absolute, ...relative]) out.push(resolveFrom(cwd, token));
+    for (const token of msys) {
+      const win = fromMsys(token);
+      if (win) out.push(win, resolveFrom(cwd, win));
+    }
   }
   return out.filter(Boolean);
 }
@@ -340,13 +355,20 @@ function main() {
   }
 
   const input = readHookInput();
-  const event = input.hook_event_name || mode;
+  const event = input.hook_event_name || mode || 'PreToolUse';
+  const isPreTool = event === 'PreToolUse';
 
-  // SessionStart / CwdChanged は拒否できないイベントなので、警告だけを文脈に載せる。
-  // 実際の防御は PreToolUse が担う。ここで気づければ無駄な往復を減らせる。
-  if (event === 'SessionStart' || event === 'CwdChanged') {
-    const hit = violation({ cwd: input.cwd, tool_input: {} }, account, config);
-    if (!hit) return;
+  // PreToolUse 以外のイベントには「操作の対象」が無いので cwd だけで判定する。
+  // SessionStart / CwdChanged の入力にツール引数は含まれず、含まれない値を見に行くと
+  // 判定の根拠が曖昧になるため、明示的に絞る。
+  const hit = violation(isPreTool ? input : { cwd: input.cwd, tool_input: {} }, account, config);
+  if (!hit) return; // 何も出力しなければ通常の権限フローに委ねられる。
+
+  // 拒否できるのは PreToolUse だけ。SessionStart / CwdChanged は公式に
+  // "No blocking or decision control" とされており、将来このフックを別のイベントに
+  // 登録した場合も同じ。deny 形式を返しても破棄されるので、警告として文脈に載せる
+  // (reportCrash と同じ方針)。ここで気づければ無駄な往復を減らせる。
+  if (!isPreTool) {
     process.stdout.write(
       JSON.stringify({
         hookSpecificOutput: { hookEventName: event, additionalContext: denyMessage(hit, account) },
@@ -354,9 +376,6 @@ function main() {
     );
     return;
   }
-
-  const hit = violation(input, account, config);
-  if (!hit) return; // 何も出力しなければ通常の権限フローに委ねられる。
 
   process.stdout.write(
     JSON.stringify({

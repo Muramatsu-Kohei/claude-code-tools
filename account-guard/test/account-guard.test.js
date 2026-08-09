@@ -310,6 +310,45 @@ console.log('account-guard');
   }
 }
 {
+  // Git Bash 形式に `.` / `..` が混ざる形。文字列の書き換えだけでは畳めないので、
+  // Windows 形式に直してから解決する必要がある
+  const home = sandbox('deny-msys-dots', { subscriptionType: 'pro', rules: ORG });
+  for (const [label, command] of [
+    ['カレント参照を挟む', 'ls /c/./org-tree'],
+    ['上に登る', 'cat /c/x/../org-tree/secret.txt'],
+  ]) {
+    const res = run(home, {
+      hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+      tool_input: { command },
+    });
+    check(`Git Bash 形式を拒否する — ${label}`, decision(res) === 'deny', JSON.stringify(res));
+  }
+}
+{
+  // ドライブのコロン直後の `/c/` は Windows パスの一部。ここを MSYS と誤認すると
+  // `d:c:/org-tree` という壊れた文字列になり、無関係なパスを拒否してしまう
+  const home = sandbox('allow-drive-then-c', { subscriptionType: 'pro', rules: ORG });
+  for (const [label, file] of [
+    ['ドライブ直下の c/', 'D:/c/org-tree/notes.md'],
+    ['対照(2文字)', 'D:/cc/org-tree/notes.md'],
+  ]) {
+    const res = run(home, {
+      hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Read',
+      tool_input: { file_path: file },
+    });
+    check(`別ドライブの同名パスを誤検知しない — ${label}`, res === null, JSON.stringify(res));
+  }
+}
+{
+  // 拒否できないイベントに登録された場合、deny 形式を返しても破棄される。
+  // 三種類目以降のイベントでも警告に落ちること
+  const home = sandbox('warn-other-event', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, { hook_event_name: 'UserPromptSubmit', cwd: 'C:/org-tree/proj' });
+  check('未知のイベントでは deny でなく警告を返す',
+    decision(res) === null && res?.hookSpecificOutput?.hookEventName === 'UserPromptSubmit',
+    JSON.stringify(res));
+}
+{
   const home = sandbox('deny-double-slash-win', { subscriptionType: 'pro', rules: ORG });
   const res = run(home, {
     hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',

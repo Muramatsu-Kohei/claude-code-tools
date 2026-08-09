@@ -374,7 +374,7 @@ process.stdin.on('end', () => {
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Read|Edit|Write|NotebookEdit|Glob|Grep|Bash|PowerShell|Agent|Task",
+        "matcher": "*",
         "hooks": [{ "type": "command", "command": "node C:/claude/ClaudeCode/account-guard/account-guard.js", "timeout": 5 }]
       }
     ],
@@ -389,9 +389,13 @@ process.stdin.on('end', () => {
 ```
 
 **実際に止まるのは `PreToolUse` だけ**で、残り 2 つは気づきを早めるための警告。
-`matcher` でツールを絞っているのは、全ツール呼び出しに node の起動を挟まないため。
-ここに載っていないツール（`WebFetch` など）から保護ツリーの中身が出ることはない
-——出すには先に `Read` か `Bash` が要り、そこで止まる。
+
+`matcher` は `"*"`（全ツール）にする。当初はツール名を列挙していたが、それだと
+**名前を事前に知りようがないツール**——MCP サーバーが提供するファイル操作ツールなど
+——がフックに届かない。実装側は「知らないツールは引数全体から絶対パスの形を拾う」
+という作りで最後の砦にしているのに、列挙式の matcher はその砦の手前で素通りさせる。
+全呼び出しで node を起動するコストはかかるが、取りこぼしの危険とは釣り合わない。
+ひな形の `account-guard/hooks-snippet.json` も `"*"` になっている。
 
 **設定変更は稼働中のセッションにも即座に効いた**（登録直後に同じセッションから
 保護ツリーを読もうとして拒否された）。再起動は要らない。

@@ -80,7 +80,11 @@ setAccount(home, 'pro');
 const todayBlocked = worklog(['today', '--days', '3650']).out;
 check('許可されていないアカウントでは today に保護ツリーが出ない', !todayBlocked.includes('保護ツリーの作業'), todayBlocked);
 check('無関係ツリーは today にそのまま出る', todayBlocked.includes('無関係ツリーの作業'), todayBlocked);
-check('除外を黙って隠さない注記が出る', /別アカウント専用のツリーのため 1 件のプロジェクトを表示していません/.test(todayBlocked), todayBlocked);
+// 件数はキー単位(プロジェクト)と cwd 単位(セッション)の両方を数える。後者を
+// 数えないと、第二の網が拾った取りこぼしだけが注記に現れず黙って消える
+check('除外を黙って隠さない注記が出る',
+  /別アカウント専用のツリーのため 1 件のプロジェクトと 2 件のセッションを表示していません/.test(todayBlocked),
+  todayBlocked);
 // F2: cwd の無いセッションは、キー自体は無関係ツリー(OTHER)でも fail-closed で隠れる
 // (「保護ツリーの外だと証明できない」ため。move 後の孤児などキーだけでは拾えない
 // 取りこぼしを塞ぐのがこの第二の網の役目なので、判定不能を見せる側に倒すと意味が無くなる)
@@ -91,7 +95,7 @@ check('F1: cwd の大小がツリー設定と違っても保護ツリー配下�
 
 const listAllBlocked = worklog(['list', '--all', '-n', '20']).out;
 check('list --all でも保護ツリーが出ない', !listAllBlocked.includes('保護ツリーの作業'), listAllBlocked);
-check('list --all にも注記が出る', listAllBlocked.includes('件のプロジェクトを表示していません'), listAllBlocked);
+check('list --all にも注記が出る', /別アカウント専用のツリーのため.*表示していません/.test(listAllBlocked), listAllBlocked);
 check('似た名前の別ツリー(org-treeo)は誤って除外されない', listAllBlocked.includes('似た名前ツリーの作業'), listAllBlocked);
 
 const listCwdBlocked = worklog(['list', '-n', '20'], { cwd: TREE }).out;
@@ -118,7 +122,7 @@ check('export --project でも同様に制限の案内が出る(保存される�
 const exportBlocked = worklog(['export', '--all']).out;
 check('export --all でも保護ツリーが出ない', !exportBlocked.includes('保護ツリーの作業'), exportBlocked);
 check('export --all にも注記が残る(保存されるファイルなので黙って消さない)',
-  exportBlocked.includes('件のプロジェクトを表示していません'), exportBlocked);
+  /別アカウント専用のツリーのため.*表示していません/.test(exportBlocked), exportBlocked);
 
 // --- 記録(書き込み)経路はアカウントに関係なく制限しない ---
 const hookInput = JSON.stringify({ cwd: TREE, session_id: 'blocked-write-1', source: 'startup' });
@@ -253,11 +257,15 @@ check('list でも設定を読めていないことを伝える(--all でなく�
 
 // restrictedTrees が配列でない書き損じ。そのまま filter に渡すと例外になり、
 // フック経路では上位の catch に吸われて文脈注入が黙って止まる
-for (const [label, rawCfg] of [
+// 相対パスの tree も同じ扱い。normPath(path.resolve)が実行時の cwd を基準に解決するため、
+// 呼び出す場所によって守る対象が変わってしまう(別の場所からは何も守らない)
+const badConfigCases = [
   ['配列にし忘れたオブジェクト', '{ "restrictedTrees": { "tree": "C:/org-tree", "allow": ["team"] } }'],
   ['null', '{ "restrictedTrees": null }'],
-]) {
-  const dir = path.join(BASE, `home-badtype-${label.replace(/[^a-z]/gi, '')}`);
+  ['相対パスの tree', '{ "restrictedTrees": [ { "tree": "org-tree", "allow": ["team"] } ] }'],
+];
+badConfigCases.forEach(([label, rawCfg], i) => {
+  const dir = path.join(BASE, `home-badcfg-${i}`);
   const { home: h, logDir: d } = sandboxHome(dir, CONFIG);
   setAccount(h, 'pro');
   fs.writeFileSync(
@@ -269,7 +277,7 @@ for (const [label, rawCfg] of [
   check(`restrictedTrees が${label}でも異常終了しない`, res.code === 0, `code=${res.code} ${res.err}`);
   check(`restrictedTrees が${label}なら壊れた設定として伏せる`,
     !res.out.includes('保護ツリーの作業') && /config\.json.*を読めない/.test(res.out), res.out);
-}
+});
 
 // 設定ファイルが無いのは意図した状態(既定設定で動く)。壊れているときと同じ扱いにしない
 const { home: home6, logDir: logDir6 } = sandboxHome(path.join(BASE, 'home-noconfig'));
