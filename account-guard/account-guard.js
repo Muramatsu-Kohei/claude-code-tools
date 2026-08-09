@@ -105,39 +105,122 @@ const COMMAND_FIELDS = {
   Task: ['prompt', 'description'],
 };
 
+// 文字列に埋もれた絶対パス。ドライブ文字から始まる形だけを見る。
+const ABSOLUTE_PATH_TOKEN = /[a-z]:[\\/][^"'\s,]*/gi;
+
+// 文字列に埋もれた「上に登る」相対パス。`../` を含まない相対指定は cwd の配下にしか
+// 届かず、cwd が保護ツリーの内側なら isInsideTree が先に拒否するので見なくてよい。
+const RELATIVE_PATH_TOKEN = /(?:\.\.[\\/])+[^"'`\s,;|&()]*/g;
+
+// 相対パスを cwd 基準の絶対パスへ直す。解決できない値(null 文字を含む等)は捨てる。
+function resolveFrom(cwd, value) {
+  try {
+    return path.resolve(cwd || process.cwd(), value);
+  } catch {
+    return null;
+  }
+}
+
 // 判定対象にする文字列を取り出す。
-function targetStrings(toolName, toolInput) {
+//
+// 相対パス指定は必ず cwd 基準で解決してから突き合わせる。これをしていなかった頃は
+// 保護ツリーの外の cwd から `Read{file_path:"../../<tree>/secret"}` と上に登る指定が
+// 素通りしていた(絶対パス版だけが拒否され、テストも絶対パスしか見ていなかった)。
+function targetStrings(toolName, toolInput, cwd) {
   const ti = toolInput ?? {};
-  const fields = PATH_FIELDS[toolName] || COMMAND_FIELDS[toolName];
+  const pathFields = PATH_FIELDS[toolName];
+  const commandFields = COMMAND_FIELDS[toolName];
+
+  // フィールドの値そのものが操作対象のパス。書かれたままと解決後の両方を見る。
+  if (pathFields) {
+    const out = [];
+    for (const f of pathFields) {
+      const v = ti[f];
+      if (typeof v !== 'string' || !v) continue;
+      out.push(v, resolveFrom(cwd, v));
+    }
+    return out.filter(Boolean);
+  }
+
+  // ここから先はパスがどの位置に現れるか決まっていない文字列。
   // 知らないツール(MCP のファイルシステム系など)はどの引数が操作対象か判断できない。
   // 素通しにすると保護が丸ごと外れるので引数全体から拾うが、文字列全体を突き合わせると
   // 散文中のツリー名にも反応する(上の PATH_FIELDS のコメントにある誤検知)。
   // 絶対パスの形をした部分文字列だけを取り出せば、実際の操作対象を捉えつつ言及は見逃せる。
-  if (!fields) return JSON.stringify(ti).match(/[a-z]:[\\/][^"'\s,]*/gi) ?? [];
-  return fields.map((f) => ti[f]).filter((v) => typeof v === 'string');
+  const texts = commandFields
+    ? commandFields.map((f) => ti[f]).filter((v) => typeof v === 'string')
+    : [JSON.stringify(ti)];
+
+  const out = [];
+  for (const text of texts) {
+    if (commandFields) out.push(text);
+    else out.push(...(text.match(ABSOLUTE_PATH_TOKEN) ?? []));
+    // 埋もれた相対パスは個別に切り出して解決する。文字列全体では解決できないため。
+    for (const rel of text.match(RELATIVE_PATH_TOKEN) ?? []) {
+      out.push(resolveFrom(cwd, rel));
+    }
+  }
+  return out.filter(Boolean);
 }
 
-function loadRules() {
+// 設定を読む。`broken` は「保護すべきなのに読めない」状態を表す。
+//
+// 「ファイルが無い」と「あるが壊れている」を区別するのが要点。以前はどちらも
+// DEFAULT_RULES(= 保護なし)にしていたため、config.json に末尾カンマを1つ入れただけで
+// 全ての保護が無言で消えていた。設定していないのは意図した状態だが、壊れているのは
+// 事故であって、素通しにしてよい理由がない。冒頭の方針どおり後者は拒否側に倒す。
+function loadConfig() {
+  let text;
   try {
-    const cfg = JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
-    if (!Array.isArray(cfg?.rules)) return DEFAULT_RULES;
-    // 形の壊れたルールは黙って捨てず、tree だけでも読めれば「許可なし」として扱う。
-    // allow の書き損じで保護が外れるより、拒否側に倒れるほうが安全。
-    return cfg.rules
-      .filter((r) => r && typeof r.tree === 'string' && r.tree)
-      .map((r) => ({ tree: r.tree, allow: Array.isArray(r.allow) ? r.allow : [] }));
-  } catch {
-    return DEFAULT_RULES;
+    text = fs.readFileSync(CONFIG, 'utf8');
+  } catch (e) {
+    // 未作成なら保護なし(意図した状態)。読めない場合は権限などの異常なので壊れた扱い。
+    return { rules: DEFAULT_RULES, broken: e && e.code !== 'ENOENT' };
   }
+
+  let cfg;
+  try {
+    cfg = JSON.parse(text);
+  } catch {
+    return { rules: DEFAULT_RULES, broken: true };
+  }
+
+  // rules が配列でないのも書き損じ。空配列を明示した場合だけ「保護なし」として通す。
+  if (!Array.isArray(cfg?.rules)) return { rules: DEFAULT_RULES, broken: true };
+
+  // 形の壊れたルールは黙って捨てず、tree だけでも読めれば「許可なし」として扱う。
+  // allow の書き損じで保護が外れるより、拒否側に倒れるほうが安全。
+  const rules = cfg.rules
+    .filter((r) => r && typeof r.tree === 'string' && r.tree)
+    .map((r) => ({ tree: r.tree, allow: Array.isArray(r.allow) ? r.allow : [] }));
+  return { rules, broken: false };
+}
+
+// 壊れた設定を直す操作だけは通す。これがないと Claude Code の中から復旧できず、
+// エディタや git を外部から使うしか手がなくなる(全停止させたときに実際に困った)。
+function isConfigRepair(input) {
+  const tool = input.tool_name;
+  if (tool !== 'Read' && tool !== 'Edit' && tool !== 'Write') return false;
+  const target = input.tool_input?.file_path;
+  if (typeof target !== 'string' || !target) return false;
+  const abs = resolveFrom(input.cwd, target);
+  return Boolean(abs) && normalize(abs) === normalize(CONFIG);
 }
 
 // このツール呼び出しが保護ツリーに触れるか判定し、触れるなら拒否理由を返す。
 // 触れない、または現在のアカウントが許可されているなら null。
-function violation(input, account, rules) {
+function violation(input, account, config) {
   const cwd = input.cwd || process.cwd();
-  const targets = targetStrings(input.tool_name, input.tool_input);
 
-  for (const rule of rules) {
+  // 設定が壊れているときは、どのツリーを守るべきかが分からない。素通しにすると
+  // 保護が丸ごと外れるので、修復操作を除いて拒否する。
+  if (config.broken && !isConfigRepair(input)) {
+    return { broken: true, tree: CONFIG, reason: '設定ファイルを読めません', allow: [] };
+  }
+
+  const targets = targetStrings(input.tool_name, input.tool_input, cwd);
+
+  for (const rule of config.rules) {
     if (rule.allow.includes(account)) continue;
 
     if (isInsideTree(cwd, rule.tree)) {
@@ -159,6 +242,8 @@ function violation(input, account, rules) {
 }
 
 function denyMessage(hit, account) {
+  if (hit.broken) return brokenConfigMessage();
+
   const allowed = hit.allow.length ? hit.allow.join(' / ') : '(許可アカウントの設定なし)';
   return [
     `[account-guard] ${hit.tree} は別アカウント専用のツリーです。`,
@@ -169,6 +254,18 @@ function denyMessage(hit, account) {
       : 'このツリーのコードを現在のアカウントに読み込ませないため、操作を拒否しました。',
     '`/login` で正しいアカウントに切り替えてから操作してください。回避しようとせず、',
     'ユーザーにアカウントの切り替えが必要であることを伝えてください。',
+  ].join('\n');
+}
+
+function brokenConfigMessage() {
+  return [
+    '[account-guard] 設定ファイルを読めないため、操作を拒否しました。',
+    `${CONFIG} が壊れています(JSON として解析できないか、rules が配列ではありません)。`,
+    '',
+    'どのツリーを保護すべきか判断できない状態です。素通しにすると保護が無言で外れるため、',
+    '安全側に倒しています。設定ファイル自体の読み書きだけは許可しているので、',
+    'JSON の構文(末尾カンマなど)を直せば元に戻ります。',
+    '設定を削除して保護ごと無効化するような回避はせず、ユーザーに状況を伝えてください。',
   ].join('\n');
 }
 
@@ -191,23 +288,27 @@ function readHookInput() {
 function main() {
   const mode = process.argv[2] || '';
   const account = currentAccount();
-  const rules = loadRules();
+  const config = loadConfig();
 
   // 手元での確認用。フックからは呼ばれない。
   if (mode === 'status') {
     console.log(`アカウント: ${account}`);
     console.log(`設定: ${CONFIG}${fs.existsSync(CONFIG) ? '' : ' (未作成 — 保護は無効)'}`);
-    if (!rules.length) {
+    if (config.broken) {
+      console.log('設定を読めません — 修復するまで、設定ファイル自身の編集以外は拒否します。');
+      return;
+    }
+    if (!config.rules.length) {
       console.log('保護ルール: なし。config.json に rules を書くまで何も拒否しません。');
       return;
     }
-    for (const r of rules) {
+    for (const r of config.rules) {
       const state = r.allow.includes(account) ? '許可' : '拒否';
       console.log(`  ${r.tree}  allow=[${r.allow.join(', ')}]  → 現在は ${state}`);
     }
     const probe = process.argv[3];
     if (probe) {
-      const hit = violation({ cwd: probe, tool_input: {} }, account, rules);
+      const hit = violation({ cwd: probe, tool_input: {} }, account, config);
       console.log(`判定(cwd=${probe}): ${hit ? '拒否 — ' + hit.reason : '通過'}`);
     }
     return;
@@ -219,7 +320,7 @@ function main() {
   // SessionStart / CwdChanged は拒否できないイベントなので、警告だけを文脈に載せる。
   // 実際の防御は PreToolUse が担う。ここで気づければ無駄な往復を減らせる。
   if (event === 'SessionStart' || event === 'CwdChanged') {
-    const hit = violation({ cwd: input.cwd, tool_input: {} }, account, rules);
+    const hit = violation({ cwd: input.cwd, tool_input: {} }, account, config);
     if (!hit) return;
     process.stdout.write(
       JSON.stringify({
@@ -229,7 +330,7 @@ function main() {
     return;
   }
 
-  const hit = violation(input, account, rules);
+  const hit = violation(input, account, config);
   if (!hit) return; // 何も出力しなければ通常の権限フローに委ねられる。
 
   process.stdout.write(
@@ -255,18 +356,25 @@ function main() {
 // 内側なら止め、外側なら通す。内側での取りこぼしは残るが、それは「ガードが壊れている」
 // という異常時に限られ、全停止の代償のほうが大きい。
 function reportCrash(e) {
-  const rules = loadRules();
-  if (!rules.length) return; // 保護ルール未設定なら何も拒否しない。
-
+  const config = loadConfig();
   const input = readHookInput();
   const account = currentAccount();
   const cwd = input.cwd || process.cwd();
-  const hit = rules.find((r) => !r.allow.includes(account) && isInsideTree(cwd, r.tree));
+
+  // 設定が壊れているなら、この経路でも main と同じく拒否側に倒す(修復操作だけは通す)。
+  // 保護ルール未設定なら find が何も返さず、何も拒否しない。
+  const hit = config.broken
+    ? isConfigRepair(input)
+      ? null
+      : { tree: CONFIG, broken: true }
+    : config.rules.find((r) => !r.allow.includes(account) && isInsideTree(cwd, r.tree));
   if (!hit) return;
 
   const detail = [
     `[account-guard] ガードが異常終了しました(原因: ${e && e.message})。`,
-    `作業ディレクトリが ${hit.tree} 配下にあるため、安全側に倒します。`,
+    hit.broken
+      ? `設定ファイル ${CONFIG} も読めないため、安全側に倒します。`
+      : `作業ディレクトリが ${hit.tree} 配下にあるため、安全側に倒します。`,
     '',
     'ガード自体の不具合の可能性があります。保護ツリーの外での作業は影響を受けません。',
     'ガードを戻すには Claude Code の外から:',

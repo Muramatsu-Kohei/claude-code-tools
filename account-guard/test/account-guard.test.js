@@ -23,19 +23,20 @@ function check(label, cond, extra) {
   console.log(`  ${cond ? 'PASS' : 'FAIL'} ${label}${tail}`);
 }
 
-// subscriptionType だけを持つ最小の credentials を置く。raw に文字列を渡すと
+// subscriptionType だけを持つ最小の credentials を置く。raw / rawRules に文字列を渡すと
 // 壊れたファイルを再現でき、「読めないときに拒否側へ倒れるか」を試せる。
-function sandbox(name, { subscriptionType, rules, raw } = {}) {
+function sandbox(name, { subscriptionType, rules, raw, rawRules } = {}) {
   const home = path.join(BASE, name);
   fs.mkdirSync(path.join(home, '.claude', 'account-guard'), { recursive: true });
   const cred = path.join(home, '.claude', '.credentials.json');
   if (raw !== undefined) fs.writeFileSync(cred, raw, 'utf8');
   else if (subscriptionType) fs.writeFileSync(cred, JSON.stringify({ claudeAiOauth: { subscriptionType } }), 'utf8');
-  if (rules) {
-    fs.writeFileSync(path.join(home, '.claude', 'account-guard', 'config.json'), JSON.stringify({ rules }), 'utf8');
-  }
+  if (rawRules !== undefined) fs.writeFileSync(configPath(home), rawRules, 'utf8');
+  else if (rules) fs.writeFileSync(configPath(home), JSON.stringify({ rules }), 'utf8');
   return home;
 }
+
+const configPath = (home) => path.join(home, '.claude', 'account-guard', 'config.json');
 
 // フックとして呼び出し、stdout の JSON を返す。出力なし(= 通常フローに委ねる)は null。
 function run(home, input, argv = []) {
@@ -196,6 +197,90 @@ console.log('account-guard');
     tool_name: 'mcp__memory__write', tool_input: { text: 'org-tree の運用についてのメモ' },
   });
   check('未知ツールでも散文中のツリー名では拒否しない', res === null, JSON.stringify(res));
+}
+
+// --- 相対パスは cwd 基準で解決してから判定する ---
+// 絶対パスしか見ていなかった頃は、保護ツリー外の cwd から `../../` で上に登る指定が
+// 素通りしていた。テストも絶対パスしか書いておらず、そのことに気づけなかった。
+{
+  const home = sandbox('deny-relative-read', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Read',
+    tool_input: { file_path: '../../org-tree/proj/secret.py' },
+  });
+  check('相対パスで上に登る読み取りを拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  const home = sandbox('deny-relative-bash', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command: 'cat ../../org-tree/proj/secret.py' },
+  });
+  check('コマンド文字列中の相対パスも拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  const home = sandbox('deny-relative-glob', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Glob',
+    tool_input: { pattern: '../../org-tree/**/*.py' },
+  });
+  check('相対パスの Glob による列挙を拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  // 解決先が保護ツリーでなければ通す。相対パスというだけで止めてはいけない。
+  const home = sandbox('allow-relative-sibling', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode/account-guard', tool_name: 'Read',
+    tool_input: { file_path: '../README.md' },
+  });
+  check('保護ツリーに届かない相対パスは通す', res === null, JSON.stringify(res));
+}
+
+// --- 設定が壊れているとき ---
+// 「未作成 = 保護なし」は意図した状態だが、「あるが壊れている」は事故。以前はどちらも
+// 保護なしにしていたため、末尾カンマ1つで全ての保護が無言で消えていた。
+{
+  const home = sandbox('broken-config', { subscriptionType: 'pro', rawRules: '{ "rules": [ , ] }' });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read',
+    tool_input: { file_path: 'secret.py' },
+  });
+  check('設定が壊れていたら拒否側に倒す', decision(res) === 'deny', JSON.stringify(res));
+  check('拒否理由に設定ファイルのパスが入る',
+    /config\.json/.test(res?.hookSpecificOutput?.permissionDecisionReason || ''), JSON.stringify(res));
+}
+{
+  const home = sandbox('broken-config-outside', { subscriptionType: 'pro', rawRules: '{ "rules": [ , ] }' });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command: 'echo hello' },
+  });
+  check('設定が壊れていればツリー外の操作も拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  // 拒否一色にすると Claude Code の中から直せなくなる。修復の口だけは開けておく。
+  const home = sandbox('broken-config-repair', { subscriptionType: 'pro', rawRules: '{ "rules": [ , ] }' });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Edit',
+    tool_input: { file_path: configPath(home) },
+  });
+  check('壊れた設定ファイル自身の編集は通す', res === null, JSON.stringify(res));
+}
+{
+  const home = sandbox('broken-config-rules-type', { subscriptionType: 'pro', rawRules: '{ "rules": "C:/org-tree" }' });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Read',
+    tool_input: { file_path: 'README.md' },
+  });
+  check('rules が配列でない設定も壊れた扱いにする', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  // 空配列を明示したときだけは「保護なし」を意図した設定として通す。
+  const home = sandbox('empty-rules', { subscriptionType: 'pro', rawRules: '{ "rules": [] }' });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read', tool_input: {},
+  });
+  check('rules を空配列にした設定は保護なしとして通す', res === null, JSON.stringify(res));
 }
 
 // --- ガード自身が異常終了したとき ---
