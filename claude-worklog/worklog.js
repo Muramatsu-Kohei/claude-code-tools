@@ -1781,7 +1781,15 @@ function cmdMove(flags) {
   // セッションとして一覧に現れる)。既定では外し、--force で押し切れるようにする
   const liveSids = new Set(live.map((s) => s.sessionId));
   const skipped = force ? [] : selected.filter((s) => liveSids.has(s.sid));
-  const moving = selected.filter((s) => !skipped.includes(s));
+
+  // cwd が制限ツリー配下のセッションは対象から外す。resolveMoveKey のキー単位の網は
+  // すり抜けてここまで来ることがある(過去の move で非制限キーへ移された孤児など)。
+  // 下の一覧は summary をそのまま出すので、外さないと読み出し制限の抜け穴になる。
+  // 見えていない記録を動かせるのも筋が通らないので、--force でも押し切らせない
+  const blocked = blockedTrees(loadConfig(), currentAccount());
+  const restricted = blocked.length ? selected.filter((s) => isCwdBlocked(s.cwd, blocked)) : [];
+
+  const moving = selected.filter((s) => !skipped.includes(s) && !restricted.includes(s));
   const movingSids = new Set(moving.map((s) => s.sid));
   const isMoving = (l) => Boolean(l.rec) && movingSids.has(l.rec.sid);
   // 壊れた行と sid の無い行は畳み込みに現れないので、選択されず自動的に元へ残る
@@ -1795,6 +1803,11 @@ function cmdMove(flags) {
   }
   for (const s of skipped) {
     console.log(yellow(`  スキップ(起動中) ${fmtTime(s.startTs)} ${s.sid.slice(0, 8)} — 移すには --force`));
+  }
+  // 要約は出さない(それ自体が制限している中身なので)。存在と件数までは隠さず、
+  // 「消えた」と誤解して探し回らずに済むようにする
+  for (const s of restricted) {
+    console.log(yellow(`  対象外 ${fmtTime(s.startTs)} ${s.sid.slice(0, 8)} — 別アカウント専用のツリーの記録`));
   }
   if (!moving.length) {
     console.error('移動できる記録がない。');

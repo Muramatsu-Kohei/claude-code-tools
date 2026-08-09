@@ -218,6 +218,16 @@ const todayProjectOther = worklog(['today', '--days', '3650', '--project', OTHER
 check('today --project で無関係なツリーを指定したら件数の注記は出ない',
   !todayProjectOther.includes('件のプロジェクトを表示していません'), todayProjectOther);
 
+// --- move も cwd 単位の網をかける ---
+// resolveMoveKey はキー単位でしか止められないので、非制限キーの下にある「cwd が制限ツリー」の
+// セッション(過去の move で移された孤児など)が move の一覧に summary ごと出てしまっていた
+const moveDry = worklog(['move', '--from', 'other-repo', '--to', 'org-treeo', '--all', '--dry-run']);
+check('move の一覧に制限セッションの要約が出ない',
+  !moveDry.out.includes('大小違いcwdセッションの作業') && !moveDry.out.includes('cwd不明セッションの作業'),
+  moveDry.out);
+check('move では制限セッションを対象外として示す', /対象外.*別アカウント専用/.test(moveDry.out), moveDry.out);
+check('制限に当たらないセッションは move の対象に残る', moveDry.out.includes('無関係ツリーの作業'), moveDry.out);
+
 // --- config.json が壊れているとき(fail-closed) ---
 // 「未作成」は既定設定で動く意図した状態だが、「あるが壊れている」は事故。以前は
 // どちらも既定に落ちて restrictedTrees が空に戻り、保護ツリーの記録が無警告で出ていた。
