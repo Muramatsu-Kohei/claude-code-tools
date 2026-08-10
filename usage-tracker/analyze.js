@@ -86,6 +86,9 @@ function parseArgs(argv) {
   // 混ざると window の同一性判定や週次枠の窓分割が壊れる(詳細は buildWindows /
   // weekWindowStarts のコメント参照)ため、明示的に --account all を指定しない限り
   // 常に単一アカウントだけを見る設計にしている。
+  // 明示指定の有無を残す。指定がなかった回に限り、acct を書いていなかった頃のログを
+  // 今のアカウントのものとして拾う(filterRowsByAccount の includeLegacy)。
+  opts.accountExplicit = opts.account != null;
   if (opts.account == null) opts.account = currentAccount();
   return opts;
 }
@@ -184,9 +187,15 @@ function accountBreakdown(rows) {
 // 5時間枠/週次枠はアカウントごとに容量が独立しているため、既定では単一アカウントの
 // 行だけを残す。ACCOUNT_ALL のときだけ素通しし、後段(buildWindows のキーや HTML の
 // 警告表示)で「混在している」ことを扱えるようにする。
-function filterRowsByAccount(rows, account) {
+//
+// includeLegacy は --account を明示しなかった回だけ真になる。acct を書いていなかった頃の
+// ログは単一アカウント運用時代の記録なので、いまのアカウントのものとして扱う。これが無いと
+// migrate-account.js をまだ実行していない環境では既定の実行が常に0件になり、対象が無い
+// まま HTML を作って既存のレポートを空で上書きしていた。
+// 逆に --account を明示した回は、どのアカウントの記録か分からない行を混ぜない。
+function filterRowsByAccount(rows, account, includeLegacy = false) {
   if (account === ACCOUNT_ALL) return rows;
-  return rows.filter((r) => r.acct === account);
+  return rows.filter((r) => r.acct === account || (includeLegacy && r.acct === ACCOUNT_UNKNOWN));
 }
 
 // ---------------------------------------------------------------------------
@@ -358,10 +367,10 @@ function regress(points) {
 // に渡すと r.acct(loadRows が必ず文字列に正規化する)と一致せず全行が0件に落ちてしまうため、
 // 「絞り込まない」を表す既存の定数を既定値にして空振りを防ぐ。単一アカウントに絞りたい
 // 呼び出し側(main / CLI)は必ず currentAccount() などで解決した値を明示的に渡すこと。
-function analyze(logPath, account = ACCOUNT_ALL) {
+function analyze(logPath, account = ACCOUNT_ALL, includeLegacy = false) {
   const { rows: allRows, totalLines, skipped, readError } = loadRows(logPath);
   const accountCounts = accountBreakdown(allRows);
-  const rows = filterRowsByAccount(allRows, account);
+  const rows = filterRowsByAccount(allRows, account, includeLegacy);
   const windows = buildWindows(rows);
   const regressionPoints = windows
     .filter((w) => w.excludedReason == null)
@@ -540,13 +549,29 @@ function weekWindowStarts(rows) {
 }
 
 // 週次枠の窓単位で直近 weeks 個ぶんに絞る。
+//
+// 窓の境界はアカウントごとに刻まれる(weekWindowStarts のコメント参照)ため、--account all
+// では starts に両アカウントの境界が混ざる。総数をそのまま週数と数えていた頃は、2アカウント
+// 分の記録があるだけで要求した窓数の半分ほどしかカバーしない範囲に切り詰められていた。
+// グラフの注記は要求値のまま出るので、狭まったことに気付けない。
+// アカウントごとに「直近 weeks 個目の窓の開始位置」を求め、その中で最も古い位置から残す。
 function clipToRecentWeekWindows(rows, weeks) {
   if (!weeks || rows.length === 0) return rows;
-  const starts = weekWindowStarts(rows);
-  // 手持ちの窓が要求数以下なら切らない。先頭の窓は途中から記録が始まっていることが
-  // 多いが、それを捨てると初回利用時にグラフが空になる。
-  if (starts.length <= weeks) return rows;
-  return rows.slice(starts[starts.length - weeks]);
+  const startsByAcct = new Map();
+  for (const i of weekWindowStarts(rows)) {
+    const acct = rows[i].acct;
+    if (!startsByAcct.has(acct)) startsByAcct.set(acct, []);
+    startsByAcct.get(acct).push(i);
+  }
+  let cut = null;
+  for (const starts of startsByAcct.values()) {
+    // どれか一つでも手持ちの窓が要求数以下なら切らない。先頭の窓は途中から記録が
+    // 始まっていることが多いが、それを捨てると初回利用時にグラフが空になる。
+    if (starts.length <= weeks) return rows;
+    const from = starts[starts.length - weeks];
+    if (cut === null || from < cut) cut = from;
+  }
+  return cut === null ? rows : rows.slice(cut);
 }
 
 // 表示範囲の決定。--days を明示したときだけ日数で切り、既定は週次枠の窓単位。
@@ -782,7 +807,14 @@ function buildHtml(result, opts = {}) {
     : 0;
   const totalWeeks = weekWindowStarts(result.rowsForChart).length;
   const shownWeeks = weekWindowStarts(chartRows).length;
-  const scope = opts.days ? `直近 ${opts.days} 日` : `週次枠の直近 ${opts.weeks} 窓`;
+  // --account all では窓数(totalWeeks / shownWeeks)が両アカウントの合計になる一方、
+  // 絞り込みはアカウントごとに直近 N 窓を確保する。指定値と数字が食い違って見えるので、
+  // 何に対する N なのかを文言で示す。
+  const scope = opts.days
+    ? `直近 ${opts.days} 日`
+    : opts.account === ACCOUNT_ALL
+      ? `週次枠の直近 ${opts.weeks} 窓(アカウントごと)`
+      : `週次枠の直近 ${opts.weeks} 窓`;
   // 何を省いたかは必ず書く。黙って切ると「これが全データ」と読まれてしまう。
   const chartNote =
     chartRows.length < result.rowsForChart.length
@@ -1085,19 +1117,25 @@ function buildHtml(result, opts = {}) {
 
 function main() {
   const opts = parseArgs(process.argv.slice(2));
-  const result = analyze(opts.log, opts.account);
+  const result = analyze(opts.log, opts.account, !opts.accountExplicit);
 
-  fs.mkdirSync(path.dirname(opts.html), { recursive: true });
-  fs.writeFileSync(opts.html, buildHtml(result, opts));
+  // 対象行が0件のときは HTML を書かない。空のレポートで上書きすると、直前まで見えていた
+  // 実績まで消える。--account の綴り間違いや、ログを読めなかったときにも起こる。
+  // 書き換えずに理由だけ出せば、元のレポートは残るしやり直しも効く。
+  const wroteHtml = !(result.readError || result.parsedRows === 0);
+  if (wroteHtml) {
+    fs.mkdirSync(path.dirname(opts.html), { recursive: true });
+    fs.writeFileSync(opts.html, buildHtml(result, opts));
+  }
 
   if (opts.json) {
     // rowsForChart は HTML 用の内部データなので JSON 出力からは外す。
     const { rowsForChart, ...jsonResult } = result;
-    console.log(JSON.stringify({ ...jsonResult, htmlPath: opts.html }, null, 2));
+    console.log(JSON.stringify({ ...jsonResult, htmlPath: wroteHtml ? opts.html : null }, null, 2));
   } else {
     printSummary(result);
     console.log('');
-    console.log(`HTML レポート: ${opts.html}`);
+    console.log(wroteHtml ? `HTML レポート: ${opts.html}` : `対象行が無いため ${opts.html} は更新していません。`);
   }
 }
 
