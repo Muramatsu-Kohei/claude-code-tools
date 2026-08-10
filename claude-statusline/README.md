@@ -202,7 +202,9 @@ const hookPath = process.env.CLAUDE_STATUSLINE_HOOK || fallbacks.find((p) => fs.
 require(hookPath).record(d);
 ```
 
-**既定は同じリポジトリに置かれた `usage-tracker` です。** このリポジトリごと使っているなら追加の設定は要りません。`statusline.js` だけをコピーする導入方法では `__dirname` 基準のパスがリポジトリの外を指すため、このリポジトリを開いて Claude Code を使っているときに渡る `CLAUDE_PROJECT_DIR` も候補として試します。どちらでも見つからない場合や別の場所に置いた場合は、環境変数 `CLAUDE_STATUSLINE_HOOK` にモジュールのパスを直接渡してください。記録が要らなければ、末尾のこのブロックごと削除してかまいません。
+**既定は同じリポジトリに置かれた `usage-tracker` です。** このリポジトリごと使っているなら追加の設定は要りません。
+
+`statusline.js` だけをコピーする導入方法では `__dirname` 基準のパスがリポジトリの外を指すため、フォールバックとして `CLAUDE_PROJECT_DIR` も試します。ただし**これはこのリポジトリを開いている間しか効きません**。他のプロジェクトで作業している回は記録が落ち、`usage.jsonl` が偏った一部だけになります（分析はこのログから計算されるので推定が歪みます）。**コピーして使うなら `CLAUDE_STATUSLINE_HOOK` に `collect.js` の絶対パスを設定してください。** `usage-tracker/install.ps1` は、配置済みの `statusline.js` の末尾に絶対パスを焼き込んだブロックを追記するので、そちらを使う手もあります。記録が要らなければ、末尾のこのブロックごと削除してかまいません。
 
 自前の記録先を使う場合は、`record(d)` を持つモジュールを用意して環境変数 `CLAUDE_STATUSLINE_HOOK` にそのパスを渡してください。`d` はステータスラインが受け取った stdin の JSON そのものです。
 
