@@ -1,6 +1,5 @@
 // Claude Code ステータスライン
-// カラーカスタマイズは90行付近だけ変更
-
+//
 // settings.json の statusLine から `node <このファイル>` として呼ばれ、stdin で渡される JSON から
 // モデル・推論設定・コンテキスト使用率・コスト・差分行数・プラン利用枠(5時間/週次)を1行で出力する。
 // 出力例:
@@ -30,7 +29,6 @@
 
 const fs = require('fs');
 
-// ANSI エスケープシーケンスの先頭文字
 const ESC = '\x1b';
 
 // ===========================================================================
@@ -64,28 +62,23 @@ const ESC = '\x1b';
 //  - dim と bright系の組み合わせ(例: c(ST.dim, FG.brightBlack))は端末によって潰れて読めなくなる。
 // ===========================================================================
 
-// スタイル
 const ST = { reset: 0, bold: 1, dim: 2, italic: 3, underline: 4, blink: 5, reverse: 7, strike: 9 };
 
-// 文字色
 const FG = {
   black: 30, red: 31, green: 32, yellow: 33, blue: 34, magenta: 35, cyan: 36, white: 37,
   gray: 90, brightRed: 91, brightGreen: 92, brightYellow: 93, brightBlue: 94,
   brightMagenta: 95, brightCyan: 96, brightWhite: 97,
 };
 
-// 背景
 const BG = {
   black: 40, red: 41, green: 42, yellow: 43, blue: 44, magenta: 45, cyan: 46, white: 47,
   gray: 100, brightRed: 101, brightGreen: 102, brightYellow: 103, brightBlue: 104,
   brightMagenta: 105, brightCyan: 106, brightWhite: 107,
 };
 
-// 複数のコードを1つのエスケープにまとめて、指定できるような形式に変換する。c(ST.bold, FG.cyan) -> "ESC[1;36m"
-// スタイル = エスケープ頭文字 + [ + スタイル + ; + 文字色 + ; + 背景色 + m
+// 複数のコードを1つのエスケープにまとめる。c(ST.bold, FG.cyan) -> "ESC[1;36m"
 const c = (...codes) => `${ESC}[${codes.join(';')}m`;
 
-// スタイルリセット
 const RESET = c(ST.reset);
 
 // ===========================================================================
@@ -116,19 +109,32 @@ const THEME = {
 };
 
 // 色が切り替わる閾値。THEME と対で調整する。
-// 100%上限の場合
 const PCT_WARN = 70;
 const PCT_CRIT = 90;
-// 使用コストの場合
 const COST_WARN = 5;
 const COST_HIGH = 20;
+
+// コンテキストは比率ではなく絶対量でも警告する。
+// 窓が 1M あると比率の閾値(70%)は 700k 相当になり、実質どこまで伸ばしても緑のままになる。
+// 一方コストは絶対量で効く: 実測で 1 ターンの単価は 30〜60k 帯を 1.0 として
+// 150k 超で 1.6 倍、200k 超で 2.0 倍、300k 超で 3.6 倍。会話履歴が毎ターン再送されるため。
+// そこで単価が明確に上がり始める 150k を警告、切るべき水準の 250k を危険とする。
+const CTX_WARN_TOKENS = 150e3;
+const CTX_CRIT_TOKENS = 250e3;
 
 // 使用率に応じた色。閾値は上の定数で決まる。
 const colorFor = (pct) => (pct >= PCT_CRIT ? THEME.crit : pct >= PCT_WARN ? THEME.warn : THEME.ok);
 
+// コンテキストの色。比率と絶対量のうち厳しい方を採る。
+function ctxColor(pct, usedTokens) {
+  if (pct >= PCT_CRIT || usedTokens >= CTX_CRIT_TOKENS) return THEME.crit;
+  if (pct >= PCT_WARN || usedTokens >= CTX_WARN_TOKENS) return THEME.warn;
+  return THEME.ok;
+}
+
 const write = (text) => process.stdout.write(Buffer.from(text + '\n', 'utf8'));
 
-// ファイルディスクリプタ0番（fd 0 = 標準入力）の同期読み取り。End Of File まで読み切るので部分読みにならない。
+// fd 0 の同期読み取り。EOF まで読み切るので部分読みにならない。
 let raw = '';
 try {
   raw = fs.readFileSync(0, 'utf8');
@@ -138,13 +144,11 @@ try {
   process.exit(0);
 }
 
-// 空行チェック
 if (!raw.trim()) {
   write(`${THEME.fallback}(statusline: no input)${RESET}`);
   process.exit(0);
 }
 
-// Jsonへのパース
 let d;
 try {
   d = JSON.parse(raw);
@@ -155,13 +159,11 @@ try {
 
 // リセット時刻の整形。当日中なら時刻のみ、翌日以降は曜日を添える。
 // resets_at は Unix epoch 秒でも ISO 8601 文字列でも渡ってくる可能性があるため両対応にする。
-// 日本語を使うと文字コード関連でおかしくなるので、英語(ASCII)推奨
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-// 1時5分を01時05分のように2桁に合わせ込む
 const pad = (n) => String(n).padStart(2, '0');
+
 function formatReset(value) {
   if (value === null || value === undefined || value === '') return null;
-
   let t;
   if (typeof value === 'number') {
     t = new Date(value * 1000);
@@ -170,19 +172,14 @@ function formatReset(value) {
   } else {
     t = new Date(String(value));
   }
-
-  if (isNaN(t.getTime())) {
-    return null;
-  }
-
-  // 時刻
+  if (isNaN(t.getTime())) return null;
   const hm = `${pad(t.getHours())}:${pad(t.getMinutes())}`;
   const now = new Date();
   const sameDay =
     t.getFullYear() === now.getFullYear() &&
     t.getMonth() === now.getMonth() &&
     t.getDate() === now.getDate();
-  // "Sun11:54" と詰めると曜日と時刻が読みにくいため、ここはスペースを入れる。
+  // "Sun11:54" と詰めると曜日と時刻が団子になって読みにくいため、ここはスペースを入れる。
   return sameDay ? hm : `${DAYS[t.getDay()]} ${hm}`;
 }
 
@@ -216,11 +213,10 @@ if (d.model?.display_name) {
   // "Opus 5" -> "Opus5"。空白を潰しても識別性は落ちない。
   modelBits.push(`${THEME.model}${String(d.model.display_name).replace(/\s+/g, '')}${RESET}`);
 }
-// エフォートは2〜3文字に短縮。
+// エフォートは2〜3文字に短縮。xhigh/max は消費が跳ねるので色で気づけるようにする。
 const EFFORT = { low: 'lo', medium: 'md', high: 'hi', xhigh: 'xhi', max: 'max' };
 const effort = EFFORT[d.effort?.level];
 if (effort) {
-  // xhigh/max は消費が跳ねるので色で気づけるようにする。
   const style = effort === 'xhi' || effort === 'max' ? THEME.effortHigh : THEME.effort;
   modelBits.push(`${style}${effort}${RESET}`);
 }
@@ -230,17 +226,16 @@ if (d.thinking?.enabled === false) modelBits.push(`${THEME.nothink}nothink${RESE
 if (modelBits.length) parts.push(modelBits.join(' '));
 
 // コンテキストウィンドウ。セッション開始直後や /compact 直後は null になる。
-// 窓が 1M あると % だけでは残量の絶対感が掴めないため、残りトークン数を併記する。
+// % だけでは絶対感が掴めないためトークン数を併記する。残量ではなく使用量を出すのは、
+// 色の閾値(CTX_WARN_TOKENS)が使用量で決まっており、両者が揃っていないと
+// 「なぜ黄色いのか」が読み取れないため。残量は 1M 窓ではほぼ動かず判断材料にならない。
 const cw = d.context_window;
 const ctx = cw?.used_percentage;
 if (typeof ctx === 'number' && isFinite(ctx)) {
   const p = Math.floor(ctx);
-  let s = `${colorFor(p)}ctx ${p}%${RESET}`;
-  const size = cw.context_window_size;
   const used = (cw.total_input_tokens || 0) + (cw.total_output_tokens || 0);
-  if (typeof size === 'number' && size > 0 && used > 0) {
-    s += ` ${THEME.tokens}${shortTokens(Math.max(0, size - used))}${RESET}`;
-  }
+  let s = `${ctxColor(p, used)}ctx ${p}%${RESET}`;
+  if (used > 0) s += ` ${THEME.tokens}${shortTokens(used)}${RESET}`;
   parts.push(s);
 }
 
@@ -248,7 +243,7 @@ if (typeof ctx === 'number' && isFinite(ctx)) {
 const workBits = [];
 const usd = d.cost?.total_cost_usd;
 if (typeof usd === 'number' && isFinite(usd) && usd > 0) {
-  // サブスク利用の場合は実課金額ではなく相対的な重さの目安。
+  // サブスク利用なので実課金額ではなく相対的な重さの目安。閾値は緩めに取る。
   const style = usd >= COST_HIGH ? THEME.costHigh : usd >= COST_WARN ? THEME.costWarn : THEME.cost;
   workBits.push(`${style}${shortCost(usd)}${RESET}`);
 }
@@ -279,3 +274,31 @@ if (parts.length === 0) {
 }
 
 write(parts.join(`${THEME.sep} | ${RESET}`));
+
+// --- usage-tracker hook (begin) ---
+// プラン利用枠(5h/7d)の使用率は statusline の入力にしか現れず、transcript にも残らないため
+// 後から復元できない。表示を出し終えたこの位置で時系列として書き出しておく。
+// 表示とは無関係な副作用なので、収集側が壊れていても statusline の出力には影響しない。
+try {
+  // 明示指定(CLAUDE_STATUSLINE_HOOK)があれば無条件にそれを使う。誤っていても下の catch で
+  // 気付ける。未指定のときは候補を順に試す。__dirname 基準の相対パスはこのリポジトリの中から
+  // 直接動かしている場合に解決できるが、README の既定手順(statusline.js だけを
+  // ~/.claude/statusline.js にコピーする)ではこのファイルがリポジトリの外に出るため解決できない。
+  // そのケースを拾うため、このリポジトリを開いた状態で Claude Code を使っているなら指すはずの
+  // CLAUDE_PROJECT_DIR も候補に加える。どちらも「実在すれば使う」だけなので、誤って
+  // 個人マシン固有の絶対パスを焼き込む(=他環境で必ず失敗する)心配はない。
+  const explicit = process.env.CLAUDE_STATUSLINE_HOOK;
+  const fallbacks = [
+    `${__dirname}/../usage-tracker/collect.js`,
+    process.env.CLAUDE_PROJECT_DIR ? `${process.env.CLAUDE_PROJECT_DIR}/usage-tracker/collect.js` : null,
+  ].filter(Boolean);
+  const hookPath = explicit || fallbacks.find((p) => fs.existsSync(p));
+  if (!hookPath) throw new Error(`usage-tracker hook not found (tried: ${fallbacks.join(', ')})`);
+  require(hookPath).record(d);
+} catch (e) {
+  // 収集は捨てて表示を優先する。ただし無言のままだと usage.jsonl への追記が止まったことに
+  // 誰も気付けない(枠切れ警告も出なくなる)。stdout は表示そのものなので汚さず、stderr に
+  // だけ残す。通常運用では見えず、`claude --debug` で確認したときだけ表面化する控えめな形。
+  process.stderr.write(`[statusline] usage-tracker hook 失敗: ${e.message}\n`);
+}
+// --- usage-tracker hook (end) ---

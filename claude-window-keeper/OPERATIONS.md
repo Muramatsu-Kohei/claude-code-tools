@@ -37,26 +37,43 @@ Claude Code の 5 時間セッション制限（レートリミット）のウ�
 
 | ファイル | 内容 |
 |---|---|
-| `state.json` | `{ "lastPing": "<ISO8601>" }` 前回送信時刻のみ |
-| `ping.log` | 実行ログ（PING / STATE / WARN / ERROR / DRYRUN の追記）。毎時発生する `SKIP` は画面表示のみでファイルには残さない |
+| `state-<account>.json` | `{ "lastPing": "<ISO8601>" }` 前回送信時刻のみ。枠はアカウントごとに独立しているため、ログイン中のアカウント（`subscriptionType`）別にファイルを分ける。アカウント分離導入前の旧 `state.json`（無印）は読まない・引き継がない。新パスが無ければ「前回 ping なし」として素直に送信する |
+| `ping.log` | 実行ログ（PING / STATE / WARN / ERROR / DRYRUN の追記）。毎時発生しうる `SKIP` は画面表示のみでファイルには残さない。アカウント判別不能の `WARN` は状態が変わったとき（＝初回）だけファイルに残し、以降は `state-unknown.notified` があるあいだ画面表示のみにする |
+| `state-unknown.notified` | アカウント判別不能の `WARN` を初回通知済みかどうかの目印（中身は使わない）。判別できた回に削除され、次に判別不能へ戻ったとき改めて1行だけログに残る |
 | `ping.log.1` | `ping.log` が 1 MB を超えたときの退避先（1世代のみ保持、以前の内容は破棄） |
 
 ---
 
 ## 3. 動作ロジック（ping 本体）
 
-1. `state.json` から `lastPing` を読む
+1. `state-<account>.json` から `lastPing` を読む（無ければ「前回 ping なし」扱い。旧 `state.json`（無印）は読まない）
 2. `-Status`: 前回時刻・経過・推定リセット（`lastPing + WindowMinutes`）を表示して終了（送信・更新なし）
-3. `-Force` でない かつ 経過 < `WindowMinutes` → `SKIP` を画面表示して終了（ファイルには残さない）
-4. `-DryRun`: 送信・状態更新をせずログのみ
-5. それ以外: `claude -p "Reply with only the word: ok" --model <Model>` を実行
-6. 成功したら `state.json` を現在時刻で更新し、推定リセット時刻をログ出力
+3. アカウントが `unknown`（未ログイン、`/login` 中、別ユーザー資格での実行など）→ `WARN` を出して終了。`state-unknown.notified` が無ければファイルにも残して作成し、あれば画面のみに留める。`-Force` でも送らない
+4. `-Force` でない かつ 経過 < `WindowMinutes` → `SKIP` を画面表示して終了（ファイルには残さない）
+5. `-DryRun`: 送信・状態更新をせずログのみ
+6. それ以外: `claude -p "Reply with only the word: ok" --model <Model>` を実行
+7. 成功したら `state-<account>.json` を現在時刻で更新し、推定リセット時刻をログ出力
 
 **設計上のポイント**
 - 「送るかどうか」の判断はすべて ping 本体が持つ。タスクは単に頻繁に叩くだけ（冪等）。
 - そのため 1 時間ごとに起動しても、5 時間未満なら必ず SKIP されコストは発生しない。
 - `-DryRun` / `-Status` は状態を汚さないため、検証に安全に使える。
-- **判定の順序は 2 → 3 → 4。** SKIP 判定（3）が DryRun 判定（4）より先に来るため、
+- 旧 `state.json`（無印）は一切読まない。team で運用してきた環境で個人アカウントに
+  切り替えた直後など、旧ファイルを読んで別アカウントの `lastPing` を「まだ枠の途中」と
+  誤読すると、ping を送らないまま枠が張り直されない。しかもその回は `SKIP` で終わるため
+  `ping.log` には何も残らず、気付く手掛かりがない（このツールが最も避けたい事象）。新パスが無いときは素直に「前回 ping なし」として送信する。
+  失うのはアップグレード直後の余分な ping 1 回だけ。
+- **`unknown` の回はそもそも ping を送らない。** 枠はアカウントごとに独立しているので、
+  判別できないまま送ると「どの枠をいつ張り直したか」が追えず、記録も `state-unknown.json`
+  へ分かれてしまう。ログインし直せば解消するので見送るほうが安い。
+- **`unknown` の WARN は初回だけファイルに残す。** 判別不能は SKIP と同じく毎時発生しうるが、
+  SKIP と違って一時的とは限らない（新しいマシン、資格情報を別の場所に置いた、権限エラーなど
+  原因が持続しうる）。毎時ファイルに残せば SKIP 同様 PING/STATE の履歴を押し出してしまうが、
+  一切残さなければ「タスクが動いていない」のと見分けがつかず無音のまま気付けない。そこで
+  `state-unknown.notified` が無いとき（＝状態が変わった直後）だけファイルに残してマーカーを作り、
+  以降はマーカーがあるあいだ画面のみにする。アカウントを判別できた回にマーカーを消すため、
+  次にまた判別不能になれば改めて1行だけログに残る。
+- **判定の順序は 2 → 4 → 5。** SKIP 判定（4）が DryRun 判定（5）より先に来るため、
   記録がある状態で `-DryRun` 単体を実行すると SKIP で終了し DRYRUN 行に到達しない。
   送信処理の流れを検証したいときは `-Force -DryRun`（送信・記録なし）を使う。
 - **成否は例外ではなく `$LASTEXITCODE` で判定する。** 理由は下の「9. 配布時の前提・注意」の
@@ -157,7 +174,7 @@ Get-ScheduledTask -TaskName ClaudeWindowKeeper | Select-Object TaskName,State
 
 - 両スクリプトの構文パス（PowerShell Parser）: OK
 - `-DryRun` / `-Status`: 期待通り（状態を更新しない）
-- `-Force` 実送信: `reply: ok`、`state.json` 更新、推定リセット表示を確認
+- `-Force` 実送信: `reply: ok`、state ファイル（当時は無印 `state.json`。現在はアカウント別の `state-<account>.json`）更新、推定リセット表示を確認
 - `--output-format json` でトークン実測を取得
 - タスク登録: UAC 昇格経由で成功、`State = Ready` を確認
 
@@ -231,7 +248,7 @@ $ErrorActionPreference = "Stop"
 ```
 
 当初の実装は `claude` の呼び出しを `2>&1 | Out-String` で受けて try/catch で囲んでいたため、
-この挙動を踏むと **ping は実際に送信されて枠を消費したのに catch に落ちて `state.json` を更新しない**
+この挙動を踏むと **ping は実際に送信されて枠を消費したのに catch に落ちて state ファイル（`state-<account>.json`）を更新しない**
 状態になっていた。すると次の毎時実行でも「経過 ≧ WindowMinutes」のままなので real ping を毎時送り続け、
 **1 日 4〜5 回のはずが最大 24 回（枠とコストが約 5 倍）** になる。ログには ERROR しか残らず原因も追いにくい。
 

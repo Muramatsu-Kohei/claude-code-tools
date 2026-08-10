@@ -1,0 +1,9 @@
+{
+  "_comment": "~/.claude/account-guard/config.json として配置する。tree はそのアカウント専用にしたいディレクトリ、allow は触れてよいアカウント(.credentials.json の subscriptionType の値。組織は team、個人は pro / max)。allow に含まれないアカウントでログイン中は、このツリーへの操作が拒否される。",
+  "rules": [
+    {
+      "tree": "C:/work/org-only",
+      "allow": ["team"]
+    }
+  ]
+}

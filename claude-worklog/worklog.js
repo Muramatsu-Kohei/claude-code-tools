@@ -67,18 +67,267 @@ const DEFAULT_CONFIG = {
   scopeMode: 'auto',
   scopeIndexMax: 3,          // 引き継ぎの索引に出す他スコープの最大件数
   scopeIndexMaxAgeDays: 14,  // これより古い未完は索引に出さない(放置分が毎回並ぶのを防ぐ)
+  // 特定ツリー配下の記録を、許可されていないアカウントには見せない(読み出し・表示だけを
+  // 制限し、記録は制限しない)。例: 組織用ツリーを個人アカウントのセッションに出さない
+  //   [{ tree: 'C:/org-tree', allow: ['team'] }]
+  restrictedTrees: [],
 };
 
 // ---------------------------------------------------------------------------
 //  基礎ユーティリティ
 // ---------------------------------------------------------------------------
 
+// 設定を読む。configBroken は「設定があるのに読めない」状態を表す。
+//
+// 「未作成」と「あるが壊れている」を区別するのが要点。以前はどちらも既定設定に
+// 落としていたため、config.json に末尾カンマを1つ入れただけで restrictedTrees が
+// 空に戻り、組織ツリーの記録が個人アカウントのセッションに無警告で出ていた。
+// 未設定は意図した状態だが、壊れているのは事故なので伏せる側に倒す(blockedTrees 参照)。
 function loadConfig() {
+  let text;
   try {
-    return { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')) };
-  } catch {
-    return { ...DEFAULT_CONFIG };
+    text = fs.readFileSync(CONFIG_PATH, 'utf8');
+  } catch (e) {
+    return { ...DEFAULT_CONFIG, configBroken: Boolean(e && e.code !== 'ENOENT') };
   }
+  try {
+    const parsed = JSON.parse(text);
+    // 設定の最上位はオブジェクトでなければならない。配列やスカラーだと restrictedTrees の
+    // 参照が undefined になるだけで下の検証を全て素通りし、制限なし・警告なしで通ってしまう。
+    // 姉妹ツールの account-guard は設定の最上位が rules を持つオブジェクトなので、それに
+    // 引きずられて worklog の config.json をいきなり配列で書く書き損じは十分あり得る。
+    // 「あるが壊れている」は事故なので伏せる側に倒す(account-guard の rules 非配列と同じ扱い)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ...DEFAULT_CONFIG, configBroken: true };
+    }
+    // restrictedTrees の書き損じは、どれも「制限が無言で外れる」形の事故になる。
+    // 以下はいずれも configBroken(= blockedTrees が BLOCK_ALL を返す fail-closed)に倒す:
+    //  - 配列でない: 「1件だけだから」と配列にし忘れる書き損じ。そのまま blockedTrees に
+    //    渡すと .filter が無くて例外になり、フック経路では末尾の catch に吸われて文脈注入が
+    //    黙って止まる。姉妹ツールの account-guard が rules に対してしているのと同じ扱い
+    //  - tree が文字列でない/空: キー名の書き損じ(tree を path と書くなど)。以前は
+    //    blockedTrees 側の filter が黙って捨てていたため、1文字の書き損じで読み出し制限が
+    //    丸ごと無効になるのに、設定は正常と報告されていた
+    //  - tree が相対パス: 判定に使う normPath は path.resolve なので、worklog を実行した
+    //    場所を基準に解決されてしまう。同じ設定でも呼び出し位置によって守る対象が変わり、
+    //    別の場所から実行すれば何も守らない — 制限機能として最も避けたい壊れ方
+    const trees = parsed && parsed.restrictedTrees;
+    const treesBroken = trees !== undefined && (
+      !Array.isArray(trees)
+      || trees.some((r) => !r || typeof r.tree !== 'string' || !r.tree || !path.isAbsolute(r.tree))
+    );
+    if (treesBroken) {
+      // parsed を丸ごと捨てて DEFAULT_CONFIG を返すと、読み出し制限と無関係な記録側の設定
+      // (autoSummary、summaryModel など)まで既定に戻り、意図的に止めていた自動要約が
+      // 全セッションで走り出す。restrictedTrees は「読み出し・表示だけを制限し、記録は
+      // 制限しない」と明言している以上、壊れた設定で変わってよいのも読み出し側だけ。
+      // 制限そのものは configBroken 経由で全伏せになるので安全側は保たれる
+      return { ...DEFAULT_CONFIG, ...parsed, restrictedTrees: [], configBroken: true };
+    }
+    // configBroken は最後に置く。設定ファイル側に同名のキーがあっても上書きさせない
+    return { ...DEFAULT_CONFIG, ...parsed, configBroken: false };
+  } catch {
+    return { ...DEFAULT_CONFIG, configBroken: true };
+  }
+}
+
+// 現在使っている Claude アカウントを判定する。identity を示すフィールドが無いため、
+// ~/.claude/.credentials.json の claudeAiOauth.subscriptionType(team/pro)を代用する。
+// トークン本体(accessToken 等)は読み捨てるだけで、一切保持・記録しない。
+function currentAccount() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, '.credentials.json'), 'utf8'));
+    const t = raw && raw.claudeAiOauth && raw.claudeAiOauth.subscriptionType;
+    return typeof t === 'string' && t ? t : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  読み出し制限(restrictedTrees)
+//
+//  組織のツリー(例: C:\org-tree)の作業ログを、個人アカウントのセッションに見せたくない。
+//  制限するのは一覧・today・export など「読み出し・表示」だけで、記録(書き込み)は
+//  対象ツリーで作業した事実そのものとして今までどおり残す。そのため session-start /
+//  session-end / add / summarize はここの関数を一切呼ばない。
+//
+//  判定は 2 段構え:
+//   1. キー単位(listProjectKeys() 系の経路をまとめて塞げる)。実 cwd が分かれば
+//      それで cwdUnderTree と同じ精度の判定をし、取れないときだけキー文字列の前方一致に落とす
+//   2. セッションレコードの cwd(記録単位。move 後の孤児などキーだけでは拾えない
+//      取りこぼしを塞ぐ第二の網)
+// ---------------------------------------------------------------------------
+
+// 現在のアカウントに見せてよくない restrictedTrees だけを返す。allow に現在の
+// アカウントが含まれていれば制限しない。allow が配列でない設定ミスは「誰にも
+// 見せない」側に倒す(プライバシー機能なので fail-open ではなく fail-closed にする)
+// 設定を読めないときに使う「全部伏せる」ルール。どのツリーを制限すべきか分からない
+// 以上、制限なしとして見せるのはプライバシー機能として逆で、設定を直せば元に戻る。
+const BLOCK_ALL = { tree: '', all: true };
+
+function blockedTrees(cfg, account) {
+  if (cfg.configBroken) return [BLOCK_ALL];
+  return (cfg.restrictedTrees || [])
+    // tree の書き損じは loadConfig が configBroken にして上の分岐で止めている。ここの
+    // filter は loadConfig を通さずに組み立てた設定(テストなど)への保険であって、
+    // 通常の経路では何も落とさない — 黙って捨てると制限が無言で外れるため
+    .filter((r) => r && typeof r.tree === 'string' && r.tree)
+    .filter((r) => !(Array.isArray(r.allow) && r.allow.includes(account)));
+}
+
+// key のログファイルに現れる cwd のうち、「本来その key の記録である」と確認できる
+// ものだけを集めてキャッシュする。isKeyBlocked は制限ルールごとに keyUnderTree を呼び、
+// filterVisibleKeys は全キーに対して走り、restrictionNote は同じコマンド内でさらに
+// listProjectKeysRaw/filterVisibleKeys を再実行するため、キャッシュなしだとプロジェクト数
+// × ルール数(注記を作るコマンドはその2倍)だけ同じ .ndjson を毎回丸ごと readFileSync して
+// 全行 parse することになる。このプロセスは1回のコマンド実行(または1回の SessionStart
+// フック)で終わる短命なものなので、無効化の仕組みは不要(プロセスが生きている間はログ
+// ファイルは増えるだけで、既に書かれた行の cwd が後から変わることはない)。
+// 「本来の記録である cwd が1件も無かった」という結果も Map に積んで、毎回ファイルを
+// 読み直すことを防ぐ。
+//
+// なぜ全 cwd ではなく key から導ける cwd だけを見るのか:
+// keyUnderTree が知りたいのは「この key は本来どのツリーの記録か」であって、「この
+// ファイルに保護ツリーの記録が混じっているか」ではない。後者まで拾うと、cmdMove の
+// 移入レコードや孤児レコード(cwd から計算した key がファイル自身の key と食い違う行)
+// によって無関係な key ごと遮断してしまい、そうした行を個別に隠すのは record 単位の
+// 第二の網(isCwdBlocked/filterVisibleSessions)の役目なのに、それを key 単位の網が
+// 先取りして壊すことになる。本来の記録だけを見れば、move でファイルの何行目に
+// 紛れ込んでいても正しく拾える。
+//
+// 判定に完全一致を使えないのは、キーと cwd の作られ方がずれているため。キーは
+// repoKey(cwd) つまり git のルートから作られる(親で開いても子で開いても同じ
+// プロジェクトに記録するため)のに、レコードにはセッションの生の cwd が入る。
+// リポジトリのサブディレクトリで開いたセッションは projectKey(cwd) がキーより
+// 深くなるので、完全一致だけを見ると本来の記録が丸ごと落ちてフォールバックの
+// キー前方一致に戻ってしまう。そこで key 自身に加えて key + '-' で始まるものも
+// 受け入れる。projectKey の区切り潰しにより "C--foo-bar" が C:\foo のサブ
+// ディレクトリか兄弟ツリー C:\foo-bar かは文字列だけでは区別できないが、
+// 採否を決めるのは最終的に cwdUnderTree のパス区切りベースの判定なので、
+// ここで多めに拾っても兄弟ツリーが配下と誤判定されることはない。
+const keyCwdsCache = new Map();
+function keyCwds(key) {
+  if (keyCwdsCache.has(key)) return keyCwdsCache.get(key);
+  const k = key.toLowerCase();
+  const cwds = readRecords(key)
+    .map((r) => (r && typeof r.cwd === 'string' && r.cwd) || null)
+    .filter(Boolean)
+    .filter((cwd) => {
+      const ck = projectKey(cwd).toLowerCase();
+      return ck === k || ck.startsWith(`${k}-`);
+    });
+  keyCwdsCache.set(key, cwds);
+  return cwds;
+}
+
+// projectKey はドライブ文字以降の区切り文字(':' '/' '\')を全て '-' に潰すため、
+// ディレクトリ名に含まれるリテラルなハイフンと区別がつかない。例えば "C:\foo\bar"
+// と "C:\foo-bar" は projectKey では同じ "C--foo-bar" になり、キーの文字列だけを
+// 前方一致で見ると保護ツリー "C:\foo" に無関係な兄弟 "C:\foo-bar" まで配下と
+// 誤判定してしまう(逆にログが消えたり move が失敗する実害になる)。
+// 実 cwd が分かるならそれを使い、account-guard.js の isInsideTree() と同じ、
+// パス区切りの位置がぶれない判定(cwdUnderTree)に揃える。
+// cmdMove は移動してきた行を cwd を書き換えずに追記するだけなので、そのキーの
+// ログが「制限外の cwd から移されてきたレコード」で始まっていることがあり得る。
+// 最初の1件だけを見ると、そのケースで保護ツリーのキーが判定から漏れてしまう
+// (プライバシー機能としては見せてしまう側の誤りになり、fail-open で許してはいけない)。
+// そのため keyCwds(key) が返す「本来その key の記録である cwd」を全件見て、1件でも
+// ツリーの内側にあれば「ツリー内」とする(fail-closed)。本来の記録が何行目にあっても
+// 拾える一方、keyCwds 側で移入レコード・孤児レコードは既に除外済みなので、無関係な
+// key がそれらに引かれて誤って遮断されることはない。該当する cwd が1件も無いときだけ、
+// 従来のキー前方一致に落とす。
+function keyUnderTree(key, treePath) {
+  const cwds = keyCwds(key);
+  if (cwds.length) return cwds.some((cwd) => cwdUnderTree(cwd, treePath));
+  // 実 cwd が1件も取れない場合だけ、従来のキー前方一致にフォールバックする。境界を
+  // 誤って跨ぐ可能性は残るが、プライバシー機能としては見せてしまう側より安全
+  const treeKey = projectKey(treePath).toLowerCase();
+  if (!treeKey) return false;
+  const k = key.toLowerCase();
+  return k === treeKey || k.startsWith(`${treeKey}-`);
+}
+
+// cwd がツリー配下かを見る。inSameTree() は親子どちらの向きでも真になる(並列
+// セッション警告向けの設計)が、ここでは「cwd がツリーの内側にあるか」という
+// 向きだけを見る必要がある(cwd がツリーの親ならまだ配下ではない)ため、
+// 同じ前方一致の発想を使いつつ向きを固定した専用の判定にする。
+// Windows はファイルシステムが case-insensitive なので、比較前に小文字化する
+// (姉妹ツールの account-guard.js の normalize() と揃える。ここを揃えないと
+// ドライブ以外の大小差だけで制限が無言ですり抜けてしまう)
+function cwdUnderTree(cwd, treePath) {
+  const c = normPath(cwd).toLowerCase();
+  const t = normPath(treePath).toLowerCase();
+  if (!c || !t) return false;
+  return c === t || c.startsWith(t + path.sep);
+}
+
+function isKeyBlocked(key, blocked) {
+  return blocked.some((r) => r.all || keyUnderTree(key, r.tree));
+}
+
+// key は「そのレコードが入っているキー」。cwd が無いレコードの判定に使う。
+function isCwdBlocked(cwd, blocked, key = null) {
+  if (!blocked.length) return false;
+  if (blocked.some((r) => r.all)) return true;
+  // cwd の無いセッション(SessionStart が発火しなかった場合。端末の強制終了で起きる)は
+  // 「保護ツリーの外だった」ことを cwd からは証明できない。ただし判定不能を一律
+  // fail-closed にすると、restrictedTrees を1件足しただけで無関係な cwd 欠落レコードが
+  // list・today・export・handoff から消え、move でも動かせなくなる。
+  // そこで、そのレコードが入っているキー自体をキー単位の網に掛け、可視と出るなら
+  // 制限対象とみなさない。キー単位の網は既にツリー情報(keyCwds/前方一致)を反映して
+  // いるので、そこを通ったキーの中身を二重に伏せる理由はない。
+  // move で保護ツリーから移されてきた記録は cwd を書き換えずに追記されるため、この
+  // 緩和では漏れない(cwd を持っているので下の判定で拾われる)。キーが分からないときだけ
+  // 従来どおり伏せる側に倒す
+  if (!cwd) return key ? isKeyBlocked(key, blocked) : true;
+  return blocked.some((r) => cwdUnderTree(cwd, r.tree));
+}
+
+// プロジェクトキーの一覧から、現在のアカウントに見せてよくないものを外す
+function filterVisibleKeys(keys, cfg, account) {
+  const blocked = blockedTrees(cfg, account);
+  if (!blocked.length) return keys;
+  return keys.filter((k) => !isKeyBlocked(k, blocked));
+}
+
+// セッション配列(各要素が cwd を持つ)から、cwd がツリー配下のものを外す。
+// キーの前方一致では拾えない取りこぼしを塞ぐ第二の網。
+// cwd を持たないレコードの判定にキーが要る(isCwdBlocked 参照)ので、呼び出し側は
+// s.project を付けて渡すか、単一キー分なら fallbackKey で渡す
+function filterVisibleSessions(sessions, cfg, account, fallbackKey = null) {
+  const blocked = blockedTrees(cfg, account);
+  if (!blocked.length) return sessions;
+  return sessions.filter((s) => !isCwdBlocked(s && s.cwd, blocked, (s && s.project) || fallbackKey));
+}
+
+// 除外が発生したことを黙って隠さないための一行。today / list --all / export --all で使う。
+// SessionStart の自動注入(buildContext)は出力を汚したくないのでここを呼ばない
+// hiddenSessions は cwd 側の第二の網で落ちた件数。キー単位で数えるだけでは、
+// 非制限キーの下にある孤児(move で移された記録など)が件数に現れず、まさにその網が
+// 拾う取りこぼしだけが無言で消える — この注記が防ごうとしている誤解そのものになる。
+// scopeKeys はそのコマンドが実際に問い合わせたキー(制限フィルタ前)。省略時は全キー横断。
+function restrictionNote(cfg, account, hiddenSessions = 0, scopeKeys = null) {
+  if (cfg.configBroken) {
+    return `設定 ${CONFIG_PATH} を読めないため、安全側に倒して全ての記録を伏せています`;
+  }
+  const blocked = blockedTrees(cfg, account);
+  if (!blocked.length) return null;
+  // 件数は「そのコマンドが問い合わせた範囲」でしか意味を持たない。--project 指定のように
+  // 単一プロジェクトを見ているときにディスク上の全キーから数えると、その一覧に含まれても
+  // いない他プロジェクトの件数を「ここから伏せた」と伝えることになる。
+  // scopeKeys のうちディスク上に実在するものだけを数えるのは、--project の打ち間違いで
+  // 作られた実在しないキーを「制限中」と案内しないため(explicitProjectRestrictionNote と同じ考え方)
+  const onDisk = listProjectKeysRaw();
+  const scope = scopeKeys ? scopeKeys.filter((k) => onDisk.includes(k)) : onDisk;
+  const hidden = scope.filter((k) => isKeyBlocked(k, blocked)).length;
+
+  const parts = [];
+  if (hidden > 0) parts.push(`${hidden} 件のプロジェクト`);
+  if (hiddenSessions > 0) parts.push(`${hiddenSessions} 件のセッション`);
+  // 「と 」の後ろのスペースは意図的。各パートが数字で始まるので、詰めると
+  // 「プロジェクトと2 件」と不揃いになる
+  return parts.length ? `別アカウント専用のツリーのため ${parts.join('と ')}を表示していません` : null;
 }
 
 // フック実行中の失敗は表に出せない(出すとセッションが汚れる)ので、ここだけに残す
@@ -145,7 +394,9 @@ function readRecords(key) {
   return readRawLines(key).map((l) => l.rec).filter(Boolean);
 }
 
-function listProjectKeys() {
+// ディスク上に実在するキーをそのまま返す(制限フィルタ前)。restrictionNote() が
+// 除外件数を数えるのに素の件数を必要とするため、フィルタ済み版と分けてある
+function listProjectKeysRaw() {
   try {
     return fs.readdirSync(LOG_DIR)
       .filter((f) => f.endsWith('.ndjson'))
@@ -155,6 +406,13 @@ function listProjectKeys() {
   } catch {
     return [];
   }
+}
+
+// 全キーを横断して読む経路はすべてここを通るので、restrictedTrees によるキー単位の
+// 除外はここ 1 箇所に入れておけば広く効く(resolveTargetKeySets(--all) /
+// cmdToday の既定 / cmdExport(--all) / resolveMoveKey など)
+function listProjectKeys() {
+  return filterVisibleKeys(listProjectKeysRaw(), loadConfig(), currentAccount());
 }
 
 function uniq(arr) {
@@ -328,14 +586,6 @@ function foldSessions(records) {
 
 function loadSessions(key) {
   return foldSessions(readRecords(key));
-}
-
-function loadAllSessions() {
-  const out = [];
-  for (const key of listProjectKeys()) {
-    for (const s of loadSessions(key)) out.push({ ...s, project: key });
-  }
-  return out.sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -785,8 +1035,19 @@ function latestHandoff(sessions) {
 // 「次回の始め方」「過去 N 件の要約」「持ち越しの未完タスク」「並列稼働中の他セッション」に絞る。
 // 戻り値は { text, handoff } で、handoff は自動投入(initialUserMessage)の判断に使う。
 function buildContext(key, cwd, currentSid, cfg) {
-  const sessions = loadSessions(key).filter((s) => s.sid !== currentSid);
+  // restrictedTrees は読み出し・表示だけを制限する。ここで cwd 単位に外しておけば、
+  // 保護ツリー配下で許可されていないアカウントのセッションには何も注入されなくなる
+  // (start の記録自体は cmdSessionStart 側で既に完了しており、この関数を通らない)。
+  // 注記は基本的に出さない — SessionStart の自動注入は出力を汚したくないため。
+  // ただし config 破損時は全ツリーが BLOCK_ALL になり、引き継ぎまで無言で消える。
+  // これだけは「引き継ぎ機能が壊れている」という誤解を招くので、他の経路と同じ注記を出す
+  // 第4引数は cwd を持たないレコードの判定に使うキー(この経路は単一キー分しか読まない)
+  const sessions = filterVisibleSessions(
+    loadSessions(key).filter((s) => s.sid !== currentSid),
+    cfg, currentAccount(), key,
+  );
   const parts = [];
+  if (cfg.configBroken) parts.push(`> ${restrictionNote(cfg, currentAccount())}`);
 
   // どのツールの続きを渡すか。全ツール分の引き継ぎを入れると、まさに避けたかった
   // 「無関係な引き継ぎ」が増えるだけなので、主スコープ 1 本だけを全文にする。
@@ -1244,58 +1505,171 @@ function matchScope(session, needle, cfg) {
   return Boolean(scope) && scope.toLowerCase().includes(String(needle).toLowerCase());
 }
 
+// --project の値をキー一覧から解決する規則(完全一致 > 部分一致 > 無ければ cwd 由来の
+// キー1つにフォールバック)。プールを外から渡せるようにして、フィルタ前(制限診断用)と
+// フィルタ後(実際の解決用)の両方で同じ規則を使い回す。ここを2箇所に書くと、判定基準が
+// ずれて「制限のはずなのに記録なし扱いになる」ような食い違いが起きるため
+function matchProjectKeys(pool, explicit) {
+  const hit = pool.filter((k) => k === explicit || k.toLowerCase().includes(explicit.toLowerCase()));
+  return hit.length ? hit : [repoKey(explicit)];
+}
+
+// 対象キーを、制限フィルタ前(raw)と後(visible)の両方で返す。
+// 注記(restrictionNote)は「そのコマンドが問い合わせた範囲で何件伏せたか」を語るため、
+// フィルタで落ちた分を知るには前後の両方が要る。
+// allByDefault は --project も --all も無いときに全プロジェクトを対象にするか
+// (cmdToday の既定はカレントではなく全プロジェクト横断)
+function resolveTargetKeySets(flags, allByDefault = false) {
+  const cfg = loadConfig();
+  const account = currentAccount();
+  const explicit = one(flags, 'project');
+  let raw;
+  // allByDefault の判定に explicit ではなく flags.project を使うのは、値の無い --project が
+  // 渡されたときの挙動を従来どおり(cwd 解決)に保つため
+  if (flags.all || (allByDefault && !flags.project)) {
+    raw = listProjectKeysRaw();
+  } else if (typeof explicit === 'string') {
+    // 完全なキーでも部分一致でも受ける(手で打つときに楽なため)。制限の有無に関わらず
+    // まず素の一覧から一致を探し、最後にまとめてフィルタする(部分一致自体は
+    // フィルタ後の一覧からしか探さないと「見えないキー」を経由できず判定がぶれるため)
+    raw = matchProjectKeys(listProjectKeysRaw(), explicit);
+  } else {
+    // 既定(現在のディレクトリ)も listProjectKeys() を経由しない単独キーなので、
+    // ここで保護ツリー配下かを見ないと「cd して worklog list」だけで素通りしてしまう
+    raw = [repoKey(one(flags, 'cwd', process.cwd()))];
+  }
+  return { raw, visible: filterVisibleKeys(raw, cfg, account) };
+}
+
 function resolveTargetKeys(flags) {
-  if (flags.all) return listProjectKeys();
+  return resolveTargetKeySets(flags).visible;
+}
+
+// resolveTargetKeys(--project、または無指定時の cwd)が空になったとき、それが
+// 「本当に記録が無い」のか「制限で見えないだけ」なのかを cmdList / cmdExport が
+// 区別するための注記。「記録が消えた」と誤解して調べ回るのを防ぐのが目的なので、
+// 対象プロジェクトが実在すること自体は隠さない(名前は利用者が --project に
+// 自分で書いた値、または cwd から作った値そのもの)
+function explicitProjectRestrictionNote(flags, cfg, account) {
+  // 設定を読めていないときは BLOCK_ALL で全部伏せている。理由は「別アカウント専用の
+  // ツリーだから」ではないので、ここでその説明を出すと誤った案内になる
+  // (本当の理由は restrictionNote 側が出す)
+  if (cfg.configBroken) return null;
+  const blocked = blockedTrees(cfg, account);
+  if (!blocked.length) return null;
   const explicit = one(flags, 'project');
   if (typeof explicit === 'string') {
-    // 完全なキーでも部分一致でも受ける(手で打つときに楽なため)
-    const all = listProjectKeys();
-    const hit = all.filter((k) => k === explicit || k.toLowerCase().includes(explicit.toLowerCase()));
-    return hit.length ? hit : [repoKey(explicit)];
+    const raw = listProjectKeysRaw();
+    // フォールバック(部分一致なし)のときの repoKey(explicit) は、ディスク上に
+    // 実在するとは限らない(打ち間違い等)。実在しないキーまで「制限中」と案内すると
+    // 誤情報になるので、素の一覧に無いものは「本当に記録が無い」側として扱う
+    const candidates = matchProjectKeys(raw, explicit).filter((k) => raw.includes(k));
+    if (!candidates.length) return null;
+    if (!candidates.every((k) => isKeyBlocked(k, blocked))) return null; // 一部でも見えるなら通常表示になる
+    return `「${explicit}」は別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。`;
   }
-  return [repoKey(one(flags, 'cwd', process.cwd()))];
+  // --project 省略時(既定の cwd 解決)。--all は listProjectKeys() で既にキー単位
+  // フィルタ済みで、件数ベースの restrictionNote が別途案内するのでここでは扱わない。
+  // resolveTargetKeys() の既定分岐と同じ repoKey(cwd) を使わないと判定基準がずれる
+  if (flags.all) return null;
+  const cwdKey = repoKey(one(flags, 'cwd', process.cwd()));
+  if (!isKeyBlocked(cwdKey, blocked)) return null;
+  return '現在のディレクトリは別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。';
 }
 
 function cmdList(flags) {
-  const keys = resolveTargetKeys(flags);
+  const { raw: scopeKeys, visible: keys } = resolveTargetKeySets(flags); // keys はキー単位でフィルタ済み
   const n = Number(one(flags, 'n', 10)) || 10;
   const verbose = Boolean(one(flags, 'verbose', flags.v ? true : false));
   const showProject = keys.length > 1;
   const cfg = loadConfig();
+  const account = currentAccount();
   const scopeFilter = one(flags, 'scope');
+  // 注記は --all(全プロジェクト横断)のときは件数で、--project の明示指定では
+  // 「記録が消えた」との誤解を防ぐための個別の案内で出す(下の空セッション分岐)
+  // cwd 単位の第二の網もかけておく(move 後の孤児などキーだけでは拾えない取りこぼし対策)
+  const rawSessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })));
+  const visible = filterVisibleSessions(rawSessions, cfg, account);
+  const all = visible.slice().sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
 
-  const all = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })))
-    .sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
+  // 設定を読めていないことだけは、対象の指定によらず必ず伝える。--project 指定など
+  // 件数注記の対象外でも、cwd 側の第二の網(孤児レコード等)で除外が出た分だけは
+  // 黙って消さずに数える(除外は発生したのに何の表示もない、という抜けを塞ぐ)
+  const hiddenSessions = rawSessions.length - visible.length;
+  // scope 内でキー単位に伏せた数。--project が保護ツリーと可視のプロジェクトの両方に
+  // 一致した場合、セッションは可視キーからしか読まないので hiddenSessions は 0 になり、
+  // 一覧も空にならないので個別の案内(explicitProjectRestrictionNote)も出ない。
+  // ここを数えないと、保護ツリーのプロジェクトが何の表示もないまま消える
+  const hiddenKeys = scopeKeys.length - keys.length;
+  const note = flags.all || cfg.configBroken || hiddenSessions > 0 || hiddenKeys > 0
+    ? restrictionNote(cfg, account, hiddenSessions, scopeKeys)
+    : null;
   // 絞り込みは件数制限より前に掛ける(直近 n 件の中から探すのでは取りこぼす)
   const sessions = (typeof scopeFilter === 'string' ? all.filter((s) => matchScope(s, scopeFilter, cfg)) : all)
     .slice(0, n);
 
   if (!sessions.length) {
-    console.log(typeof scopeFilter === 'string'
-      ? `スコープ「${scopeFilter}」に一致する記録がない。`
-      : '記録がまだない。フックを設定したか、対象プロジェクトが合っているか確認する。');
+    // 「記録が無い」と「制限で見せていない」は意味が違う。前者だと消えたと誤解して
+    // 調べ回ることになるため、--project が保護ツリーに当たっている場合はそちらを優先する
+    const restricted = explicitProjectRestrictionNote(flags, cfg, account);
+    if (restricted) {
+      console.log(yellow(`! ${restricted}`));
+    } else {
+      console.log(typeof scopeFilter === 'string'
+        ? `スコープ「${scopeFilter}」に一致する記録がない。`
+        : '記録がまだない。フックを設定したか、対象プロジェクトが合っているか確認する。');
+    }
+    // 個別の案内を出したときは件数の注記を重ねない(同じことを二度言うことになる)
+    if (note && !restricted) console.log(yellow(`! ${note}`));
     return;
   }
   const where = showProject ? '全プロジェクト' : keys.map((k) => repoLabel(k, all)).join(', ');
   console.log(bold(`直近の作業ログ (${where}${typeof scopeFilter === 'string' ? ` / scope ${scopeFilter}` : ''})`));
   for (const s of sessions) console.log(renderSession(s, { verbose, showProject, cfg }));
+  if (note) console.log(yellow(`! ${note}`));
 }
 
 function cmdToday(flags) {
   const cfg = loadConfig();
-  const keys = flags.project ? resolveTargetKeys(flags) : listProjectKeys();
+  const account = currentAccount();
+  // --project 省略時は全プロジェクト横断が既定
+  const { raw: scopeKeys, visible: keys } = resolveTargetKeySets(flags, true);
   const days = Number(one(flags, 'days', 1)) || 1;
   const since = new Date();
   since.setHours(0, 0, 0, 0);
   since.setDate(since.getDate() - (days - 1));
   const from = since.getTime();
-
-  const sessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })))
+  // 注記の出し分けは cmdList / cmdExport と揃える。today は既定で全プロジェクト横断
+  // なので件数ベースの注記を出すが、--project を明示したときは横断していないので
+  // 件数は意味を持たない(代わりに空表示のときへ個別の案内を出す)。
+  // 設定を読めていないことだけは、対象の指定によらず必ず伝える。
+  // cwd 単位の第二の網もかけておく(move 後の孤児などキーだけでは拾えない取りこぼし対策)
+  const rawSessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })));
+  const visible = filterVisibleSessions(rawSessions, cfg, account);
+  const sessions = visible
     .filter((s) => (s.startTs || 0) >= from)
     .sort((a, b) => (a.startTs || 0) - (b.startTs || 0));
 
+  // --project 指定時も、cwd 側の第二の網で除外が出た分だけは黙って消さず数える
+  const hiddenSessions = rawSessions.length - visible.length;
+  // キー単位で伏せた分も数える(cmdList と同じ理由。--project が保護ツリーと可視の
+  // プロジェクトの両方に一致すると、どちらの網にも現れないまま静かに消えるため)
+  const hiddenKeys = scopeKeys.length - keys.length;
+  const note = !flags.project || cfg.configBroken || hiddenSessions > 0 || hiddenKeys > 0
+    ? restrictionNote(cfg, account, hiddenSessions, scopeKeys)
+    : null;
+
   if (!sessions.length) {
-    console.log(days > 1 ? `直近 ${days} 日の記録はない。` : '今日の記録はまだない。');
+    // 「記録が無い」と「制限で見せていない」の区別は cmdList / cmdExport と同じく today でも要る。
+    // --project 省略時は cwd ではなく全プロジェクトが対象なので、cwd 基準の案内は使わない
+    const restricted = flags.project ? explicitProjectRestrictionNote(flags, cfg, account) : null;
+    if (restricted) {
+      console.log(yellow(`! ${restricted}`));
+    } else {
+      console.log(days > 1 ? `直近 ${days} 日の記録はない。` : '今日の記録はまだない。');
+    }
+    // 個別の案内を出したときは件数の注記を重ねない
+    if (note && !restricted) console.log(yellow(`! ${note}`));
     return;
   }
   let currentDay = null;
@@ -1309,9 +1683,12 @@ function cmdToday(flags) {
   }
   const projects = uniq(sessions.map((s) => displayName(s, cfg)));
   console.log(`\n${dim(`${sessions.length} セッション / ${projects.length} プロジェクト: ${projects.join(', ')}`)}`);
+  if (note) console.log(yellow(`! ${note}`));
 }
 
 function cmdLive() {
+  const cfg = loadConfig();
+  const blocked = blockedTrees(cfg, currentAccount());
   const live = liveSessions();
   if (!live.length) {
     console.log('起動中の Claude Code セッションはない。');
@@ -1320,7 +1697,10 @@ function cmdLive() {
   console.log(bold(`起動中のセッション (${live.length})`));
   for (const s of live) {
     const key = repoKey(s.cwd || '');
-    const rec = loadSessions(key).find((x) => x.sid === s.sessionId);
+    // 起動中セッションの一覧自体は worklog の記録ではないので出す(pid/cwd は元々見えている)。
+    // ただし直近の記録(rec.summary)は worklog 側のデータなので、保護ツリー配下なら読まない
+    const restricted = blocked.length && (isKeyBlocked(key, blocked) || isCwdBlocked(s.cwd, blocked));
+    const rec = restricted ? null : loadSessions(key).find((x) => x.sid === s.sessionId);
     const elapsed = s.startedAt ? fmtDuration(Date.now() - s.startedAt) : '';
     const status = s.status === 'busy' ? yellow('busy') : dim(s.status || '?');
     const summary = rec && rec.summary ? ` ${dim(`直近の記録: ${truncate(rec.summary, 50)}`)}` : '';
@@ -1351,9 +1731,16 @@ function cmdContext(flags) {
 // Windows なら `worklog handoff | clip` でそのままクリップボードに入る。
 function cmdHandoff(flags, scopeArg) {
   const cfg = loadConfig();
-  const keys = resolveTargetKeys(flags);
-  let sessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })))
-    .sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
+  const account = currentAccount();
+  const { raw: scopeKeys, visible: keys } = resolveTargetKeySets(flags); // keys はキー単位でフィルタ済み
+  // cwd 単位の第二の網もかけておく(move 後の孤児などキーだけでは拾えない取りこぼし対策)
+  const rawSessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })));
+  const visible = filterVisibleSessions(rawSessions, cfg, account);
+  // 伏せた件数はここで数える。引き継ぎが見つかった場合でも、より新しい引き継ぎが制限で
+  // 伏せられている可能性があり、黙って古いほうを渡すと「これが最新」と誤解されるため
+  const hiddenSessions = rawSessions.length - visible.length;
+  const hiddenKeys = scopeKeys.length - keys.length;
+  let sessions = visible.slice().sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
   // 位置引数でツールを指定して引き継ぎを切り替える(注入される索引から辿るための入口)
   const scope = scopeArg || one(flags, 'scope');
   if (typeof scope === 'string') {
@@ -1374,7 +1761,19 @@ function cmdHandoff(flags, scopeArg) {
     isOwn = Boolean(h);
   }
   if (!h) {
-    console.log('引き継ぎ文が記録されていない。セッション終了時に /finish を実行すると記録される。');
+    // 「記録が無い」と「制限で見せていない」は意味が違う。cmdList / cmdToday / cmdExport と
+    // 同じく区別しないと、実際には記録済み・/finish 済みの引き継ぎを「未記録」と
+    // 誤って報告してしまう(制限ツリー内では対象セッションが黙って空になるため)
+    const restricted = explicitProjectRestrictionNote(flags, cfg, account);
+    const note = restricted
+      || (cfg.configBroken || hiddenSessions > 0 || hiddenKeys > 0
+        ? restrictionNote(cfg, account, hiddenSessions, scopeKeys)
+        : null);
+    if (note) {
+      console.log(yellow(`! ${note}`));
+    } else {
+      console.log('引き継ぎ文が記録されていない。セッション終了時に /finish を実行すると記録される。');
+    }
     return;
   }
   // --raw は貼り付け用。見出しや注記を付けずに本文だけ出す
@@ -1388,15 +1787,25 @@ function cmdHandoff(flags, scopeArg) {
   console.log(h.text);
   if (isOwn) console.log(dim('\n(注: 他セッションの引き継ぎは無く、これはこのセッション自身が記録したもの)'));
   if (!h.explicit) console.log(dim('\n(/finish の引き継ぎ文ではなく「次にやること」から生成)'));
+  // 出せた引き継ぎより新しいものが制限で伏せられていることがある。何も言わずに古いほうを
+  // 渡すと「これが最新」と受け取られるため、伏せた事実だけは添える(中身は出さない)
+  if (hiddenKeys > 0 || hiddenSessions > 0) {
+    const note = restrictionNote(cfg, account, hiddenSessions, scopeKeys);
+    if (note) console.log(dim(`\n(${note}。より新しい引き継ぎがそちらにある可能性がある)`));
+  }
 }
 
 function cmdExport(flags) {
   const cfg = loadConfig();
-  const keys = flags.all ? listProjectKeys() : resolveTargetKeys(flags);
+  const account = currentAccount();
+  const { raw: scopeKeys, visible: keys } = resolveTargetKeySets(flags); // keys はキー単位でフィルタ済み
   const sinceStr = one(flags, 'since');
   const from = sinceStr ? Date.parse(sinceStr) : null;
 
-  const sessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })))
+  // cwd 単位の第二の網もかけておく(move 後の孤児などキーだけでは拾えない取りこぼし対策)
+  const rawSessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })));
+  const visible = filterVisibleSessions(rawSessions, cfg, account);
+  const sessions = visible
     .filter((s) => (from ? (s.startTs || 0) >= from : true))
     .sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
 
@@ -1404,6 +1813,23 @@ function cmdExport(flags) {
   out.push('# 作業ログ');
   out.push('');
   out.push(`生成: ${new Date().toISOString()} / ${sessions.length} セッション`);
+  // export はそのままファイルに保存・共有されうるので、除外があった事実を出力の中に残す。
+  // 黙って消すと「記録が消えた」と誤解されるため。--all は件数、--project の明示指定は
+  // 「記録が無い」との混同を避けるための個別の案内にする
+  // 設定を読めていないことだけは、対象の指定によらず必ず残す。--project 指定でも
+  // cwd 側の第二の網で除外が出た分は黙って消さず数える
+  const hiddenSessions = rawSessions.length - visible.length;
+  // キー単位で伏せた分も数える(cmdList と同じ理由)。個別の案内が出せるときはそちらを
+  // 優先する — 「N 件のプロジェクト」より「そのプロジェクトは制限されている」のほうが
+  // 名指しで問い合わせた利用者には正確に伝わる
+  const hiddenKeys = scopeKeys.length - keys.length;
+  const restricted = explicitProjectRestrictionNote(flags, cfg, account);
+  if (restricted) {
+    out.push(`\n> ${restricted}`);
+  } else if (flags.all || cfg.configBroken || hiddenSessions > 0 || hiddenKeys > 0) {
+    const note = restrictionNote(cfg, account, hiddenSessions, scopeKeys);
+    if (note) out.push(`\n> ${note}`);
+  }
   out.push('');
   let day = null;
   for (const s of sessions) {
@@ -1436,16 +1862,56 @@ function cmdExport(flags) {
 // キー指定を 1 つに解決する。完全一致 > 部分一致の順。既存キーに当たらないときは
 // パスとして解釈する(allowNew。まだ記録のない移動先を --to に書けるようにするため)
 function resolveMoveKey(spec, allowNew) {
-  const all = listProjectKeys();
+  const all = listProjectKeys(); // restrictedTrees でキー単位フィルタ済み
   if (all.includes(spec)) return spec;
   const hit = all.filter((k) => k.toLowerCase().includes(spec.toLowerCase()));
   if (hit.length === 1) return hit[0];
   if (hit.length > 1) throw new Error(`「${spec}」は ${hit.length} 件のプロジェクトに一致する: ${hit.join(', ')}`);
-  if (!allowNew) throw new Error(`「${spec}」に一致するプロジェクトがない。worklog list --all で確認する`);
+
+  // ここまでで hit なし。all は制限フィルタ済みなので、実際には存在するキーが
+  // 制限で見えていないだけの可能性がある。その状態のまま allowNew のフォールバック
+  // (パスとして repoKey() に通す)に進むと、spec を cwd からの相対パスとして解決した
+  // 「ディスク上に無い新規キー」を作ってしまい、記録がそこへ move されてしまう
+  // (「ディスク上に無い」の警告は出るが move 自体は実行されてしまう)。
+  // 制限が理由だと分かっている場合はキーを捏造せず、ここで move そのものを拒否する
+  const cfg = loadConfig();
+  const blocked = blockedTrees(cfg, currentAccount());
+  // 設定を読めていないときは BLOCK_ALL で全部伏せているので、理由は「別アカウント専用の
+  // ツリーだから」ではない。そのまま案内するとアカウント切り替えという効かない対処へ
+  // 誘導してしまうため、restrictionNote / explicitProjectRestrictionNote と同じ区別をする
+  const denyReason = (what) => (cfg.configBroken
+    ? `設定 ${CONFIG_PATH} を読めないため、安全側に倒して全ての記録を伏せている。設定を直してからやり直す。`
+    : `${what}は別アカウント専用のツリーのため move できない。許可されたアカウントに切り替える。`);
+  if (blocked.length) {
+    const raw = listProjectKeysRaw();
+    const rawHit = raw.includes(spec) ? [spec] : raw.filter((k) => k.toLowerCase().includes(spec.toLowerCase()));
+    if (rawHit.length && rawHit.every((k) => isKeyBlocked(k, blocked))) {
+      throw new Error(denyReason(`「${spec}」`));
+    }
+  }
+
+  // 上の rawHit 判定は実在するキーに部分一致したときしか働かないので、綴り違いや
+  // 消えたディレクトリの指定はここへ落ちる。設定が壊れていて全部伏せている状態で
+  // 「一致するプロジェクトがない」と言うと、効かない対処(list --all も同じ制限で
+  // 空になる)へ誘導するため、上と同じ区別をする
+  if (!allowNew) {
+    if (cfg.configBroken) throw new Error(denyReason(`「${spec}」`));
+    throw new Error(`「${spec}」に一致するプロジェクトがない。worklog list --all で確認する`);
+  }
   // 既存キーに当たらなかったのでパス扱いにする。打ち間違いがそのまま新しいキーに
   // なってしまうため、ディスク上に無いことだけは伝える(消えたディレクトリの
   // 記録を移す正当な用途もあるのでエラーにはしない)
   const key = repoKey(spec);
+  // 上の rawHit 判定はディスク上に実在するキーに一致したときしか働かない。spec が既存の
+  // キー名に部分一致すらしないとき(保護ツリーへ cd して --to . と書いた場合など)は
+  // そこを素通りし、ここで保護ツリー配下の新規キーを作ってしまう。すると move は成功
+  // メッセージを出すのに、直後から filterVisibleKeys がそのキーを伏せるため移した記録が
+  // 全経路から消え、戻すための move も同じ制限で拒否される — 利用者から見れば move で
+  // ログを失ったのと同じになる。捏造するキーにもツリー判定を掛け、書けるが読めない
+  // 置き場所を作らせない
+  if (blocked.length && isKeyBlocked(key, blocked)) {
+    throw new Error(denyReason(`移動先「${spec}」`));
+  }
   if (!existsSafe(normPath(spec))) console.log(yellow(`! 移動先 ${spec} はディスク上に無い。新しいキー ${key} を作る`));
   return key;
 }
@@ -1518,7 +1984,18 @@ function cmdMove(flags) {
   // セッションとして一覧に現れる)。既定では外し、--force で押し切れるようにする
   const liveSids = new Set(live.map((s) => s.sessionId));
   const skipped = force ? [] : selected.filter((s) => liveSids.has(s.sid));
-  const moving = selected.filter((s) => !skipped.includes(s));
+
+  // cwd が制限ツリー配下のセッションは対象から外す。resolveMoveKey のキー単位の網は
+  // すり抜けてここまで来ることがある(過去の move で非制限キーへ移された孤児など)。
+  // 下の一覧は summary をそのまま出すので、外さないと読み出し制限の抜け穴になる。
+  // 見えていない記録を動かせるのも筋が通らないので、--force でも押し切らせない
+  const blocked = blockedTrees(loadConfig(), currentAccount());
+  // キー(from)も渡す。cwd を持たない孤児レコードまで一律に対象外にすると、保護ツリーと
+  // 何の関係もない自分の記録が「別アカウント専用のツリーの記録」という誤った理由で
+  // 動かせなくなる(from は resolveMoveKey を通っており可視なキーだけが来る)
+  const restricted = blocked.length ? selected.filter((s) => isCwdBlocked(s.cwd, blocked, from)) : [];
+
+  const moving = selected.filter((s) => !skipped.includes(s) && !restricted.includes(s));
   const movingSids = new Set(moving.map((s) => s.sid));
   const isMoving = (l) => Boolean(l.rec) && movingSids.has(l.rec.sid);
   // 壊れた行と sid の無い行は畳み込みに現れないので、選択されず自動的に元へ残る
@@ -1532,6 +2009,11 @@ function cmdMove(flags) {
   }
   for (const s of skipped) {
     console.log(yellow(`  スキップ(起動中) ${fmtTime(s.startTs)} ${s.sid.slice(0, 8)} — 移すには --force`));
+  }
+  // 要約は出さない(それ自体が制限している中身なので)。存在と件数までは隠さず、
+  // 「消えた」と誤解して探し回らずに済むようにする
+  for (const s of restricted) {
+    console.log(yellow(`  対象外 ${fmtTime(s.startTs)} ${s.sid.slice(0, 8)} — 別アカウント専用のツリーの記録`));
   }
   if (!moving.length) {
     console.error('移動できる記録がない。');
@@ -1602,6 +2084,8 @@ function cmdHelp() {
         ディレクトリが2つ以上あるときスコープを有効にする。'off'/'on' で固定できる
         autoStartFromHandoff: true にすると、新セッション開始時に引き継ぎを
         最初の発言として自動投入し、前回の続きから動き出す(既定 false)
+        restrictedTrees: [{ tree, allow: [subscriptionType,...] }] で、指定ツリー配下の
+        記録を許可されていないアカウントの読み出しから隠す(記録は制限しない。詳細は README)
 `);
 }
 

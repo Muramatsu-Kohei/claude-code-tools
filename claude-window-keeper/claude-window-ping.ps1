@@ -60,11 +60,43 @@ param(
 $ErrorActionPreference = "Stop"
 
 $stateDir  = Join-Path $env:USERPROFILE ".claude\window-keeper"
-$stateFile = Join-Path $stateDir "state.json"
 $logFile   = Join-Path $stateDir "ping.log"
+
+# Ping はいまログイン中のアカウントの 5 時間枠を消費する。枠はアカウントごとに独立して
+# いるため、最後に Ping した時刻もアカウント別に持たなければならない。1 つの state を
+# 共有すると、アカウントを切り替えた直後に「まだ枠の途中」と誤判定して Ping を送らず、
+# 枠の開始時刻を固定するというこのツールの目的が果たせなくなる。
+#
+# credentials にアカウント固有の識別子(uuid やメールアドレス)は無いため、プラン種別
+# subscriptionType で代用する（組織は team、個人は pro / max）。
+function Get-ClaudeAccount {
+    $cred = Join-Path $env:USERPROFILE ".claude\.credentials.json"
+    try {
+        $t = (Get-Content $cred -Raw -ErrorAction Stop | ConvertFrom-Json).claudeAiOauth.subscriptionType
+        # 値はファイル名の一部になるので、想定外の文字が来たら採用しない
+        if ($t -and ($t -match '^[a-zA-Z0-9_-]+$')) { return $t }
+    } catch {
+        # 未ログイン・権限不足・将来の構造変更のいずれか。判別不能として 1 つにまとめる
+    }
+    return "unknown"
+}
+
+$account   = Get-ClaudeAccount
+$stateFile = Join-Path $stateDir ("state-{0}.json" -f $account)
+
+# 判別不能（$account -eq "unknown")を最初に通知済みかどうかの目印。中身は使わず存在だけ見る
+$unknownNotifiedFile = Join-Path $stateDir "state-unknown.notified"
 
 if (-not (Test-Path $stateDir)) {
     New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+}
+
+# アカウントを判別できた回（unknown 以外で処理が進められる回）はマーカーを消す。
+# -Status のような Ping を送らない経路も含めるのは、それも「今回は判別できた」という
+# 事実が確認できる機会であり、ここで消し忘れると次にまた判別不能へ戻ったときの
+# 初回通知が復活しない（マーカーが残ったままだと以後ずっと -ConsoleOnly になってしまう）。
+if ($account -ne "unknown" -and (Test-Path $unknownNotifiedFile)) {
+    Remove-Item -Path $unknownNotifiedFile -Force
 }
 
 # ログは追記され続けるため、この大きさを超えたら 1 世代だけ退避して作り直す
@@ -74,7 +106,8 @@ $logMaxBytes = 1MB
 # ログ記載用func.
 # -ConsoleOnly を付けた呼び出しは画面表示だけで、ファイルには残さない
 function Write-Log([string]$msg, [switch]$ConsoleOnly) {
-    $line = "{0}  {1}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"), $msg
+    # どのアカウントの枠を消費した Ping なのかを後から追えるようにする
+    $line = "{0}  [{1}] {2}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"), $account, $msg
     Write-Host $line
     if ($ConsoleOnly) { return }
 
@@ -85,13 +118,20 @@ function Write-Log([string]$msg, [switch]$ConsoleOnly) {
     Add-Content -Path $logFile -Value $line
 }
 
+# アカウント分離導入前は state.json（無印）1本だった名残があるが、旧ファイルは読まない。
+# どのアカウントの記録か書かれておらず、たまたまログイン中のアカウントに紐付けると、
+# team で運用してきた環境で個人アカウントに切り替えた直後などに「まだ枠の途中」と
+# 誤読して Ping を見送ってしまう（枠が張り直されないまま気付けない、このツールが
+# 最も避けたい事象）。新パス state-<account>.json が無ければ「前回 Ping なし」として
+# 扱い、素直に Ping を送る。失うのはアップグレード直後の余分な Ping 1 回だけ。
+
 # 前回のPing時間をログから復元
 $lastPing = $null
 if (Test-Path $stateFile) {
     try {
         $state = Get-Content $stateFile -Raw | ConvertFrom-Json
-        if ($state.lastPing) { 
-            $lastPing = [datetime]$state.lastPing 
+        if ($state.lastPing) {
+            $lastPing = [datetime]$state.lastPing
         }
     } catch {
         Write-Log ("WARN  could not read state file: " + $_.Exception.Message)
@@ -102,6 +142,8 @@ $now = Get-Date
 
 # 状況確認のみ（実行時に -Status がつけられたとき）
 if ($Status) {
+    # 枠はアカウントごとに独立しているので、どのアカウントの状態を見ているかを最初に示す
+    Write-Host ("Account        : " + $account)
     if ($lastPing) {
         $elapsed = $now - $lastPing
         $reset   = $lastPing.AddMinutes($WindowMinutes)
@@ -120,6 +162,33 @@ if ($Status) {
     }
     return # 確認のみでこれ以降の処理（Ping送信）は行わない
     
+}
+
+# アカウントを判別できない回は Ping を送らない。
+#
+# 枠はアカウントごとに独立しているので、判別できないまま送ると「どのアカウントの枠を
+# いつ張り直したか」が追えなくなる。しかも state-unknown.json という別系統に記録が
+# 分かれるため、本来のアカウント側は前回時刻を失ったままになる。移行済みで旧
+# state.json も無い状況では $lastPing が $null になり、下のスキップ判定を素通りして
+# 意図しない時刻に本物の Ping が飛ぶ ― このツールが防ぐべき事象そのものになる。
+# -Force でも送らないのは、押し切っても「どの枠を張り直したのか」が分からないため。
+# ログインし直せば解消するので、記録を汚さず見送るほうが安い。
+if ($account -eq "unknown") {
+    # 判別不能はログイン状態が変わるまで毎時発生しうる点は SKIP と同じだが、SKIP と違って
+    # 一時的とは限らない。新しいマシン、資格情報を別の場所に置いた、権限エラーなど原因が
+    # 持続すると、この分岐が毎回の実行の終着点になり、5 時間枠は二度と張り直されない。
+    # それでいて何も残さなければ「タスクが動いていない」のと見分けがつかず、無音のまま
+    # 何時間・何日も気付けない。SKIP のように毎時ファイルへ積み上げては元の PING/STATE
+    # 履歴を押し出してしまうので、状態が変わったとき（＝初回）だけファイルに残し、
+    # 2 回目以降はマーカーがある間 -ConsoleOnly に切り替えて積み上げを防ぐ。
+    if (Test-Path $unknownNotifiedFile) {
+        Write-Log -ConsoleOnly "WARN  account not identified; ping skipped (log in, then re-run)"
+    } else {
+        Write-Log "WARN  account not identified; ping skipped (log in, then re-run)"
+        # 中身はデバッグ用のタイムスタンプ程度で、判定には存在有無しか使わない
+        $now.ToString("o") | Set-Content -Path $unknownNotifiedFile
+    }
+    return
 }
 
 # スキップ判定（-Force がある場合は前回からの時間に関係なくPing）
