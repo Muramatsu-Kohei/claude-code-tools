@@ -20,15 +20,41 @@ const DEFAULT_LOG = path.join(HOME, '.claude', 'usage-tracker', 'usage.jsonl');
 
 function parseArgs(argv) {
   const opts = { acct: null, log: DEFAULT_LOG, dryRun: false };
+  // 値を取るオプション(--acct, --log)の共通処理。次のトークンが無い、あるいは
+  // "--" で始まる場合は値の指定漏れとみなしてエラーにする。ここを素通りすると、
+  // 例えば `--acct --dry-run` のとき次のフラグ文字列がそのまま acct 名として
+  // 代入されてしまい、正規表現バリデーションもハイフンを許すため通過してしまう。
+  // すると --dry-run は効かないまま(opts.dryRun は false のまま)本物のログを
+  // 書き換える事故になるため、ここで確実に止める。
+  const readValue = (flagName, i) => {
+    const v = argv[i + 1];
+    if (v === undefined || v.startsWith('--')) {
+      console.error(`エラー: ${flagName} には値が必要です(渡されたのは ${v === undefined ? '(なし)' : `"${v}"`})`);
+      opts.error = true;
+      return null;
+    }
+    return v;
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--acct') opts.acct = argv[++i];
-    else if (a === '--log') opts.log = argv[++i];
-    else if (a === '--dry-run' || a === '-n') opts.dryRun = true;
+    if (a === '--acct') {
+      const v = readValue('--acct', i);
+      if (v === null) break;
+      opts.acct = v;
+      i++;
+    } else if (a === '--log') {
+      const v = readValue('--log', i);
+      if (v === null) break;
+      opts.log = v;
+      i++;
+    } else if (a === '--dry-run' || a === '-n') opts.dryRun = true;
     else if (a === '--help' || a === '-h') opts.help = true;
     else {
       console.error(`不明な引数: ${a}`);
-      opts.help = true;
+      // 打ち間違いを終了コード 0 で返すと、スクリプトから呼んだとき「移行できた」と
+      // 誤って続行される。--help は 0、引数の誤りは非ゼロで終わるよう分ける
+      opts.error = true;
+      break;
     }
   }
   return opts;
@@ -47,6 +73,11 @@ function usage() {
 
 function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (opts.error) {
+    usage();
+    process.exitCode = 1;
+    return;
+  }
   if (opts.help) return usage();
   if (!opts.acct) {
     console.error('エラー: --acct は必須です。既定値を持たせると取り違えに気づけないため。\n');

@@ -71,9 +71,15 @@ if ($content -like "*$legacyMark*") {
 # ($collectorForRequire)がブロック中に実在するかまで確認し、それが無ければ
 # 「未インストール」とみなして本来のブロックへ置き換える。
 # パスには `[` `]` などの -like ワイルドカード扱いされる文字が入り得るため、
-# パターンマッチではなく厳密な部分文字列一致の .Contains() を使う。
-$hasBeginMark = $content.Contains($beginMark)
-$installed = $hasBeginMark -and $content.Contains($collectorForRequire)
+# パターンマッチ(-like)は使えない。かといって単純な .Contains() は既定で大小文字を
+# 区別する(Ordinal)比較になり、-like から .Contains() に置き換えたときに
+# 「大小を区別しない」という挙動まで変わってしまっていた(大小違いのパス表記で
+# 起動すると既にフックが入っているのに未インストール扱いになり、statusline.js を
+# 書き換え直して .bak-usage-tracker も上書きしてしまう退行があった)。
+# ワイルドカードの問題を避けつつ大小無視の判定に戻すため、IndexOf を
+# OrdinalIgnoreCase で呼ぶ。
+$hasBeginMark = $content.IndexOf($beginMark, [StringComparison]::OrdinalIgnoreCase) -ge 0
+$installed = $hasBeginMark -and ($content.IndexOf($collectorForRequire, [StringComparison]::OrdinalIgnoreCase) -ge 0)
 
 if ($Uninstall) {
   # アンインストールはマーカーの有無だけで判断する。同梱フォールバック版であっても
