@@ -206,7 +206,20 @@ function accountBreakdown(rows) {
 // acct が 'unknown' に落ちるので、--account unknown と明示したときだけ対象に入る)。
 function filterRowsByAccount(rows, account, includeLegacy = false) {
   if (account === ACCOUNT_ALL) return rows;
-  return rows.filter((r) => r.acct === account || (includeLegacy && r.acctLegacy));
+  // admit 判定(何を対象アカウントの記録とみなすか)はあくまで acctLegacy(フィールドの
+  // 不在)で行う。値が 'unknown' なだけの行(記録時に判別できなかった行)は今までどおり
+  // 弾く。ここまでは従来どおり変えない。
+  //
+  // admit された legacy 行は、そのままだと acct が ACCOUNT_UNKNOWN のまま残り、
+  // buildWindows / clipToRecentWeekWindows / windowsWithinRows がキーやレンジ集計に
+  // r.acct を使っているせいで、対象アカウントの行と別グループに分裂してしまう
+  // (5h枠が更新の前後で2つに割れて回帰対象から漏れる、週次枠の直近 N 窓の絞り込みが
+  // legacy 分と現行分の2系統になり古い legacy 窓まで表示に残る、等)。移行前のログは
+  // 「今のアカウントの記録」として合流させると決めた行なので、グルーピング用に acct を
+  // 対象アカウント値へ付け替えたコピーを返す。元の行オブジェクトは書き換えない
+  // (accountBreakdown など、フィルタ前の allRows を見る側に影響させないため)。
+  return rows.filter((r) => r.acct === account || (includeLegacy && r.acctLegacy))
+    .map((r) => (r.acctLegacy && r.acct !== account ? { ...r, acct: account } : r));
 }
 
 // ---------------------------------------------------------------------------
