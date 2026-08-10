@@ -156,14 +156,35 @@ function blockedTrees(cfg, account) {
     .filter((r) => !(Array.isArray(r.allow) && r.allow.includes(account)));
 }
 
-// key に対応する実 cwd を1つ読む(cwd を持つ最初のレコード。通常は start)。
-// listProjectKeysRaw() 由来のキーは必ずログファイルが実在するので、ここで
-// レコードが読めないのは「cwd を記録していない古い形式」など稀なケースだけ
-function keyRealCwd(key) {
-  for (const r of readRecords(key)) {
-    if (r && typeof r.cwd === 'string' && r.cwd) return r.cwd;
-  }
-  return null;
+// key のログファイルに現れる cwd のうち、「本来その key の記録である」と確認できる
+// ものだけを集めてキャッシュする。isKeyBlocked は制限ルールごとに keyUnderTree を呼び、
+// filterVisibleKeys は全キーに対して走り、restrictionNote は同じコマンド内でさらに
+// listProjectKeysRaw/filterVisibleKeys を再実行するため、キャッシュなしだとプロジェクト数
+// × ルール数(注記を作るコマンドはその2倍)だけ同じ .ndjson を毎回丸ごと readFileSync して
+// 全行 parse することになる。このプロセスは1回のコマンド実行(または1回の SessionStart
+// フック)で終わる短命なものなので、無効化の仕組みは不要(プロセスが生きている間はログ
+// ファイルは増えるだけで、既に書かれた行の cwd が後から変わることはない)。
+// 「本来の記録である cwd が1件も無かった」という結果も Map に積んで、毎回ファイルを
+// 読み直すことを防ぐ。
+//
+// なぜ全 cwd ではなく projectKey(cwd) がその key 自身と一致する cwd だけを見るのか:
+// keyUnderTree が知りたいのは「この key は本来どのツリーの記録か」であって、「この
+// ファイルに保護ツリーの記録が混じっているか」ではない。後者まで拾うと、cmdMove の
+// 移入レコードや孤児レコード(cwd から計算した key がファイル自身の key と食い違う行)
+// によって無関係な key ごと遮断してしまい、そうした行を個別に隠すのは record 単位の
+// 第二の網(isCwdBlocked/filterVisibleSessions)の役目なのに、それを key 単位の網が
+// 先取りして壊すことになる。cwd から計算した key が一致する行だけを見れば、move で
+// ファイルの何行目に紛れ込んでいても「本来そのキーの記録」だけを正しく拾える。
+const keyCwdsCache = new Map();
+function keyCwds(key) {
+  if (keyCwdsCache.has(key)) return keyCwdsCache.get(key);
+  const k = key.toLowerCase();
+  const cwds = readRecords(key)
+    .map((r) => (r && typeof r.cwd === 'string' && r.cwd) || null)
+    .filter(Boolean)
+    .filter((cwd) => projectKey(cwd).toLowerCase() === k);
+  keyCwdsCache.set(key, cwds);
+  return cwds;
 }
 
 // projectKey はドライブ文字以降の区切り文字(':' '/' '\')を全て '-' に潰すため、
@@ -173,10 +194,19 @@ function keyRealCwd(key) {
 // 誤判定してしまう(逆にログが消えたり move が失敗する実害になる)。
 // 実 cwd が分かるならそれを使い、account-guard.js の isInsideTree() と同じ、
 // パス区切りの位置がぶれない判定(cwdUnderTree)に揃える。
+// cmdMove は移動してきた行を cwd を書き換えずに追記するだけなので、そのキーの
+// ログが「制限外の cwd から移されてきたレコード」で始まっていることがあり得る。
+// 最初の1件だけを見ると、そのケースで保護ツリーのキーが判定から漏れてしまう
+// (プライバシー機能としては見せてしまう側の誤りになり、fail-open で許してはいけない)。
+// そのため keyCwds(key) が返す「本来その key の記録である cwd」を全件見て、1件でも
+// ツリーの内側にあれば「ツリー内」とする(fail-closed)。本来の記録が何行目にあっても
+// 拾える一方、keyCwds 側で移入レコード・孤児レコードは既に除外済みなので、無関係な
+// key がそれらに引かれて誤って遮断されることはない。該当する cwd が1件も無いときだけ、
+// 従来のキー前方一致に落とす。
 function keyUnderTree(key, treePath) {
-  const cwd = keyRealCwd(key);
-  if (cwd) return cwdUnderTree(cwd, treePath);
-  // 実 cwd が取れない場合だけ、従来のキー前方一致にフォールバックする。境界を
+  const cwds = keyCwds(key);
+  if (cwds.length) return cwds.some((cwd) => cwdUnderTree(cwd, treePath));
+  // 実 cwd が1件も取れない場合だけ、従来のキー前方一致にフォールバックする。境界を
   // 誤って跨ぐ可能性は残るが、プライバシー機能としては見せてしまう側より安全
   const treeKey = projectKey(treePath).toLowerCase();
   if (!treeKey) return false;
