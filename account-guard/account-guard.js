@@ -25,30 +25,18 @@
 const fs = require('fs');
 const path = require('path');
 
-const HOME = process.env.USERPROFILE || process.env.HOME || '.';
-const CREDENTIALS = path.join(HOME, '.claude', '.credentials.json');
-const CONFIG = path.join(HOME, '.claude', 'account-guard', 'config.json');
+// credentials の場所と読み方は swap.js と共有する(credentials.js のコメント参照)。
+const { HOME, ACCOUNT_UNKNOWN, currentAccount } = require('./credentials');
 
-// アカウントを判別できなかったときの値。collect.js と同じ規約。
-const ACCOUNT_UNKNOWN = 'unknown';
+const CONFIG = path.join(HOME, '.claude', 'account-guard', 'config.json');
 
 // 既定では何も保護しない。守るべきツリーは環境ごとに違ううえ、実在するパスを
 // 公開リポジトリに焼き込みたくないため、設定ファイルで明示させる。
 // 設定していない状態に気づけるよう `status` サブコマンドで確認できるようにしてある。
 const DEFAULT_RULES = [];
 
-// 現在ログイン中のアカウント。トークン本体には触れないし記録もしない。
-// credentials に uuid やメールアドレスのような identity フィールドは存在しないため、
-// プラン種別で代用している(2026-08 時点で実測済み)。
-function currentAccount() {
-  try {
-    const t = JSON.parse(fs.readFileSync(CREDENTIALS, 'utf8'))?.claudeAiOauth?.subscriptionType;
-    return typeof t === 'string' && t ? t : ACCOUNT_UNKNOWN;
-  } catch {
-    // 未ログイン・権限不足・将来の構造変更のいずれか。判別不能として扱う。
-    return ACCOUNT_UNKNOWN;
-  }
-}
+// 現在ログイン中のアカウントの取得(currentAccount)は credentials.js にある。
+// トークン本体には触れないし記録もしない。
 
 // パスを比較可能な形に揃える。区切りをスラッシュに統一し、ドライブ文字の大小と
 // 末尾スラッシュの差を吸収する。JSON.stringify を通した文字列ではバックスラッシュが

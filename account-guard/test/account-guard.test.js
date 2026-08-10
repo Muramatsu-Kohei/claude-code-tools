@@ -539,9 +539,14 @@ console.log('account-guard');
 {
   fs.mkdirSync(BASE, { recursive: true });
   const CRASH = path.join(BASE, 'ag-crash.js');
+  // ガード本体は同じディレクトリの credentials.js を require する。コピー先は .tmp なので
+  // 相対参照のままでは解決できない。実体を指す絶対パスへ書き換えてから落とす
+  const credModule = JSON.stringify(path.join(__dirname, '..', 'credentials.js'));
   fs.writeFileSync(
     CRASH,
-    fs.readFileSync(GUARD, 'utf8').replace('function main() {', "function main() {\n  throw new Error('boom');"),
+    fs.readFileSync(GUARD, 'utf8')
+      .replace("require('./credentials')", `require(${credModule})`)
+      .replace('function main() {', "function main() {\n  throw new Error('boom');"),
     'utf8'
   );
   const runCrash = (home, input) => {

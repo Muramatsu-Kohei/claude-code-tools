@@ -10,11 +10,10 @@
 // (§1.3)。したがってタイマーやフックから自動実行してはならない。人が意図して叩くこと。
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
+// credentials の場所と読み方は account-guard.js と共有する(credentials.js のコメント参照)。
+const { HOME, CREDENTIALS, readCredentials, subscriptionTypeOf } = require('./credentials');
 
-const HOME = os.homedir();
-const CREDENTIALS = path.join(HOME, '.claude', '.credentials.json');
 // 退避先を ~/.claude 配下に置くのは、元の credentials と同じ ACL を継承させるため。
 // 平文トークンの本数は増えるが、保護レベルは変わらない(§6.1 の「残るリスク」)。
 const ACCOUNTS_DIR = path.join(HOME, '.claude', 'accounts');
@@ -28,15 +27,15 @@ function fail(msg) {
   process.exit(1);
 }
 
-// credentials を読む。raw を保持するのは、退避時に JSON を再生成せず元のバイト列を
+// credentials を読む。復元に使える中身であることまで確かめる(accessToken が無いものを
+// 復元しても意味がない)。raw を保持するのは、退避時に JSON を再生成せず元のバイト列を
 // そのまま書き戻すため(フィールド順や表記の揺れを持ち込まない)。
 function readCreds(file) {
-  const raw = fs.readFileSync(file, 'utf8');
-  const json = JSON.parse(raw);
-  if (!json || !json.claudeAiOauth || !json.claudeAiOauth.accessToken) {
+  const c = readCredentials(file);
+  if (!c.json || !c.json.claudeAiOauth || !c.json.claudeAiOauth.accessToken) {
     throw new Error('claudeAiOauth.accessToken が無い');
   }
-  return { raw, json };
+  return c;
 }
 
 function readCredsOrNull(file) {
@@ -48,13 +47,15 @@ function readCredsOrNull(file) {
   }
 }
 
-// credentials には uuid やメールアドレスのような identity フィールドが無いため、
-// プラン種別を代用の識別子にする(account-guard.js / claude-window-ping.ps1 と同じ判断)。
-// 同一プランを 2 つ持つ構成では衝突するが、想定は 組織 Team + 個人 Pro の 1 組。
+// プラン種別をそのままファイル名にすると、空白などファイル名に使えない文字が混ざりうる
+// (将来 subscriptionType が "max 20x" のような値になった場合)。弾いて止めてしまうと
+// swap 経由の切り替えが恒久的に不能になるため、名前として使える形に潰して先に進める。
+// 潰すのは退避ファイルの名前だけで、account-guard 側の判定は生の値を使う。
 function accountNameOf(json) {
-  const t = json.claudeAiOauth.subscriptionType;
-  if (typeof t === 'string' && NAME_RE.test(t)) return t;
-  return null;
+  const t = subscriptionTypeOf(json);
+  if (!t) return null;
+  const safe = t.toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return safe || null;
 }
 
 // 書き込み途中で電源が落ちても credentials を壊さないよう、一時ファイル経由で差し替える。
@@ -66,16 +67,33 @@ function writeAtomic(file, data) {
   const tmp = file + '.tmp';
   fs.writeFileSync(tmp, data, { mode: 0o600 });
   fs.chmodSync(tmp, 0o600);
-  fs.renameSync(tmp, file);
+  try {
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    // Windows では移動先を他プロセスが開いていると rename が EPERM で落ちる
+    // (稼働中の Claude Code が credentials を掴んでいる場合)。放置すると平文トークン入りの
+    // .tmp が残るが、一覧は `.json` しか拾わないので誰も気づけない。必ず消してから投げる。
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
 }
 
 // refreshToken には有効期限があり、切れていると復元しても /login のやり直しになる。
 // 期間は公表されていないので日数を決め打ちせず、常にトークン自身の値から残りを出す
 // (2026-08-09 の実測では残り 26 日だった)。
-function expiryNote(json) {
+function msLeft(json) {
   const at = json.claudeAiOauth.refreshTokenExpiresAt;
-  if (typeof at !== 'number') return '';
-  const left = at - Date.now();
+  return typeof at === 'number' ? at - Date.now() : null;
+}
+
+function isExpired(json) {
+  const left = msLeft(json);
+  return left !== null && left <= 0;
+}
+
+function expiryNote(json) {
+  const left = msLeft(json);
+  if (left === null) return '';
   if (left <= 0) return '  [失効済み: /login のやり直しが必要]';
   const days = Math.floor(left / DAY_MS);
   return days <= 1 ? '  [まもなく失効]' : `  [残り ${days} 日]`;
@@ -94,22 +112,41 @@ function accountFile(name) {
   return path.join(ACCOUNTS_DIR, name + '.json');
 }
 
-// 現在ログイン中の認証情報を accounts/<name>.json に退避する。戻り値は退避した名前。
+// 退避先の名前は subscriptionType から導くが、`swap save <明示名>` で別名を付けたスロットも
+// 同じアカウントを指している。名前だけを見て 1 つしか更新しないと、明示名のスロットが
+// 古いスナップショットのまま取り残され、`swap <明示名>` でローテート済みのトークンを
+// 復元して認証が通らなくなる。同じアカウントを指すスロットは揃って更新する。
+// 同一判定に subscriptionType を使うのは identity フィールドが無いため。同一プランを
+// 2 つ持つ構成では区別できないが、それは退避名の衝突と同じ既知の前提(§6.1)。
+function slotsForSameAccount(json, primary) {
+  const names = new Set(primary ? [primary] : []);
+  const type = subscriptionTypeOf(json);
+  if (type) {
+    for (const name of savedAccounts()) {
+      const c = readCredsOrNull(accountFile(name));
+      if (c && subscriptionTypeOf(c.json) === type) names.add(name);
+    }
+  }
+  return [...names];
+}
+
+// 現在ログイン中の認証情報を accounts/ に退避する。戻り値は書き込んだ名前の一覧。
 function saveCurrent(explicitName) {
   const cur = readCredsOrNull(CREDENTIALS);
   if (!cur) return null;
-  const name = explicitName || accountNameOf(cur.json);
-  if (!name) {
+  const primary = explicitName || accountNameOf(cur.json);
+  if (!primary) {
     throw new Error('subscriptionType が読めないため退避名を決められない。名前を明示して save してください');
   }
-  writeAtomic(accountFile(name), cur.raw);
-  return name;
+  const names = slotsForSameAccount(cur.json, primary);
+  for (const name of names) writeAtomic(accountFile(name), cur.raw);
+  return names;
 }
 
 function cmdStatus() {
   const cur = readCredsOrNull(CREDENTIALS);
-  const curName = cur ? accountNameOf(cur.json) : null;
-  console.log('現在のアカウント: ' + (curName || (cur ? '不明(subscriptionType が読めない)' : '未ログイン')));
+  const curType = cur ? subscriptionTypeOf(cur.json) : null;
+  console.log('現在のアカウント: ' + (curType || (cur ? '不明(subscriptionType が読めない)' : '未ログイン')));
   if (cur) console.log('  ' + CREDENTIALS + expiryNote(cur.json));
 
   const saved = savedAccounts();
@@ -120,8 +157,9 @@ function cmdStatus() {
   }
   for (const name of saved) {
     const c = readCredsOrNull(accountFile(name));
-    const mark = name === curName ? '* ' : '  ';
-    console.log(mark + name.padEnd(8) + (c ? expiryNote(c.json) : '  [読めません]'));
+    // 印は名前ではなくプラン種別で合わせる。明示名で退避したスロットにも印が付く
+    const isCurrent = Boolean(c && curType && subscriptionTypeOf(c.json) === curType);
+    console.log((isCurrent ? '* ' : '  ') + name.padEnd(8) + (c ? expiryNote(c.json) : '  [読めません]'));
   }
 }
 
@@ -129,10 +167,10 @@ function cmdSave(name) {
   if (name && !NAME_RE.test(name)) fail('アカウント名に使えない文字が含まれています: ' + name);
   const saved = saveCurrent(name);
   if (!saved) fail('現在の credentials を読めません(未ログインか破損)');
-  console.log('退避しました: ' + saved + ' -> ' + accountFile(saved));
+  console.log('退避しました: ' + saved.join(', ') + ' -> ' + ACCOUNTS_DIR);
 }
 
-function cmdSwap(target) {
+function cmdSwap(target, force) {
   if (!NAME_RE.test(target)) fail('アカウント名に使えない文字が含まれています: ' + target);
 
   const file = accountFile(target);
@@ -144,15 +182,34 @@ function cmdSwap(target) {
   let next;
   try {
     next = readCreds(file);
-  } catch (e) {
-    fail(target + ' の内容が不正です (' + e.message + ')。上書きを中止しました');
+  } catch {
+    // 例外メッセージは出さない。JSON.parse の失敗文はファイル先頭を引用するため、
+    // credentials が相手だとトークンの断片が端末やログに残る
+    fail(target + ' の内容が壊れているか、想定した形式ではありません。上書きを中止しました'
+      + '\n  ファイル: ' + file);
+  }
+
+  // 失効済みの復元先は切り替える前に止める。上書きしてから気づいてもマシン全体が
+  // 未ログインになっており、稼働中の別セッションも次のリクエストで認証エラーになる。
+  if (isExpired(next.json) && !force) {
+    fail(target + ' の refreshToken は失効しています。復元しても /login のやり直しになるため中止しました'
+      + '\n  現在のログインはそのままです。承知のうえで上書きするなら: swap ' + target + ' --force');
   }
 
   const cur = readCredsOrNull(CREDENTIALS);
   const curName = cur ? accountNameOf(cur.json) : null;
 
-  if (curName === target) {
-    console.log('すでに ' + target + ' でログインしています。何もしません');
+  // 同一かどうかは名前ではなくプラン種別で見る。`swap save personal` のような別名スロットは
+  // 名前が現在のアカウント名と一致しないので、名前だけで比べると「切り替え」として処理が進み、
+  // 退避で最新化したスロットを、その前に読み込んだ古い内容で上書きし直してしまう
+  // (現在のログインが古いスナップショットに退化する)。
+  const curType = cur ? subscriptionTypeOf(cur.json) : null;
+  const nextType = subscriptionTypeOf(next.json);
+  const sameAccount = curType && nextType ? curType === nextType : curName === target;
+  if (sameAccount) {
+    console.log(curName === target
+      ? 'すでに ' + target + ' でログインしています。何もしません'
+      : 'すでに ' + target + ' と同じアカウント(' + curType + ')でログインしています。何もしません');
     return;
   }
 
@@ -161,14 +218,22 @@ function cmdSwap(target) {
     if (!curName) {
       fail('現在のアカウント名を判定できないため退避できません。`swap save <name>` で名前を明示してください');
     }
-    writeAtomic(accountFile(curName), cur.raw);
-    console.log('退避: ' + curName);
+    const names = slotsForSameAccount(cur.json, curName);
+    for (const name of names) writeAtomic(accountFile(name), cur.raw);
+    console.log('退避: ' + names.join(', '));
+  } else if (fs.existsSync(CREDENTIALS)) {
+    // 「未ログイン(ファイルが無い)」と「読めない(破損・権限・書き込み中)」を区別する。
+    // 後者で進むと、退避できていない生きた credentials を上書きして復旧不能にする。
+    // Claude Code がトークンを更新している最中にも起こりうるので、黙って進んではいけない。
+    fail('現在の credentials を読めません(破損しているか、他のプロセスが書き込み中)。'
+      + '退避できないため中止しました'
+      + '\n  時間をおいて再実行するか、中身を確認してから `swap save <name>` で退避してください');
   } else {
-    console.log('警告: 現在の credentials を読めないため退避をスキップします');
+    console.log('現在ログインしていないため、退避はしません');
   }
 
   writeAtomic(CREDENTIALS, next.raw);
-  console.log('切り替え: ' + (curName || '不明') + ' -> ' + target + expiryNote(next.json));
+  console.log('切り替え: ' + (curName || 'なし') + ' -> ' + target + expiryNote(next.json));
   console.log('注意: この変更はマシン全体に即座に効きます。稼働中の別セッションも切り替わります');
 }
 
@@ -177,6 +242,7 @@ function usage() {
 
   swap                現在のアカウントと退避済み一覧を表示
   swap <name>         現在を退避してから <name> を復元
+  swap <name> --force 復元先が失効済みでも中止せずに切り替える
   swap save [<name>]  現在のアカウントを退避するだけ(切り替えない)
                       名前を省略すると subscriptionType(team / pro など)を使う
 
@@ -196,8 +262,10 @@ function main() {
     if (rest.length > 1) fail('引数が多すぎます: ' + args.join(' '));
     return cmdSave(rest[0]);
   }
-  if (rest.length > 0) fail('引数が多すぎます: ' + args.join(' '));
-  return cmdSwap(cmd);
+  const force = rest.includes('--force');
+  const extra = rest.filter(a => a !== '--force');
+  if (extra.length > 0) fail('引数が多すぎます: ' + args.join(' '));
+  return cmdSwap(cmd, force);
 }
 
 try {
