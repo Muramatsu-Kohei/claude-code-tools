@@ -136,7 +136,8 @@ function currentAccount() {
 //  session-end / add / summarize はここの関数を一切呼ばない。
 //
 //  判定は 2 段構え:
-//   1. projectKey の前方一致(キー単位。listProjectKeys() 系の経路をまとめて塞げる)
+//   1. キー単位(listProjectKeys() 系の経路をまとめて塞げる)。実 cwd が分かれば
+//      それで cwdUnderTree と同じ精度の判定をし、取れないときだけキー文字列の前方一致に落とす
 //   2. セッションレコードの cwd(記録単位。move 後の孤児などキーだけでは拾えない
 //      取りこぼしを塞ぐ第二の網)
 // ---------------------------------------------------------------------------
@@ -155,12 +156,28 @@ function blockedTrees(cfg, account) {
     .filter((r) => !(Array.isArray(r.allow) && r.allow.includes(account)));
 }
 
-// projectKey の前方一致でツリー配下かを見る。"C--org-treeo" のような別ツリーを
-// 巻き込まないよう、続きが '-'(区切り)か文字列終端であることまで確認する。
-// projectKey() は normPath() 由来でドライブ文字以外の大小をそのまま残すため、
-// ここでも cwdUnderTree() と同じく小文字化してから比較する(Windows は
-// ファイルシステムが case-insensitive なので、大小差だけで制限を素通りさせない)
+// key に対応する実 cwd を1つ読む(cwd を持つ最初のレコード。通常は start)。
+// listProjectKeysRaw() 由来のキーは必ずログファイルが実在するので、ここで
+// レコードが読めないのは「cwd を記録していない古い形式」など稀なケースだけ
+function keyRealCwd(key) {
+  for (const r of readRecords(key)) {
+    if (r && typeof r.cwd === 'string' && r.cwd) return r.cwd;
+  }
+  return null;
+}
+
+// projectKey はドライブ文字以降の区切り文字(':' '/' '\')を全て '-' に潰すため、
+// ディレクトリ名に含まれるリテラルなハイフンと区別がつかない。例えば "C:\foo\bar"
+// と "C:\foo-bar" は projectKey では同じ "C--foo-bar" になり、キーの文字列だけを
+// 前方一致で見ると保護ツリー "C:\foo" に無関係な兄弟 "C:\foo-bar" まで配下と
+// 誤判定してしまう(逆にログが消えたり move が失敗する実害になる)。
+// 実 cwd が分かるならそれを使い、account-guard.js の isInsideTree() と同じ、
+// パス区切りの位置がぶれない判定(cwdUnderTree)に揃える。
 function keyUnderTree(key, treePath) {
+  const cwd = keyRealCwd(key);
+  if (cwd) return cwdUnderTree(cwd, treePath);
+  // 実 cwd が取れない場合だけ、従来のキー前方一致にフォールバックする。境界を
+  // 誤って跨ぐ可能性は残るが、プライバシー機能としては見せてしまう側より安全
   const treeKey = projectKey(treePath).toLowerCase();
   if (!treeKey) return false;
   const k = key.toLowerCase();
@@ -952,12 +969,15 @@ function buildContext(key, cwd, currentSid, cfg) {
   // restrictedTrees は読み出し・表示だけを制限する。ここで cwd 単位に外しておけば、
   // 保護ツリー配下で許可されていないアカウントのセッションには何も注入されなくなる
   // (start の記録自体は cmdSessionStart 側で既に完了しており、この関数を通らない)。
-  // 注記は出さない — SessionStart の自動注入は出力を汚したくないため
+  // 注記は基本的に出さない — SessionStart の自動注入は出力を汚したくないため。
+  // ただし config 破損時は全ツリーが BLOCK_ALL になり、引き継ぎまで無言で消える。
+  // これだけは「引き継ぎ機能が壊れている」という誤解を招くので、他の経路と同じ注記を出す
   const sessions = filterVisibleSessions(
     loadSessions(key).filter((s) => s.sid !== currentSid),
     cfg, currentAccount(),
   );
   const parts = [];
+  if (cfg.configBroken) parts.push(`> ${restrictionNote(cfg, currentAccount())}`);
 
   // どのツールの続きを渡すか。全ツール分の引き継ぎを入れると、まさに避けたかった
   // 「無関係な引き継ぎ」が増えるだけなので、主スコープ 1 本だけを全文にする。
@@ -1487,9 +1507,12 @@ function cmdList(flags) {
   const visible = filterVisibleSessions(rawSessions, cfg, account);
   const all = visible.slice().sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
 
-  // 設定を読めていないことだけは、対象の指定によらず必ず伝える
-  const note = flags.all || cfg.configBroken
-    ? restrictionNote(cfg, account, rawSessions.length - visible.length)
+  // 設定を読めていないことだけは、対象の指定によらず必ず伝える。--project 指定など
+  // 件数注記の対象外でも、cwd 側の第二の網(孤児レコード等)で除外が出た分だけは
+  // 黙って消さずに数える(除外は発生したのに何の表示もない、という抜けを塞ぐ)
+  const hiddenSessions = rawSessions.length - visible.length;
+  const note = flags.all || cfg.configBroken || hiddenSessions > 0
+    ? restrictionNote(cfg, account, hiddenSessions)
     : null;
   // 絞り込みは件数制限より前に掛ける(直近 n 件の中から探すのでは取りこぼす)
   const sessions = (typeof scopeFilter === 'string' ? all.filter((s) => matchScope(s, scopeFilter, cfg)) : all)
@@ -1535,8 +1558,10 @@ function cmdToday(flags) {
     .filter((s) => (s.startTs || 0) >= from)
     .sort((a, b) => (a.startTs || 0) - (b.startTs || 0));
 
-  const note = !flags.project || cfg.configBroken
-    ? restrictionNote(cfg, account, rawSessions.length - visible.length)
+  // --project 指定時も、cwd 側の第二の網で除外が出た分だけは黙って消さず数える
+  const hiddenSessions = rawSessions.length - visible.length;
+  const note = !flags.project || cfg.configBroken || hiddenSessions > 0
+    ? restrictionNote(cfg, account, hiddenSessions)
     : null;
 
   if (!sessions.length) {
@@ -1610,12 +1635,12 @@ function cmdContext(flags) {
 // Windows なら `worklog handoff | clip` でそのままクリップボードに入る。
 function cmdHandoff(flags, scopeArg) {
   const cfg = loadConfig();
+  const account = currentAccount();
   const keys = resolveTargetKeys(flags); // 既にキー単位でフィルタ済み
   // cwd 単位の第二の網もかけておく(move 後の孤児などキーだけでは拾えない取りこぼし対策)
-  let sessions = filterVisibleSessions(
-    keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k }))),
-    cfg, currentAccount(),
-  ).sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
+  const rawSessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })));
+  const visible = filterVisibleSessions(rawSessions, cfg, account);
+  let sessions = visible.slice().sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
   // 位置引数でツールを指定して引き継ぎを切り替える(注入される索引から辿るための入口)
   const scope = scopeArg || one(flags, 'scope');
   if (typeof scope === 'string') {
@@ -1636,7 +1661,18 @@ function cmdHandoff(flags, scopeArg) {
     isOwn = Boolean(h);
   }
   if (!h) {
-    console.log('引き継ぎ文が記録されていない。セッション終了時に /finish を実行すると記録される。');
+    // 「記録が無い」と「制限で見せていない」は意味が違う。cmdList / cmdToday / cmdExport と
+    // 同じく区別しないと、実際には記録済み・/finish 済みの引き継ぎを「未記録」と
+    // 誤って報告してしまう(制限ツリー内では対象セッションが黙って空になるため)
+    const restricted = explicitProjectRestrictionNote(flags, cfg, account);
+    const hiddenSessions = rawSessions.length - visible.length;
+    const note = restricted
+      || (cfg.configBroken || hiddenSessions > 0 ? restrictionNote(cfg, account, hiddenSessions) : null);
+    if (note) {
+      console.log(yellow(`! ${note}`));
+    } else {
+      console.log('引き継ぎ文が記録されていない。セッション終了時に /finish を実行すると記録される。');
+    }
     return;
   }
   // --raw は貼り付け用。見出しや注記を付けずに本文だけ出す
@@ -1673,9 +1709,11 @@ function cmdExport(flags) {
   // export はそのままファイルに保存・共有されうるので、除外があった事実を出力の中に残す。
   // 黙って消すと「記録が消えた」と誤解されるため。--all は件数、--project の明示指定は
   // 「記録が無い」との混同を避けるための個別の案内にする
-  // 設定を読めていないことだけは、対象の指定によらず必ず残す
-  if (flags.all || cfg.configBroken) {
-    const note = restrictionNote(cfg, account, rawSessions.length - visible.length);
+  // 設定を読めていないことだけは、対象の指定によらず必ず残す。--project 指定でも
+  // cwd 側の第二の網で除外が出た分は黙って消さず数える
+  const hiddenSessions = rawSessions.length - visible.length;
+  if (flags.all || cfg.configBroken || hiddenSessions > 0) {
+    const note = restrictionNote(cfg, account, hiddenSessions);
     if (note) out.push(`\n> ${note}`);
   } else {
     const restricted = explicitProjectRestrictionNote(flags, cfg, account);
