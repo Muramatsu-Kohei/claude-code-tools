@@ -590,6 +590,30 @@ function clipToRecentWeekWindows(rows, weeks) {
   });
 }
 
+// 表示中の行が実際にカバーしている 5h枠の window だけを選ぶ。
+//
+// 単純に「表示行の最小時刻〜最大時刻」で絞れないのは、clipToRecentWeekWindows が
+// アカウントごとに切り出すため、絞った結果が単一の連続した時間帯にならないから。
+// --account all では「A は直近1窓ぶんだけ、B は全期間」のような状態になり、全体の
+// レンジで数えると A の落としたはずの古い window まで入って過大になる(注記の
+// window 数が水増しされ、グラフには表示していないデータの境界線が引かれる)。
+// アカウントごとのレンジで判定すれば、どちらの用途でも表示と数字が一致する。
+function windowsWithinRows(windows, rows) {
+  const rangeByAcct = new Map();
+  for (const r of rows) {
+    const cur = rangeByAcct.get(r.acct);
+    if (!cur) rangeByAcct.set(r.acct, { min: r.tsMs, max: r.tsMs });
+    else {
+      if (r.tsMs < cur.min) cur.min = r.tsMs;
+      if (r.tsMs > cur.max) cur.max = r.tsMs;
+    }
+  }
+  return windows.filter((w) => {
+    const range = rangeByAcct.get(w.acct);
+    return range && w.startMs >= range.min && w.startMs <= range.max;
+  });
+}
+
 // 表示範囲の決定。--days を明示したときだけ日数で切り、既定は週次枠の窓単位。
 function clipForChart(rows, opts) {
   if (opts.days) return clipToRecentDays(rows, opts.days);
@@ -615,11 +639,9 @@ function buildTimeSeriesSvg(rows, windows) {
 
   // window 境界(先頭を除く)に薄い縦線を引く。5h枠の切り替わりが一目で分かるように。
   // 表示範囲の外にある境界は捨てる。SVG は overflow: visible なので、残すとプロット領域を
-  // はみ出した位置に縦線が描かれてしまう。
-  const boundaries = windows
-    .slice(1)
-    .filter((w) => w.startMs >= tMin && w.startMs <= tMax)
-    .map((w) => x(w.startMs));
+  // はみ出した位置に縦線が描かれてしまう。範囲判定は windowsWithinRows に任せる
+  // (アカウントごとに切り出された表示範囲を、全体のレンジで見ないため)。
+  const boundaries = windowsWithinRows(windows.slice(1), rows).map((w) => x(w.startMs));
 
   // 5h%/7d% はそれぞれ null で途切れることがあるので、連続する区間ごとに path を切る。
   function buildSegments(key) {
@@ -816,11 +838,7 @@ function buildHtml(result, opts = {}) {
   // 表示範囲を絞るのは時系列グラフだけ。サマリ・回帰・window 一覧は常に全期間を使う。
   // グラフの見た目を変えたつもりが推定値まで変わっていた、という事故を避けるための線引き。
   const chartRows = clipForChart(result.rowsForChart, opts);
-  const shownWindows = chartRows.length
-    ? result.windows.filter(
-        (w) => w.startMs >= chartRows[0].tsMs && w.startMs <= chartRows[chartRows.length - 1].tsMs
-      ).length
-    : 0;
+  const shownWindows = windowsWithinRows(result.windows, chartRows).length;
   const totalWeeks = weekWindowStarts(result.rowsForChart).length;
   const shownWeeks = weekWindowStarts(chartRows).length;
   // --account all では窓数(totalWeeks / shownWeeks)が両アカウントの合計になる一方、
