@@ -86,6 +86,9 @@ function parseArgs(argv) {
   // 混ざると window の同一性判定や週次枠の窓分割が壊れる(詳細は buildWindows /
   // weekWindowStarts のコメント参照)ため、明示的に --account all を指定しない限り
   // 常に単一アカウントだけを見る設計にしている。
+  // 明示指定の有無を残す。指定がなかった回に限り、acct を書いていなかった頃のログを
+  // 今のアカウントのものとして拾う(filterRowsByAccount の includeLegacy)。
+  opts.accountExplicit = opts.account != null;
   if (opts.account == null) opts.account = currentAccount();
   return opts;
 }
@@ -157,6 +160,12 @@ function loadRows(logPath) {
       // collect.js の ACCOUNT_UNKNOWN と同じ値にして、新旧のデータで判別不能行が
       // 別々の名前で分裂しないようにする。
       acct: typeof obj.acct === 'string' && obj.acct ? obj.acct : ACCOUNT_UNKNOWN,
+      // フィールドそのものが無い = アカウント分離を入れる前の記録。値が 'unknown' で
+      // あることとは区別する。collect.js は記録時に credentials を読めなかった回にも
+      // 'unknown' を書くので(未ログイン、/login 中、権限エラー)、値だけを見て
+      // 「移行前だから今のアカウントのもの」と決めると、実際には別アカウントで
+      // 動いていた回の記録を混ぜてしまう。filterRowsByAccount がここを見る。
+      acctLegacy: !('acct' in obj),
       five_pct: isNum(obj.five_pct) ? obj.five_pct : null,
       five_reset_ms: normalizeResetMs(obj.five_reset),
       seven_pct: isNum(obj.seven_pct) ? obj.seven_pct : null,
@@ -184,9 +193,33 @@ function accountBreakdown(rows) {
 // 5時間枠/週次枠はアカウントごとに容量が独立しているため、既定では単一アカウントの
 // 行だけを残す。ACCOUNT_ALL のときだけ素通しし、後段(buildWindows のキーや HTML の
 // 警告表示)で「混在している」ことを扱えるようにする。
-function filterRowsByAccount(rows, account) {
+//
+// includeLegacy は --account を明示しなかった回だけ真になる。acct フィールドを書いて
+// いなかった頃のログは単一アカウント運用時代の記録なので、いまのアカウントのものとして
+// 扱う。これが無いと migrate-account.js をまだ実行していない環境では既定の実行が常に
+// 0件になり、対象が無いまま HTML を作って既存のレポートを空で上書きしていた。
+//
+// 見るのは acctLegacy(フィールドの不在)であって acct の値ではない。値が 'unknown' の行は
+// 記録時にアカウントを判別できなかっただけで、実際には別アカウントの記録でありうる。
+// これを既定の実行で取り込むと、--account の設計そのものが防ごうとしている混在が起きる。
+// --account を明示した回は合流させず、指定した acct を持つ行だけを見る(移行前の行は
+// acct が 'unknown' に落ちるので、--account unknown と明示したときだけ対象に入る)。
+function filterRowsByAccount(rows, account, includeLegacy = false) {
   if (account === ACCOUNT_ALL) return rows;
-  return rows.filter((r) => r.acct === account);
+  // admit 判定(何を対象アカウントの記録とみなすか)はあくまで acctLegacy(フィールドの
+  // 不在)で行う。値が 'unknown' なだけの行(記録時に判別できなかった行)は今までどおり
+  // 弾く。ここまでは従来どおり変えない。
+  //
+  // admit された legacy 行は、そのままだと acct が ACCOUNT_UNKNOWN のまま残り、
+  // buildWindows / clipToRecentWeekWindows / windowsWithinRows がキーやレンジ集計に
+  // r.acct を使っているせいで、対象アカウントの行と別グループに分裂してしまう
+  // (5h枠が更新の前後で2つに割れて回帰対象から漏れる、週次枠の直近 N 窓の絞り込みが
+  // legacy 分と現行分の2系統になり古い legacy 窓まで表示に残る、等)。移行前のログは
+  // 「今のアカウントの記録」として合流させると決めた行なので、グルーピング用に acct を
+  // 対象アカウント値へ付け替えたコピーを返す。元の行オブジェクトは書き換えない
+  // (accountBreakdown など、フィルタ前の allRows を見る側に影響させないため)。
+  return rows.filter((r) => r.acct === account || (includeLegacy && r.acctLegacy))
+    .map((r) => (r.acctLegacy && r.acct !== account ? { ...r, acct: account } : r));
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +239,7 @@ function buildWindows(rows) {
     // ようにするため。融合すると crossedWeeklyReset が誤って立ち、正しい window が
     // 「週次リセット跨ぎ」という誤った理由で回帰から除外されてしまう。
     const fiveKey = r.five_reset_ms == null ? 'unknown' : String(r.five_reset_ms);
-    const key = `${r.acct} ${fiveKey}`;
+    const key = `${r.acct}\u0000${fiveKey}`;
     let w = map.get(key);
     if (!w) {
       w = {
@@ -358,10 +391,10 @@ function regress(points) {
 // に渡すと r.acct(loadRows が必ず文字列に正規化する)と一致せず全行が0件に落ちてしまうため、
 // 「絞り込まない」を表す既存の定数を既定値にして空振りを防ぐ。単一アカウントに絞りたい
 // 呼び出し側(main / CLI)は必ず currentAccount() などで解決した値を明示的に渡すこと。
-function analyze(logPath, account = ACCOUNT_ALL) {
+function analyze(logPath, account = ACCOUNT_ALL, includeLegacy = false) {
   const { rows: allRows, totalLines, skipped, readError } = loadRows(logPath);
   const accountCounts = accountBreakdown(allRows);
-  const rows = filterRowsByAccount(allRows, account);
+  const rows = filterRowsByAccount(allRows, account, includeLegacy);
   const windows = buildWindows(rows);
   const regressionPoints = windows
     .filter((w) => w.excludedReason == null)
@@ -518,28 +551,80 @@ function clipToRecentDays(rows, days) {
 // (リセット時刻が別の値になった = 枠が入れ替わった)なので、日付計算をせずに区切れる。
 // resets_at が欠けた行(セッション開始直後などに起こりうる)は境界の判定に使わない。
 // 欠けを境界とみなすと、実際にはリセットしていない場所で窓が increments されてしまう。
+//
+// prev はアカウントごとに別々に持つ(buildWindows が acct を含む複合キーで window を
+// 区切っているのと同じ理由)。--account all では2アカウントの行が ts 順に交互に並ぶため、
+// 単一の prev で追うと「別アカウントの seven_reset に切り替わった」だけで境界と誤判定し、
+// ほぼ全行が窓の開始点になってしまう。
 function weekWindowStarts(rows) {
   const starts = [];
-  let prev = null;
+  const prevByAcct = new Map();
   for (let i = 0; i < rows.length; i++) {
     const reset = rows[i].seven_reset_ms;
     if (reset == null) continue;
+    const acct = rows[i].acct;
+    const prev = prevByAcct.has(acct) ? prevByAcct.get(acct) : null;
     if (prev === null || reset !== prev) {
       starts.push(i);
-      prev = reset;
+      prevByAcct.set(acct, reset);
     }
   }
   return starts;
 }
 
 // 週次枠の窓単位で直近 weeks 個ぶんに絞る。
+//
+// 窓の境界はアカウントごとに刻まれる(weekWindowStarts のコメント参照)ため、--account all
+// では starts に両アカウントの境界が混ざる。総数をそのまま週数と数えていた頃は、2アカウント
+// 分の記録があるだけで要求した窓数の半分ほどしかカバーしない範囲に切り詰められていた。
+// グラフの注記は要求値のまま出るので、狭まったことに気付けない。
+// アカウントごとに「直近 weeks 個目の窓の開始位置」を求め、その中で最も古い位置から残す。
 function clipToRecentWeekWindows(rows, weeks) {
   if (!weeks || rows.length === 0) return rows;
-  const starts = weekWindowStarts(rows);
-  // 手持ちの窓が要求数以下なら切らない。先頭の窓は途中から記録が始まっていることが
-  // 多いが、それを捨てると初回利用時にグラフが空になる。
-  if (starts.length <= weeks) return rows;
-  return rows.slice(starts[starts.length - weeks]);
+  const startsByAcct = new Map();
+  for (const i of weekWindowStarts(rows)) {
+    const acct = rows[i].acct;
+    if (!startsByAcct.has(acct)) startsByAcct.set(acct, []);
+    startsByAcct.get(acct).push(i);
+  }
+  // 切り出し位置はアカウントごとに持つ。全体を1点で切ると、窓の少ないアカウントに
+  // 引きずられて他方まで切れなくなる(既定の --weeks 1 では、2アカウント目に週次窓が
+  // 1つあるだけで絞り込みが丸ごと効かなくなっていた)。
+  const cutByAcct = new Map();
+  for (const [acct, starts] of startsByAcct) {
+    // 手持ちの窓が要求数以下のアカウントは全部残す。先頭の窓は途中から記録が
+    // 始まっていることが多いが、それを捨てると初回利用時にグラフが空になる。
+    cutByAcct.set(acct, starts.length <= weeks ? -1 : starts[starts.length - weeks]);
+  }
+  // 窓の境界が1つも無いアカウント(seven_reset がまだ記録されていない)は絞り込めないので残す。
+  return rows.filter((r, i) => {
+    const cut = cutByAcct.get(r.acct);
+    return cut === undefined || i >= cut;
+  });
+}
+
+// 表示中の行が実際にカバーしている 5h枠の window だけを選ぶ。
+//
+// 単純に「表示行の最小時刻〜最大時刻」で絞れないのは、clipToRecentWeekWindows が
+// アカウントごとに切り出すため、絞った結果が単一の連続した時間帯にならないから。
+// --account all では「A は直近1窓ぶんだけ、B は全期間」のような状態になり、全体の
+// レンジで数えると A の落としたはずの古い window まで入って過大になる(注記の
+// window 数が水増しされ、グラフには表示していないデータの境界線が引かれる)。
+// アカウントごとのレンジで判定すれば、どちらの用途でも表示と数字が一致する。
+function windowsWithinRows(windows, rows) {
+  const rangeByAcct = new Map();
+  for (const r of rows) {
+    const cur = rangeByAcct.get(r.acct);
+    if (!cur) rangeByAcct.set(r.acct, { min: r.tsMs, max: r.tsMs });
+    else {
+      if (r.tsMs < cur.min) cur.min = r.tsMs;
+      if (r.tsMs > cur.max) cur.max = r.tsMs;
+    }
+  }
+  return windows.filter((w) => {
+    const range = rangeByAcct.get(w.acct);
+    return range && w.startMs >= range.min && w.startMs <= range.max;
+  });
 }
 
 // 表示範囲の決定。--days を明示したときだけ日数で切り、既定は週次枠の窓単位。
@@ -567,11 +652,9 @@ function buildTimeSeriesSvg(rows, windows) {
 
   // window 境界(先頭を除く)に薄い縦線を引く。5h枠の切り替わりが一目で分かるように。
   // 表示範囲の外にある境界は捨てる。SVG は overflow: visible なので、残すとプロット領域を
-  // はみ出した位置に縦線が描かれてしまう。
-  const boundaries = windows
-    .slice(1)
-    .filter((w) => w.startMs >= tMin && w.startMs <= tMax)
-    .map((w) => x(w.startMs));
+  // はみ出した位置に縦線が描かれてしまう。範囲判定は windowsWithinRows に任せる
+  // (アカウントごとに切り出された表示範囲を、全体のレンジで見ないため)。
+  const boundaries = windowsWithinRows(windows.slice(1), rows).map((w) => x(w.startMs));
 
   // 5h%/7d% はそれぞれ null で途切れることがあるので、連続する区間ごとに path を切る。
   function buildSegments(key) {
@@ -725,18 +808,6 @@ function buildHtml(result, opts = {}) {
     </section>
   ` : '';
 
-  // フィルタの結果0行になった場合。異常終了させず、他のどのアカウントなら行があるかを
-  // 案内する(--account の綴り間違い・アカウント未使用のいずれにもその場で気付けるように)。
-  const zeroRowsHtml = result.parsedRows === 0 ? `
-    <section class="account-warning">
-      <h2>対象アカウントの行が見つかりません</h2>
-      <p>アカウント「${esc(accountLabel(result.account))}」に該当する行が usage.jsonl にありません。</p>
-      ${result.allRowsCount > 0
-        ? `<p>内訳(全アカウント):</p><ul>${Object.entries(result.accountCounts).map(([acct, count]) => `<li>${esc(acct)}: ${count} 行</li>`).join('')}</ul>`
-        : `<p>usage.jsonl 自体に行がありません。</p>`}
-    </section>
-  ` : '';
-
   const heroValue = !reg.insufficient
     ? `${reg.windowsToLimitLS.toFixed(1)} 回`
     : reg.reason === 'no_slope' ? '推定不可' : 'データ不足';
@@ -768,14 +839,17 @@ function buildHtml(result, opts = {}) {
   // 表示範囲を絞るのは時系列グラフだけ。サマリ・回帰・window 一覧は常に全期間を使う。
   // グラフの見た目を変えたつもりが推定値まで変わっていた、という事故を避けるための線引き。
   const chartRows = clipForChart(result.rowsForChart, opts);
-  const shownWindows = chartRows.length
-    ? result.windows.filter(
-        (w) => w.startMs >= chartRows[0].tsMs && w.startMs <= chartRows[chartRows.length - 1].tsMs
-      ).length
-    : 0;
+  const shownWindows = windowsWithinRows(result.windows, chartRows).length;
   const totalWeeks = weekWindowStarts(result.rowsForChart).length;
   const shownWeeks = weekWindowStarts(chartRows).length;
-  const scope = opts.days ? `直近 ${opts.days} 日` : `週次枠の直近 ${opts.weeks} 窓`;
+  // --account all では窓数(totalWeeks / shownWeeks)が両アカウントの合計になる一方、
+  // 絞り込みはアカウントごとに直近 N 窓を確保する。指定値と数字が食い違って見えるので、
+  // 何に対する N なのかを文言で示す。
+  const scope = opts.days
+    ? `直近 ${opts.days} 日`
+    : opts.account === ACCOUNT_ALL
+      ? `週次枠の直近 ${opts.weeks} 窓(アカウントごと)`
+      : `週次枠の直近 ${opts.weeks} 窓`;
   // 何を省いたかは必ず書く。黙って切ると「これが全データ」と読まれてしまう。
   const chartNote =
     chartRows.length < result.rowsForChart.length
@@ -817,7 +891,7 @@ function buildHtml(result, opts = {}) {
     --series-five:  #2a78d6; /* categorical slot1: blue */
     --series-seven: #eb6834; /* categorical slot2: orange */
     --regression:   #52514e; /* データではなく推定モデルなので secondary ink */
-    --warn-bg:      #fdf1e6; /* --account all / 0件時の警告バナー用。他の section と混同しないよう暖色にする */
+    --warn-bg:      #fdf1e6; /* --account all の混在警告バナー用。他の section と混同しないよう暖色にする */
     --warn-border:  #e0a33d;
     --warn-ink:     #7a4a06;
   }
@@ -852,7 +926,7 @@ function buildHtml(result, opts = {}) {
   section { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
   section h2 { font-size: 14px; color: var(--ink-2); margin: 0 0 14px; font-weight: 600; }
 
-  /* --account all の混在警告 / 対象0件の案内。他の section と見た目で区別できるよう
+  /* --account all の混在警告。他の section と見た目で区別できるよう
      暖色にして目立たせる(数値だけ見て気付かず誤読するのを防ぐため)。 */
   section.account-warning { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-ink); }
   section.account-warning h2 { color: var(--warn-ink); }
@@ -921,7 +995,6 @@ function buildHtml(result, opts = {}) {
   <h1>Claude Code 使用量レポート — ${esc(accountLabel(result.account))}</h1>
   <p class="meta">ログ: ${esc(result.logPath)} / 対象アカウント: ${esc(accountLabel(result.account))}(対象 ${result.parsedRows} 行 / 全体 ${result.allRowsCount} 行) / 期間: ${esc(fmtDateTime(result.periodStart))} 〜 ${esc(fmtDateTime(result.periodEnd))} / 総行数 ${result.totalLines}(パース不能 ${result.skippedLines}) / window数 ${result.windows.length}</p>
   ${accountWarningHtml}
-  ${zeroRowsHtml}
 
   <section>
     <h2>週次リミットまでの5h枠満タン回数</h2>
@@ -1078,19 +1151,25 @@ function buildHtml(result, opts = {}) {
 
 function main() {
   const opts = parseArgs(process.argv.slice(2));
-  const result = analyze(opts.log, opts.account);
+  const result = analyze(opts.log, opts.account, !opts.accountExplicit);
 
-  fs.mkdirSync(path.dirname(opts.html), { recursive: true });
-  fs.writeFileSync(opts.html, buildHtml(result, opts));
+  // 対象行が0件のときは HTML を書かない。空のレポートで上書きすると、直前まで見えていた
+  // 実績まで消える。--account の綴り間違いや、ログを読めなかったときにも起こる。
+  // 書き換えずに理由だけ出せば、元のレポートは残るしやり直しも効く。
+  const wroteHtml = !(result.readError || result.parsedRows === 0);
+  if (wroteHtml) {
+    fs.mkdirSync(path.dirname(opts.html), { recursive: true });
+    fs.writeFileSync(opts.html, buildHtml(result, opts));
+  }
 
   if (opts.json) {
     // rowsForChart は HTML 用の内部データなので JSON 出力からは外す。
     const { rowsForChart, ...jsonResult } = result;
-    console.log(JSON.stringify({ ...jsonResult, htmlPath: opts.html }, null, 2));
+    console.log(JSON.stringify({ ...jsonResult, htmlPath: wroteHtml ? opts.html : null }, null, 2));
   } else {
     printSummary(result);
     console.log('');
-    console.log(`HTML レポート: ${opts.html}`);
+    console.log(wroteHtml ? `HTML レポート: ${opts.html}` : `対象行が無いため ${opts.html} は更新していません。`);
   }
 }
 
