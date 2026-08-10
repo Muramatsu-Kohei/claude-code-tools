@@ -82,6 +82,19 @@ console.log('account-guard');
   const res = run(home, { hook_event_name: 'PreToolUse', cwd: 'C:/org-tree', tool_name: 'Read', tool_input: {} });
   check('allow が配列でないルールは許可なしとして拒否する', decision(res) === 'deny', JSON.stringify(res));
 }
+{
+  // tree キーを書き損じた(例: path と誤記)ルールは黙って捨てられ、以前は rules が空になって
+  // 保護が丸ごと消えていた(警告なし)。allow の書き損じと違って「守るべきツリー」自体が
+  // 分からないので、config ごと壊れた扱いにして拒否側に倒すことを確かめる。
+  const home = sandbox('deny-malformed-tree', {
+    subscriptionType: 'pro',
+    rawRules: JSON.stringify({ rules: [{ path: 'C:/org-tree', allow: ['team'] }] }),
+  });
+  const res = run(home, { hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Read', tool_input: {} });
+  check('tree を書き損じたルールは config ごと壊れた扱いにする', decision(res) === 'deny', JSON.stringify(res));
+  check('拒否理由に設定ファイルのパスが入る',
+    /config\.json/.test(res?.hookSpecificOutput?.permissionDecisionReason || ''), JSON.stringify(res));
+}
 
 // --- 通過すべきケース ---
 {

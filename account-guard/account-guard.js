@@ -238,11 +238,15 @@ function loadConfig() {
   // rules が配列でないのも書き損じ。空配列を明示した場合だけ「保護なし」として通す。
   if (!Array.isArray(cfg?.rules)) return { rules: DEFAULT_RULES, broken: true };
 
-  // 形の壊れたルールは黙って捨てず、tree だけでも読めれば「許可なし」として扱う。
-  // allow の書き損じで保護が外れるより、拒否側に倒れるほうが安全。
-  const rules = cfg.rules
-    .filter((r) => r && typeof r.tree === 'string' && r.tree)
-    .map((r) => ({ tree: r.tree, allow: Array.isArray(r.allow) ? r.allow : [] }));
+  // tree を書き損じた(キー名の誤記・空文字・非文字列など)ルールは黙って捨てない。
+  // 以前は filter で無言で除外していたため、有効なルールが他になければ rules が [] になり、
+  // 保護が丸ごと外れているのに configBroken は false のまま = 警告も出ないという事故があった。
+  // allow の書き損じは「許可なし」に倒せば安全だが、tree が読めないとどのツリーを
+  // 守るべきかそもそも分からないので、rules 非配列などと同じ扱い(config ごと壊れた=拒否側)に揃える。
+  const badRule = cfg.rules.find((r) => !r || typeof r.tree !== 'string' || !r.tree);
+  if (badRule) return { rules: DEFAULT_RULES, broken: true };
+
+  const rules = cfg.rules.map((r) => ({ tree: r.tree, allow: Array.isArray(r.allow) ? r.allow : [] }));
   return { rules, broken: false };
 }
 
