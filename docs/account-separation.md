@@ -665,7 +665,9 @@ ping を swap.js が自前で `claude -p` して済ませる案は採らない�
 呼び出しは `powershell.exe -NoProfile -ExecutionPolicy Bypass -File <ping.ps1>`。
 ping スクリプトのパスは環境変数 `CLAUDE_WINDOW_PING`、無ければ swap.js から見た
 `../claude-window-keeper/claude-window-ping.ps1`。どちらも無い場合に壊れるのは warmup だけで、
-`swap` / `swap save` は動く（swap.js を単体でコピーした人のため）。
+`swap` / `swap save` は動く（ping スクリプトを持たない人のため）。ただし `credentials.js` は
+swap.js と同じディレクトリに必ず要る。アカウントの読み方をガードと共有しているので、
+これだけは省略できない。
 
 #### 決めたことと理由
 

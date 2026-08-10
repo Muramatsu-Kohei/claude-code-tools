@@ -583,5 +583,40 @@ console.log('account-guard');
   check('保護ルール未設定なら異常終了でも何も拒否しない', res === null, JSON.stringify(res));
 }
 
+// --- credentials.js を隣に置き忘れた構成 ---
+// インストール手順は account-guard.js の置き場所しか案内していないので、1 ファイルだけ
+// コピーする使い方が実際に起こりうる。require をトップレベルで素通しにすると、そこで
+// MODULE_NOT_FOUND が投げられて末尾の catch(異常終了を受け止める仕組み)より先に
+// プロセスが死ぬ。標準出力に何も出ないまま exit 1 で終わるため、Claude Code はブロックせず
+// 処理を続け、保護が丸ごと外れたことに誰も気づけない。判別不能として拒否側に倒すこと。
+{
+  const ALONE = path.join(BASE, 'alone-guard', 'account-guard.js');
+  fs.mkdirSync(path.dirname(ALONE), { recursive: true });
+  fs.copyFileSync(GUARD, ALONE); // credentials.js は意図的に置かない
+
+  const runAlone = (home, input) => {
+    const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+    const out = execFileSync(process.execPath, [ALONE], {
+      env, input: JSON.stringify(input), encoding: 'utf8',
+    });
+    return out.trim() ? JSON.parse(out) : null;
+  };
+
+  // 許可されたアカウント(team)で入っている。credentials.js があれば通る操作なので、
+  // ここで deny が出れば「読めないから拒否側に倒した」ことがはっきりする。
+  const home = sandbox('alone-home', { subscriptionType: 'team', rules: ORG });
+  let res = runAlone(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read',
+    tool_input: { file_path: 'a.py' },
+  });
+  check('credentials.js が無くても保護ツリーは拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = runAlone(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command: 'echo hello' },
+  });
+  check('credentials.js が無くても保護ツリー外は巻き込まない', res === null, JSON.stringify(res));
+}
+
 console.log(`\n  ${state.pass} passed, ${state.fail} failed`);
 process.exit(state.fail ? 1 : 0);

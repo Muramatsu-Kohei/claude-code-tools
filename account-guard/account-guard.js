@@ -26,7 +26,26 @@ const fs = require('fs');
 const path = require('path');
 
 // credentials の場所と読み方は swap.js と共有する(credentials.js のコメント参照)。
-const { HOME, ACCOUNT_UNKNOWN, currentAccount } = require('./credentials');
+//
+// require を素通しで書かないのは、これがトップレベルで投げると末尾の catch
+// (異常終了を受け止めて保護側へ倒す仕組み)より先にプロセスが死ぬため。フックは
+// 標準出力に何も出さないまま exit 1 で終わり、Claude Code はブロックせず処理を続ける。
+// つまり credentials.js を隣に置き忘れた構成では、保護が丸ごと外れたことに誰も
+// 気づけないまま素通しになる。読めなくても「判別不能」として動き続けるほうが安全。
+let credentials = null;
+try {
+  credentials = require('./credentials');
+} catch {
+  // 単体配置・コピー漏れ・権限。下のフォールバックで拒否側に倒す
+}
+
+// HOME の導出だけは自前でも持つ(テストが USERPROFILE / HOME を差し替えるため、
+// os.homedir() ではなく環境変数を見る。credentials.js と同じ規約)。
+const HOME = credentials ? credentials.HOME : (process.env.USERPROFILE || process.env.HOME || '.');
+const ACCOUNT_UNKNOWN = credentials ? credentials.ACCOUNT_UNKNOWN : 'unknown';
+// credentials.js が無ければ誰のログインかを知る手段が無い。ACCOUNT_UNKNOWN は判定側が
+// 拒否に倒す値なので、保護ツリーへの操作は deny され、設定漏れに気づける。
+const currentAccount = credentials ? credentials.currentAccount : () => ACCOUNT_UNKNOWN;
 
 const CONFIG = path.join(HOME, '.claude', 'account-guard', 'config.json');
 
