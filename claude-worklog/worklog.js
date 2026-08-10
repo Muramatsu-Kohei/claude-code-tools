@@ -401,7 +401,7 @@ function listProjectKeysRaw() {
 }
 
 // 全キーを横断して読む経路はすべてここを通るので、restrictedTrees によるキー単位の
-// 除外はここ 1 箇所に入れておけば広く効く(loadAllSessions / resolveTargetKeys(--all) /
+// 除外はここ 1 箇所に入れておけば広く効く(resolveTargetKeySets(--all) /
 // cmdToday の既定 / cmdExport(--all) / resolveMoveKey など)
 function listProjectKeys() {
   return filterVisibleKeys(listProjectKeysRaw(), loadConfig(), currentAccount());
@@ -578,17 +578,6 @@ function foldSessions(records) {
 
 function loadSessions(key) {
   return foldSessions(readRecords(key));
-}
-
-function loadAllSessions() {
-  const cfg = loadConfig();
-  const account = currentAccount();
-  const out = [];
-  for (const key of listProjectKeys()) { // 既にキー単位でフィルタ済み
-    for (const s of loadSessions(key)) out.push({ ...s, project: key });
-  }
-  // cwd 単位の第二の網もかけておく(move 後の孤児などキーだけでは拾えない取りこぼし対策)
-  return filterVisibleSessions(out, cfg, account).sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -1599,7 +1588,12 @@ function cmdList(flags) {
   // 件数注記の対象外でも、cwd 側の第二の網(孤児レコード等)で除外が出た分だけは
   // 黙って消さずに数える(除外は発生したのに何の表示もない、という抜けを塞ぐ)
   const hiddenSessions = rawSessions.length - visible.length;
-  const note = flags.all || cfg.configBroken || hiddenSessions > 0
+  // scope 内でキー単位に伏せた数。--project が保護ツリーと可視のプロジェクトの両方に
+  // 一致した場合、セッションは可視キーからしか読まないので hiddenSessions は 0 になり、
+  // 一覧も空にならないので個別の案内(explicitProjectRestrictionNote)も出ない。
+  // ここを数えないと、保護ツリーのプロジェクトが何の表示もないまま消える
+  const hiddenKeys = scopeKeys.length - keys.length;
+  const note = flags.all || cfg.configBroken || hiddenSessions > 0 || hiddenKeys > 0
     ? restrictionNote(cfg, account, hiddenSessions, scopeKeys)
     : null;
   // 絞り込みは件数制限より前に掛ける(直近 n 件の中から探すのでは取りこぼす)
@@ -1617,7 +1611,8 @@ function cmdList(flags) {
         ? `スコープ「${scopeFilter}」に一致する記録がない。`
         : '記録がまだない。フックを設定したか、対象プロジェクトが合っているか確認する。');
     }
-    if (note) console.log(yellow(`! ${note}`));
+    // 個別の案内を出したときは件数の注記を重ねない(同じことを二度言うことになる)
+    if (note && !restricted) console.log(yellow(`! ${note}`));
     return;
   }
   const where = showProject ? '全プロジェクト' : keys.map((k) => repoLabel(k, all)).join(', ');
@@ -1649,7 +1644,10 @@ function cmdToday(flags) {
 
   // --project 指定時も、cwd 側の第二の網で除外が出た分だけは黙って消さず数える
   const hiddenSessions = rawSessions.length - visible.length;
-  const note = !flags.project || cfg.configBroken || hiddenSessions > 0
+  // キー単位で伏せた分も数える(cmdList と同じ理由。--project が保護ツリーと可視の
+  // プロジェクトの両方に一致すると、どちらの網にも現れないまま静かに消えるため)
+  const hiddenKeys = scopeKeys.length - keys.length;
+  const note = !flags.project || cfg.configBroken || hiddenSessions > 0 || hiddenKeys > 0
     ? restrictionNote(cfg, account, hiddenSessions, scopeKeys)
     : null;
 
@@ -1662,7 +1660,8 @@ function cmdToday(flags) {
     } else {
       console.log(days > 1 ? `直近 ${days} 日の記録はない。` : '今日の記録はまだない。');
     }
-    if (note) console.log(yellow(`! ${note}`));
+    // 個別の案内を出したときは件数の注記を重ねない
+    if (note && !restricted) console.log(yellow(`! ${note}`));
     return;
   }
   let currentDay = null;
@@ -1729,6 +1728,10 @@ function cmdHandoff(flags, scopeArg) {
   // cwd 単位の第二の網もかけておく(move 後の孤児などキーだけでは拾えない取りこぼし対策)
   const rawSessions = keys.flatMap((k) => loadSessions(k).map((s) => ({ ...s, project: k })));
   const visible = filterVisibleSessions(rawSessions, cfg, account);
+  // 伏せた件数はここで数える。引き継ぎが見つかった場合でも、より新しい引き継ぎが制限で
+  // 伏せられている可能性があり、黙って古いほうを渡すと「これが最新」と誤解されるため
+  const hiddenSessions = rawSessions.length - visible.length;
+  const hiddenKeys = scopeKeys.length - keys.length;
   let sessions = visible.slice().sort((a, b) => (b.startTs || 0) - (a.startTs || 0));
   // 位置引数でツールを指定して引き継ぎを切り替える(注入される索引から辿るための入口)
   const scope = scopeArg || one(flags, 'scope');
@@ -1754,9 +1757,10 @@ function cmdHandoff(flags, scopeArg) {
     // 同じく区別しないと、実際には記録済み・/finish 済みの引き継ぎを「未記録」と
     // 誤って報告してしまう(制限ツリー内では対象セッションが黙って空になるため)
     const restricted = explicitProjectRestrictionNote(flags, cfg, account);
-    const hiddenSessions = rawSessions.length - visible.length;
     const note = restricted
-      || (cfg.configBroken || hiddenSessions > 0 ? restrictionNote(cfg, account, hiddenSessions, scopeKeys) : null);
+      || (cfg.configBroken || hiddenSessions > 0 || hiddenKeys > 0
+        ? restrictionNote(cfg, account, hiddenSessions, scopeKeys)
+        : null);
     if (note) {
       console.log(yellow(`! ${note}`));
     } else {
@@ -1775,6 +1779,12 @@ function cmdHandoff(flags, scopeArg) {
   console.log(h.text);
   if (isOwn) console.log(dim('\n(注: 他セッションの引き継ぎは無く、これはこのセッション自身が記録したもの)'));
   if (!h.explicit) console.log(dim('\n(/finish の引き継ぎ文ではなく「次にやること」から生成)'));
+  // 出せた引き継ぎより新しいものが制限で伏せられていることがある。何も言わずに古いほうを
+  // 渡すと「これが最新」と受け取られるため、伏せた事実だけは添える(中身は出さない)
+  if (hiddenKeys > 0 || hiddenSessions > 0) {
+    const note = restrictionNote(cfg, account, hiddenSessions, scopeKeys);
+    if (note) console.log(dim(`\n(${note}。より新しい引き継ぎがそちらにある可能性がある)`));
+  }
 }
 
 function cmdExport(flags) {
@@ -1801,12 +1811,16 @@ function cmdExport(flags) {
   // 設定を読めていないことだけは、対象の指定によらず必ず残す。--project 指定でも
   // cwd 側の第二の網で除外が出た分は黙って消さず数える
   const hiddenSessions = rawSessions.length - visible.length;
-  if (flags.all || cfg.configBroken || hiddenSessions > 0) {
+  // キー単位で伏せた分も数える(cmdList と同じ理由)。個別の案内が出せるときはそちらを
+  // 優先する — 「N 件のプロジェクト」より「そのプロジェクトは制限されている」のほうが
+  // 名指しで問い合わせた利用者には正確に伝わる
+  const hiddenKeys = scopeKeys.length - keys.length;
+  const restricted = explicitProjectRestrictionNote(flags, cfg, account);
+  if (restricted) {
+    out.push(`\n> ${restricted}`);
+  } else if (flags.all || cfg.configBroken || hiddenSessions > 0 || hiddenKeys > 0) {
     const note = restrictionNote(cfg, account, hiddenSessions, scopeKeys);
     if (note) out.push(`\n> ${note}`);
-  } else {
-    const restricted = explicitProjectRestrictionNote(flags, cfg, account);
-    if (restricted) out.push(`\n> ${restricted}`);
   }
   out.push('');
   let day = null;

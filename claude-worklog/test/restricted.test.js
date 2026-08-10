@@ -121,6 +121,32 @@ const exportProjectBlocked = worklog(['export', '--project', TREE]);
 check('export --project でも同様に制限の案内が出る(保存されるファイルに残る形)',
   /別アカウント専用のツリーのため.*表示していない/.test(exportProjectBlocked.out), exportProjectBlocked.out);
 
+// 個別の案内(explicitProjectRestrictionNote)を出したときは、件数ベースの注記
+// (restrictionNote)を重ねない。同じ除外を二重に言うと読みにくいだけでなく、
+// 「対象が全部制限されているときは個別の案内を優先し、件数の注記は出さない」という
+// 出し分けの前提が崩れていないかを確かめられる
+check('--project で保護ツリーを名指しした個別の案内には、件数の注記を重ねない(list)',
+  !listProjectBlocked.out.includes('件のプロジェクトを表示していません'), listProjectBlocked.out);
+check('--project で保護ツリーを名指しした個別の案内には、件数の注記を重ねない(export)',
+  !exportProjectBlocked.out.includes('件のプロジェクトを表示していません'), exportProjectBlocked.out);
+
+// --project にツリー名の一部だけを渡すと、前方一致で複数のキーに部分一致することがある
+// (保護ツリー org-tree と、無関係な別ツリー org-treeo)。この場合セッションは可視キー
+// (org-treeo)からしか読まれないため hiddenSessions は 0 のままで、一覧も空にならない
+// ので個別の案内も出ない。キー単位で伏せた数(hiddenKeys)を見ないと、保護ツリーが
+// 何の注記もなく黙って消える — 「除外を黙って隠さない」という不変条件そのものの確認
+const listPartialMatch = worklog(['list', '--project', 'org-tree', '-n', '20']).out;
+check('--project の部分一致では似た名前ツリーの記録は出る',
+  listPartialMatch.includes('似た名前ツリーの作業'), listPartialMatch);
+check('--project の部分一致でも保護ツリーの記録は出ない',
+  !listPartialMatch.includes('保護ツリーの作業'), listPartialMatch);
+check('--project の部分一致が保護ツリーにも当たったことを件数の注記で伝える(list)',
+  /別アカウント専用のツリーのため 1 件のプロジェクトを表示していません/.test(listPartialMatch), listPartialMatch);
+
+const exportPartialMatch = worklog(['export', '--project', 'org-tree']).out;
+check('export --project の部分一致でも同様に件数の注記が出力に残る(保存されるファイルの中身)',
+  /別アカウント専用のツリーのため 1 件のプロジェクトを表示していません/.test(exportPartialMatch), exportPartialMatch);
+
 const exportBlocked = worklog(['export', '--all']).out;
 check('export --all でも保護ツリーが出ない', !exportBlocked.includes('保護ツリーの作業'), exportBlocked);
 check('export --all にも注記が残る(保存されるファイルなので黙って消さない)',
@@ -241,6 +267,21 @@ const todayProjectBlocked = worklog(['today', '--days', '3650', '--project', TRE
 check('today --project で保護ツリーを名指しすると制限の案内が出る(「記録はまだない」ではない)',
   /別アカウント専用のツリーのため.*表示していない/.test(todayProjectBlocked)
     && !todayProjectBlocked.includes('記録はまだない'), todayProjectBlocked);
+check('today --project で保護ツリーを名指しした個別の案内には、件数の注記を重ねない',
+  !todayProjectBlocked.includes('件のプロジェクトを表示していません'), todayProjectBlocked);
+
+// list/export と同じく、today --project でも部分一致が保護ツリーと可視のプロジェクトの
+// 両方に当たったケースを確かめる。today は既定こそ全プロジェクト横断で件数の注記を出すが、
+// --project を明示した今回はその横断をしていないため、hiddenKeys を見ないと保護ツリー分
+// だけが黙って消える(list/export と同じ不変条件)
+const todayPartialMatch = worklog(['today', '--days', '3650', '--project', 'org-tree']).out;
+check('today --project の部分一致では似た名前ツリーの記録は出る',
+  todayPartialMatch.includes('似た名前ツリーの作業'), todayPartialMatch);
+check('today --project の部分一致でも保護ツリーの記録は出ない',
+  !todayPartialMatch.includes('保護ツリーの作業'), todayPartialMatch);
+check('today --project の部分一致が保護ツリーにも当たったことを件数の注記で伝える',
+  /別アカウント専用のツリーのため 1 件のプロジェクトを表示していません/.test(todayPartialMatch), todayPartialMatch);
+
 const todayProjectOther = worklog(['today', '--days', '3650', '--project', OTHER]).out;
 check('today --project で無関係なツリーを指定したら件数の注記は出ない',
   !todayProjectOther.includes('件のプロジェクトを表示していません'), todayProjectOther);
