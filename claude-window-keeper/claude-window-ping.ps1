@@ -107,36 +107,20 @@ function Write-Log([string]$msg, [switch]$ConsoleOnly) {
     Add-Content -Path $logFile -Value $line
 }
 
-# アカウント分離導入前は state.json（無印）1本だった名残。新パス state-<account>.json が
-# 無いのに旧 state.json だけ残っている場合、これを読まずに起動すると $lastPing が $null の
-# ままスキップ判定（150行目付近）を素通りしてしまい、次の毎時実行で本物の claude -p Ping が
-# 送られて枠が意図しない時刻に張り直る。これはこのツールが防ぐべき事象そのものなので、
-# 旧ファイルを読み元として引き継ぐ。
-#
-# ただしリネームによる「移行」はしない。旧形式にはどのアカウントの記録かが書かれておらず、
-# たまたまログイン中だったほうへ移すと、実際に Ping していた側の前回時刻が失われる。
-# 失った側は上に書いた素通りを起こし、移された側は打っていない Ping を打った扱いになる。
-# どちらのアカウントで走っても読むだけにすれば、記録は消えず判定も働く。
-#
-# 旧記録はアカウント不明のまま使うので、別アカウントで走った回は「他方の Ping」を自分の
-# ものと見て待つ側に倒れる。枠を意図しない時刻に張り直すより、待って次の毎時実行に回す
-# ほうが害が小さいという判断。そのアカウントで一度 Ping すれば state-<account>.json が
-# でき、以降は旧ファイルを見ない（旧ファイルは残るが、両方が揃えば手で消してよい）。
-$legacyStateFile = Join-Path $stateDir "state.json"
-$stateSource     = $stateFile
-$usingLegacyState = $false
-if ((Test-Path $legacyStateFile) -and (-not (Test-Path $stateFile))) {
-    $stateSource = $legacyStateFile
-    $usingLegacyState = $true
-}
+# アカウント分離導入前は state.json（無印）1本だった名残があるが、旧ファイルは読まない。
+# どのアカウントの記録か書かれておらず、たまたまログイン中のアカウントに紐付けると、
+# team で運用してきた環境で個人アカウントに切り替えた直後などに「まだ枠の途中」と
+# 誤読して Ping を見送ってしまう（枠が張り直されないまま気付けない、このツールが
+# 最も避けたい事象）。新パス state-<account>.json が無ければ「前回 Ping なし」として
+# 扱い、素直に Ping を送る。失うのはアップグレード直後の余分な Ping 1 回だけ。
 
 # 前回のPing時間をログから復元
 $lastPing = $null
-if (Test-Path $stateSource) {
+if (Test-Path $stateFile) {
     try {
-        $state = Get-Content $stateSource -Raw | ConvertFrom-Json
-        if ($state.lastPing) { 
-            $lastPing = [datetime]$state.lastPing 
+        $state = Get-Content $stateFile -Raw | ConvertFrom-Json
+        if ($state.lastPing) {
+            $lastPing = [datetime]$state.lastPing
         }
     } catch {
         Write-Log ("WARN  could not read state file: " + $_.Exception.Message)
@@ -149,11 +133,6 @@ $now = Get-Date
 if ($Status) {
     # 枠はアカウントごとに独立しているので、どのアカウントの状態を見ているかを最初に示す
     Write-Host ("Account        : " + $account)
-    if ($usingLegacyState) {
-        # 旧形式にはアカウントが書かれていない。下に出る前回時刻が、いま表示している
-        # アカウントのものとは限らないことを明示する（他方のアカウントの Ping かもしれない）
-        Write-Host ("State source   : state.json (legacy; account not recorded)")
-    }
     if ($lastPing) {
         $elapsed = $now - $lastPing
         $reset   = $lastPing.AddMinutes($WindowMinutes)
@@ -184,7 +163,9 @@ if ($Status) {
 # -Force でも送らないのは、押し切っても「どの枠を張り直したのか」が分からないため。
 # ログインし直せば解消するので、記録を汚さず見送るほうが安い。
 if ($account -eq "unknown") {
-    Write-Log "WARN  account not identified; ping skipped (log in, then re-run)"
+    # 判別不能はログイン状態が変わるまで毎時発生しうる。ファイルに残すと SKIP と同様に
+    # 本来の PING/STATE 履歴を押し出してしまうため、SKIP に揃えて画面のみに留める
+    Write-Log -ConsoleOnly "WARN  account not identified; ping skipped (log in, then re-run)"
     return
 }
 
@@ -265,12 +246,6 @@ Write-Log ("PING  sent (model={0}); reply: {1}" -f $Model, $replyText)
 
 # ログの更新
 $now = Get-Date
-# 旧 state.json を読み元にしていた回は、ここで初めてこのアカウント用のファイルができる。
-# 記録は Ping を実際に送ったときだけなので毎時のログを埋めない（毎回出していた頃は、
-# アカウントを判別できない環境では新ファイルが永久にできず、1日24行が延々と積もった）。
-if ($usingLegacyState) {
-    Write-Log ("STATE was reading legacy state.json (account not recorded); now writing " + (Split-Path $stateFile -Leaf))
-}
 @{ lastPing = $now.ToString("o") } | ConvertTo-Json | Set-Content -Path $stateFile
 $reset = $now.AddMinutes($WindowMinutes)
 Write-Log ("STATE lastPing updated; est. window reset at " + $reset.ToString("yyyy-MM-dd HH:mm:ss"))
