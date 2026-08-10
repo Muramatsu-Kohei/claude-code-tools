@@ -195,7 +195,7 @@ check('F1: config の tree の大小が実際のキーと違っても保護ツ�
 // spec を cwd 相対パスとして解釈した「存在しないキー」を捏造してそこへ move してしまう。
 // TREE を使うと「似た名前の別ツリー」SIMILAR が部分一致で先に拾われてしまい再現できないため、
 // 専用のサンドボックスに紛れない名前の保護ツリーを別途用意する
-const MOVE_TREE = path.join(BASE, 'org-tree'); // 課題文中の例と同じ名前にする(保護ツリー、move 専用)
+const MOVE_TREE = path.join(BASE, 'move-tree'); // 保護ツリー(move 専用)。TREE と別名にして SIMILAR に紛れないようにする
 fs.mkdirSync(MOVE_TREE, { recursive: true });
 execFileSync('git', ['init', '-q'], { cwd: MOVE_TREE, windowsHide: true });
 const { home: home4, logDir: logDir4 } = sandboxHome(
@@ -216,7 +216,7 @@ const worklog4 = runner(home4, OTHER);
 // エラーは worklog.js 側の共通 catch が errors.log にも残すので、比較対象は
 // .ndjson(プロジェクトのログファイル)だけに絞る
 const ndjsonBeforeMove = fs.readdirSync(logDir4).filter((f) => f.endsWith('.ndjson'));
-const moveToBlocked = worklog4(['move', '--from', 'other-repo', '--to', 'org-tree', '--all']);
+const moveToBlocked = worklog4(['move', '--from', 'other-repo', '--to', 'move-tree', '--all']);
 check('F4: 制限キーにしか一致しない --to は move を拒否する(exit 1)',
   moveToBlocked.code === 1, `code=${moveToBlocked.code} ${moveToBlocked.out}${moveToBlocked.err}`);
 check('F4: 拒否の理由が制限だと分かる', /別アカウント専用のツリーのため/.test(moveToBlocked.err), moveToBlocked.err);
@@ -227,7 +227,7 @@ check('F4: 移動元(OTHER)のログも書き換えない',
   fs.readFileSync(path.join(logDir4, `${projectKey(OTHER)}.ndjson`), 'utf8').includes('無関係ツリーの作業(move用)'),
   fs.readFileSync(path.join(logDir4, `${projectKey(OTHER)}.ndjson`), 'utf8'));
 
-// F5: F4 は spec が既存キー(org-tree)に部分一致する場合の拒否だったが、resolveMoveKey の
+// F5: F4 は spec が既存キー(move-tree)に部分一致する場合の拒否だったが、resolveMoveKey の
 // rawHit チェックは「ディスク上に実在するキーに一致した」場合しか働かない。保護ツリー配下の
 // 未使用パス(既存のどのキー名にも部分一致しない)を --to に渡すと rawHit が空のまま
 // allowNew のフォールバックに進み、repoKey(spec) で保護ツリー配下の新規キーを捏造して
