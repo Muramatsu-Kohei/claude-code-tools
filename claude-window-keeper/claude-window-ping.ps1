@@ -84,8 +84,19 @@ function Get-ClaudeAccount {
 $account   = Get-ClaudeAccount
 $stateFile = Join-Path $stateDir ("state-{0}.json" -f $account)
 
+# 判別不能（$account -eq "unknown")を最初に通知済みかどうかの目印。中身は使わず存在だけ見る
+$unknownNotifiedFile = Join-Path $stateDir "state-unknown.notified"
+
 if (-not (Test-Path $stateDir)) {
     New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+}
+
+# アカウントを判別できた回（unknown 以外で処理が進められる回）はマーカーを消す。
+# -Status のような Ping を送らない経路も含めるのは、それも「今回は判別できた」という
+# 事実が確認できる機会であり、ここで消し忘れると次にまた判別不能へ戻ったときの
+# 初回通知が復活しない（マーカーが残ったままだと以後ずっと -ConsoleOnly になってしまう）。
+if ($account -ne "unknown" -and (Test-Path $unknownNotifiedFile)) {
+    Remove-Item -Path $unknownNotifiedFile -Force
 }
 
 # ログは追記され続けるため、この大きさを超えたら 1 世代だけ退避して作り直す
@@ -163,9 +174,20 @@ if ($Status) {
 # -Force でも送らないのは、押し切っても「どの枠を張り直したのか」が分からないため。
 # ログインし直せば解消するので、記録を汚さず見送るほうが安い。
 if ($account -eq "unknown") {
-    # 判別不能はログイン状態が変わるまで毎時発生しうる。ファイルに残すと SKIP と同様に
-    # 本来の PING/STATE 履歴を押し出してしまうため、SKIP に揃えて画面のみに留める
-    Write-Log -ConsoleOnly "WARN  account not identified; ping skipped (log in, then re-run)"
+    # 判別不能はログイン状態が変わるまで毎時発生しうる点は SKIP と同じだが、SKIP と違って
+    # 一時的とは限らない。新しいマシン、資格情報を別の場所に置いた、権限エラーなど原因が
+    # 持続すると、この分岐が毎回の実行の終着点になり、5 時間枠は二度と張り直されない。
+    # それでいて何も残さなければ「タスクが動いていない」のと見分けがつかず、無音のまま
+    # 何時間・何日も気付けない。SKIP のように毎時ファイルへ積み上げては元の PING/STATE
+    # 履歴を押し出してしまうので、状態が変わったとき（＝初回）だけファイルに残し、
+    # 2 回目以降はマーカーがある間 -ConsoleOnly に切り替えて積み上げを防ぐ。
+    if (Test-Path $unknownNotifiedFile) {
+        Write-Log -ConsoleOnly "WARN  account not identified; ping skipped (log in, then re-run)"
+    } else {
+        Write-Log "WARN  account not identified; ping skipped (log in, then re-run)"
+        # 中身はデバッグ用のタイムスタンプ程度で、判定には存在有無しか使わない
+        $now.ToString("o") | Set-Content -Path $unknownNotifiedFile
+    }
     return
 }
 
