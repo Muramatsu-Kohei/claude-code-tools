@@ -107,27 +107,27 @@ function Write-Log([string]$msg, [switch]$ConsoleOnly) {
     Add-Content -Path $logFile -Value $line
 }
 
-# アカウント分離導入前は state.json（無印）1本だった名残の移行処理。
-# 新パス state-<account>.json が無いのに旧 state.json だけ残っている場合、移行せずに
-# 起動すると $lastPing が $null のままスキップ判定（150行目付近）を素通りしてしまい、
-# 次の毎時実行で本物の claude -p Ping が送られて枠が意図しない時刻に張り直る。
-# これはこのツールが防ぐべき事象そのものなので、旧ファイルはリネームして引き継ぐ。
+# アカウント分離導入前は state.json（無印）1本だった名残。新パス state-<account>.json が
+# 無いのに旧 state.json だけ残っている場合、これを読まずに起動すると $lastPing が $null の
+# ままスキップ判定（150行目付近）を素通りしてしまい、次の毎時実行で本物の claude -p Ping が
+# 送られて枠が意図しない時刻に張り直る。これはこのツールが防ぐべき事象そのものなので、
+# 旧ファイルを読み元として引き継ぐ。
 #
-# ただし移行は一方向で取り消せないので、行き先を間違えないことのほうが大事になる。
-#  - $account が unknown（未ログイン、/login 中で credentials を読めない、タスクが別ユーザーの
-#    資格で走った等）のまま移すと state-unknown.json に退避され、本来のアカウントの記録が
-#    失われる。それこそが上に書いた「素通り」を招くので、判別できない回は移さず読むだけにする。
-#  - -Status は状態を見るだけのつもりで叩かれる。読み取り専用の実行でファイルを動かさない。
-# どちらの場合も旧ファイルをそのまま読み元にすれば、移行を先送りしても判定は正しく働く。
+# ただしリネームによる「移行」はしない。旧形式にはどのアカウントの記録かが書かれておらず、
+# たまたまログイン中だったほうへ移すと、実際に Ping していた側の前回時刻が失われる。
+# 失った側は上に書いた素通りを起こし、移された側は打っていない Ping を打った扱いになる。
+# どちらのアカウントで走っても読むだけにすれば、記録は消えず判定も働く。
+#
+# 旧記録はアカウント不明のまま使うので、別アカウントで走った回は「他方の Ping」を自分の
+# ものと見て待つ側に倒れる。枠を意図しない時刻に張り直すより、待って次の毎時実行に回す
+# ほうが害が小さいという判断。そのアカウントで一度 Ping すれば state-<account>.json が
+# でき、以降は旧ファイルを見ない（旧ファイルは残るが、両方が揃えば手で消してよい）。
 $legacyStateFile = Join-Path $stateDir "state.json"
 $stateSource     = $stateFile
 if ((Test-Path $legacyStateFile) -and (-not (Test-Path $stateFile))) {
-    if ($Status -or $account -eq "unknown") {
-        $stateSource = $legacyStateFile
-    } else {
-        Move-Item -Path $legacyStateFile -Destination $stateFile
-        Write-Log ("STATE migrated legacy state.json -> " + (Split-Path $stateFile -Leaf))
-    }
+    $stateSource = $legacyStateFile
+    # 旧記録に頼っている回であることを後から追えるようにする（-Status は読むだけなので静かに）
+    if (-not $Status) { Write-Log "STATE reading legacy state.json (account not recorded in old format)" }
 }
 
 # 前回のPing時間をログから復元
