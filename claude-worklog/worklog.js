@@ -167,14 +167,25 @@ function blockedTrees(cfg, account) {
 // 「本来の記録である cwd が1件も無かった」という結果も Map に積んで、毎回ファイルを
 // 読み直すことを防ぐ。
 //
-// なぜ全 cwd ではなく projectKey(cwd) がその key 自身と一致する cwd だけを見るのか:
+// なぜ全 cwd ではなく key から導ける cwd だけを見るのか:
 // keyUnderTree が知りたいのは「この key は本来どのツリーの記録か」であって、「この
 // ファイルに保護ツリーの記録が混じっているか」ではない。後者まで拾うと、cmdMove の
 // 移入レコードや孤児レコード(cwd から計算した key がファイル自身の key と食い違う行)
 // によって無関係な key ごと遮断してしまい、そうした行を個別に隠すのは record 単位の
 // 第二の網(isCwdBlocked/filterVisibleSessions)の役目なのに、それを key 単位の網が
-// 先取りして壊すことになる。cwd から計算した key が一致する行だけを見れば、move で
-// ファイルの何行目に紛れ込んでいても「本来そのキーの記録」だけを正しく拾える。
+// 先取りして壊すことになる。本来の記録だけを見れば、move でファイルの何行目に
+// 紛れ込んでいても正しく拾える。
+//
+// 判定に完全一致を使えないのは、キーと cwd の作られ方がずれているため。キーは
+// repoKey(cwd) つまり git のルートから作られる(親で開いても子で開いても同じ
+// プロジェクトに記録するため)のに、レコードにはセッションの生の cwd が入る。
+// リポジトリのサブディレクトリで開いたセッションは projectKey(cwd) がキーより
+// 深くなるので、完全一致だけを見ると本来の記録が丸ごと落ちてフォールバックの
+// キー前方一致に戻ってしまう。そこで key 自身に加えて key + '-' で始まるものも
+// 受け入れる。projectKey の区切り潰しにより "C--foo-bar" が C:\foo のサブ
+// ディレクトリか兄弟ツリー C:\foo-bar かは文字列だけでは区別できないが、
+// 採否を決めるのは最終的に cwdUnderTree のパス区切りベースの判定なので、
+// ここで多めに拾っても兄弟ツリーが配下と誤判定されることはない。
 const keyCwdsCache = new Map();
 function keyCwds(key) {
   if (keyCwdsCache.has(key)) return keyCwdsCache.get(key);
@@ -182,7 +193,10 @@ function keyCwds(key) {
   const cwds = readRecords(key)
     .map((r) => (r && typeof r.cwd === 'string' && r.cwd) || null)
     .filter(Boolean)
-    .filter((cwd) => projectKey(cwd).toLowerCase() === k);
+    .filter((cwd) => {
+      const ck = projectKey(cwd).toLowerCase();
+      return ck === k || ck.startsWith(`${k}-`);
+    });
   keyCwdsCache.set(key, cwds);
   return cwds;
 }
