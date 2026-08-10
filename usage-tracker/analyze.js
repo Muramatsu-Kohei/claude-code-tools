@@ -206,7 +206,7 @@ function buildWindows(rows) {
     // ようにするため。融合すると crossedWeeklyReset が誤って立ち、正しい window が
     // 「週次リセット跨ぎ」という誤った理由で回帰から除外されてしまう。
     const fiveKey = r.five_reset_ms == null ? 'unknown' : String(r.five_reset_ms);
-    const key = `${r.acct} ${fiveKey}`;
+    const key = `${r.acct}\u0000${fiveKey}`;
     let w = map.get(key);
     if (!w) {
       w = {
