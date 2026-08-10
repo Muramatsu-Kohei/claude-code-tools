@@ -219,9 +219,14 @@ function targetStrings(toolName, toolInput, cwd, trees = []) {
   // secret` は絶対パスの形にも区切り付き相対パスの形にもならず、文字列全体の突き合わせ
   // にも当たらないため、実際の読み出しがそのまま通っていた(`cd <ツリー名>/ && …` と
   // 末尾に区切りを付けただけで拒否されるのに、付けないと通るという食い違い)。
-  // 誤検知が増えるのは「cwd がちょうどツリーの親で、かつツリー名そのものを書いたとき」に
-  // 限られる一方、見逃しは保護の穴そのものなので、冒頭の方針どおり拒否側に倒す。
-  for (const tree of trees) {
+  //
+  // この例外はシェルのコマンド文字列に限る。裸の名前が「操作対象」を意味するのは cd で
+  // 潜れるシェルだけで、Agent / Task の prompt・description は自然文だからである。
+  // 同じ扱いにすると、基底名が `private` のようなありふれた語のとき、その語を含むだけの
+  // 無関係な委譲まで「配下を操作している」として拒否される。cwd がツリーの親であるのは
+  // (親が作業リポジトリなら)ごく普通の状態なので、cwd 条件は歯止めにならない。
+  const isShell = toolName === 'Bash' || toolName === 'PowerShell';
+  for (const tree of isShell ? trees : []) {
     const base = path.basename(String(tree || '').replace(/[\\/]+$/, ''));
     if (!base) continue;
     // 前後の境界を見るのは、別ドライブの `D:/<ツリー名>` を切り出して cwd 配下へ
@@ -262,7 +267,12 @@ function loadConfig() {
   // 保護が丸ごと外れているのに configBroken は false のまま = 警告も出ないという事故があった。
   // allow の書き損じは「許可なし」に倒せば安全だが、tree が読めないとどのツリーを
   // 守るべきかそもそも分からないので、rules 非配列などと同じ扱い(config ごと壊れた=拒否側)に揃える。
-  const badRule = cfg.rules.find((r) => !r || typeof r.tree !== 'string' || !r.tree);
+  //
+  // 相対パスも書き損じ扱いにする(姉妹ツールの worklog loadConfig と同じ判断)。判定に使う
+  // resolveFrom / normalize は path.resolve なので、相対の tree はフックを呼んだ cwd を基準に
+  // 解決され、同じ設定でも作業場所によって守る対象が変わる。加えて裸のツリー名の突き合わせは
+  // 前後の境界しか見ないため、`tree: "org-tree"` は無関係な `D:/other/org-tree/x` にも当たる。
+  const badRule = cfg.rules.find((r) => !r || typeof r.tree !== 'string' || !r.tree || !path.isAbsolute(r.tree));
   if (badRule) return { rules: DEFAULT_RULES, broken: true };
 
   const rules = cfg.rules.map((r) => ({ tree: r.tree, allow: Array.isArray(r.allow) ? r.allow : [] }));

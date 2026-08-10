@@ -95,6 +95,23 @@ console.log('account-guard');
   check('拒否理由に設定ファイルのパスが入る',
     /config\.json/.test(res?.hookSpecificOutput?.permissionDecisionReason || ''), JSON.stringify(res));
 }
+{
+  // tree に相対パスを書いた設定。resolveFrom / normalize は cwd 基準で解決するため、相対の
+  // tree だと同じ設定でも作業場所によって守る対象が変わってしまう(修正2)。tree キーの
+  // 書き損じと同じく「守るべきツリー」を確定できないので、config ごと壊れた扱いにし、
+  // 保護ツリーと無関係な操作まで拒否側に倒すことを確かめる。
+  const home = sandbox('deny-relative-tree', {
+    subscriptionType: 'pro',
+    rawRules: JSON.stringify({ rules: [{ tree: 'org-tree', allow: ['team'] }] }),
+  });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command: 'echo hello' },
+  });
+  check('tree が相対パスのルールは config ごと壊れた扱いにする', decision(res) === 'deny', JSON.stringify(res));
+  check('拒否理由に設定ファイルのパスが入る',
+    /config\.json/.test(res?.hookSpecificOutput?.permissionDecisionReason || ''), JSON.stringify(res));
+}
 
 // --- 通過すべきケース ---
 {
@@ -288,6 +305,17 @@ console.log('account-guard');
     tool_input: { command: 'echo org-tree の運用方針をまとめる' },
   });
   check('ツリーの外から見た区切りなしのツリー名の言及は通す', res === null, JSON.stringify(res));
+}
+{
+  // cwd がツリーの親でも、Agent の prompt は自然文であって cd のような「配下を操作する」
+  // 指定ではない。シェル限定にした修正1により、区切りなしのツリー名の言及だけでは
+  // 拒否しないことを確かめる(以前はここまで拒否され、自然文の委譲まで巻き添えにしていた)。
+  const home = sandbox('allow-bare-name-agent-prompt', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/', tool_name: 'Agent',
+    tool_input: { prompt: 'org-tree の方針をまとめて', description: '調査' },
+  });
+  check('Agent の prompt に区切りなしのツリー名が出るだけなら通す', res === null, JSON.stringify(res));
 }
 {
   // cwd がツリーの「親」にいるときだけは、裸のツリー名も cwd 配下の実在パスを指す。

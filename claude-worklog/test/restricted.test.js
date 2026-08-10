@@ -344,6 +344,18 @@ check('設定が壊れているときの move の拒否理由は「設定を読�
   /設定.*読めない/.test(moveBroken.err) && !moveBroken.err.includes('アカウントに切り替える'),
   moveBroken.err);
 
+// 上のケースは実在キー(other-repo)に部分一致する経路(rawHit あり)を見ている。ここでは
+// どのキーにも部分一致しない綴りを指定し、rawHit が無いまま allowNew=false の分岐へ落ちる
+// ケースを確認する。設定が壊れて全キーを伏せている以上、「一致するプロジェクトがない。
+// worklog list --all で確認する」という案内は誤りで(list --all も同じ制限で空になる)、
+// こちらも「設定を読めない」に揃っているべき
+const moveBrokenNoHit = worklog5(['move', '--from', 'no-such-project-xyz', '--to', 'org-tree', '--all']);
+check('設定が壊れているとき、どのキーにも一致しない spec の move も拒否される(exit 1)',
+  moveBrokenNoHit.code === 1, `code=${moveBrokenNoHit.code} ${moveBrokenNoHit.out}${moveBrokenNoHit.err}`);
+check('どのキーにも一致しない spec でも拒否理由は「設定を読めない」であり、「一致するプロジェクトがない」ではない',
+  /設定.*読めない/.test(moveBrokenNoHit.err) && !moveBrokenNoHit.err.includes('一致するプロジェクトがない'),
+  moveBrokenNoHit.err);
+
 // restrictedTrees が配列でない書き損じ。そのまま filter に渡すと例外になり、
 // フック経路では上位の catch に吸われて文脈注入が黙って止まる
 // 相対パスの tree も同じ扱い。normPath(path.resolve)が実行時の cwd を基準に解決するため、

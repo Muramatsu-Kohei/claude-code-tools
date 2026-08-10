@@ -1890,7 +1890,14 @@ function resolveMoveKey(spec, allowNew) {
     }
   }
 
-  if (!allowNew) throw new Error(`「${spec}」に一致するプロジェクトがない。worklog list --all で確認する`);
+  // 上の rawHit 判定は実在するキーに部分一致したときしか働かないので、綴り違いや
+  // 消えたディレクトリの指定はここへ落ちる。設定が壊れていて全部伏せている状態で
+  // 「一致するプロジェクトがない」と言うと、効かない対処(list --all も同じ制限で
+  // 空になる)へ誘導するため、上と同じ区別をする
+  if (!allowNew) {
+    if (cfg.configBroken) throw new Error(denyReason(`「${spec}」`));
+    throw new Error(`「${spec}」に一致するプロジェクトがない。worklog list --all で確認する`);
+  }
   // 既存キーに当たらなかったのでパス扱いにする。打ち間違いがそのまま新しいキーに
   // なってしまうため、ディスク上に無いことだけは伝える(消えたディレクトリの
   // 記録を移す正当な用途もあるのでエラーにはしない)
