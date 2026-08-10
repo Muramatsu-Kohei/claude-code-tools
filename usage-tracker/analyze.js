@@ -808,18 +808,6 @@ function buildHtml(result, opts = {}) {
     </section>
   ` : '';
 
-  // フィルタの結果0行になった場合。異常終了させず、他のどのアカウントなら行があるかを
-  // 案内する(--account の綴り間違い・アカウント未使用のいずれにもその場で気付けるように)。
-  const zeroRowsHtml = result.parsedRows === 0 ? `
-    <section class="account-warning">
-      <h2>対象アカウントの行が見つかりません</h2>
-      <p>アカウント「${esc(accountLabel(result.account))}」に該当する行が usage.jsonl にありません。</p>
-      ${result.allRowsCount > 0
-        ? `<p>内訳(全アカウント):</p><ul>${Object.entries(result.accountCounts).map(([acct, count]) => `<li>${esc(acct)}: ${count} 行</li>`).join('')}</ul>`
-        : `<p>usage.jsonl 自体に行がありません。</p>`}
-    </section>
-  ` : '';
-
   const heroValue = !reg.insufficient
     ? `${reg.windowsToLimitLS.toFixed(1)} 回`
     : reg.reason === 'no_slope' ? '推定不可' : 'データ不足';
@@ -903,7 +891,7 @@ function buildHtml(result, opts = {}) {
     --series-five:  #2a78d6; /* categorical slot1: blue */
     --series-seven: #eb6834; /* categorical slot2: orange */
     --regression:   #52514e; /* データではなく推定モデルなので secondary ink */
-    --warn-bg:      #fdf1e6; /* --account all / 0件時の警告バナー用。他の section と混同しないよう暖色にする */
+    --warn-bg:      #fdf1e6; /* --account all の混在警告バナー用。他の section と混同しないよう暖色にする */
     --warn-border:  #e0a33d;
     --warn-ink:     #7a4a06;
   }
@@ -938,7 +926,7 @@ function buildHtml(result, opts = {}) {
   section { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
   section h2 { font-size: 14px; color: var(--ink-2); margin: 0 0 14px; font-weight: 600; }
 
-  /* --account all の混在警告 / 対象0件の案内。他の section と見た目で区別できるよう
+  /* --account all の混在警告。他の section と見た目で区別できるよう
      暖色にして目立たせる(数値だけ見て気付かず誤読するのを防ぐため)。 */
   section.account-warning { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-ink); }
   section.account-warning h2 { color: var(--warn-ink); }
@@ -1007,7 +995,6 @@ function buildHtml(result, opts = {}) {
   <h1>Claude Code 使用量レポート — ${esc(accountLabel(result.account))}</h1>
   <p class="meta">ログ: ${esc(result.logPath)} / 対象アカウント: ${esc(accountLabel(result.account))}(対象 ${result.parsedRows} 行 / 全体 ${result.allRowsCount} 行) / 期間: ${esc(fmtDateTime(result.periodStart))} 〜 ${esc(fmtDateTime(result.periodEnd))} / 総行数 ${result.totalLines}(パース不能 ${result.skippedLines}) / window数 ${result.windows.length}</p>
   ${accountWarningHtml}
-  ${zeroRowsHtml}
 
   <section>
     <h2>週次リミットまでの5h枠満タン回数</h2>

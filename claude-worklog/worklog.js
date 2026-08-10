@@ -92,6 +92,14 @@ function loadConfig() {
   }
   try {
     const parsed = JSON.parse(text);
+    // 設定の最上位はオブジェクトでなければならない。配列やスカラーだと restrictedTrees の
+    // 参照が undefined になるだけで下の検証を全て素通りし、制限なし・警告なしで通ってしまう。
+    // 姉妹ツールの account-guard は設定の最上位が rules を持つオブジェクトなので、それに
+    // 引きずられて worklog の config.json をいきなり配列で書く書き損じは十分あり得る。
+    // 「あるが壊れている」は事故なので伏せる側に倒す(account-guard の rules 非配列と同じ扱い)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ...DEFAULT_CONFIG, configBroken: true };
+    }
     // restrictedTrees の書き損じは、どれも「制限が無言で外れる」形の事故になる。
     // 以下はいずれも configBroken(= blockedTrees が BLOCK_ALL を返す fail-closed)に倒す:
     //  - 配列でない: 「1件だけだから」と配列にし忘れる書き損じ。そのまま blockedTrees に
@@ -1866,12 +1874,19 @@ function resolveMoveKey(spec, allowNew) {
   // 「ディスク上に無い新規キー」を作ってしまい、記録がそこへ move されてしまう
   // (「ディスク上に無い」の警告は出るが move 自体は実行されてしまう)。
   // 制限が理由だと分かっている場合はキーを捏造せず、ここで move そのものを拒否する
-  const blocked = blockedTrees(loadConfig(), currentAccount());
+  const cfg = loadConfig();
+  const blocked = blockedTrees(cfg, currentAccount());
+  // 設定を読めていないときは BLOCK_ALL で全部伏せているので、理由は「別アカウント専用の
+  // ツリーだから」ではない。そのまま案内するとアカウント切り替えという効かない対処へ
+  // 誘導してしまうため、restrictionNote / explicitProjectRestrictionNote と同じ区別をする
+  const denyReason = (what) => (cfg.configBroken
+    ? `設定 ${CONFIG_PATH} を読めないため、安全側に倒して全ての記録を伏せている。設定を直してからやり直す。`
+    : `${what}は別アカウント専用のツリーのため move できない。許可されたアカウントに切り替える。`);
   if (blocked.length) {
     const raw = listProjectKeysRaw();
     const rawHit = raw.includes(spec) ? [spec] : raw.filter((k) => k.toLowerCase().includes(spec.toLowerCase()));
     if (rawHit.length && rawHit.every((k) => isKeyBlocked(k, blocked))) {
-      throw new Error(`「${spec}」は別アカウント専用のツリーのため move できない。許可されたアカウントに切り替える。`);
+      throw new Error(denyReason(`「${spec}」`));
     }
   }
 
@@ -1888,7 +1903,7 @@ function resolveMoveKey(spec, allowNew) {
   // ログを失ったのと同じになる。捏造するキーにもツリー判定を掛け、書けるが読めない
   // 置き場所を作らせない
   if (blocked.length && isKeyBlocked(key, blocked)) {
-    throw new Error(`移動先「${spec}」は別アカウント専用のツリーのため move できない。許可されたアカウントに切り替える。`);
+    throw new Error(denyReason(`移動先「${spec}」`));
   }
   if (!existsSafe(normPath(spec))) console.log(yellow(`! 移動先 ${spec} はディスク上に無い。新しいキー ${key} を作る`));
   return key;

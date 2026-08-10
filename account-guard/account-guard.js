@@ -166,7 +166,9 @@ function resolveFrom(cwd, value) {
 // 相対パス指定は必ず cwd 基準で解決してから突き合わせる。これをしていなかった頃は
 // 保護ツリーの外の cwd から `Read{file_path:"../../<tree>/secret"}` と上に登る指定が
 // 素通りしていた(絶対パス版だけが拒否され、テストも絶対パスしか見ていなかった)。
-function targetStrings(toolName, toolInput, cwd) {
+// trees は設定中の保護ツリー一覧。区切りを含まない「裸のツリー名」を拾うためだけに使う
+// (下のコメント参照)。判定そのものは呼び出し側がルールごとに行う。
+function targetStrings(toolName, toolInput, cwd, trees = []) {
   const ti = toolInput ?? {};
   const pathFields = PATH_FIELDS[toolName];
   const commandFields = COMMAND_FIELDS[toolName];
@@ -209,6 +211,23 @@ function targetStrings(toolName, toolInput, cwd) {
       const win = fromMsys(token);
       if (win) out.push(win, resolveFrom(cwd, win));
     }
+  }
+
+  // 区切りを含まない裸のトークンは cwd 基準で解決しない(RELATIVE_PATH_TOKEN のコメント。
+  // 散文中でツリー名に言及しただけで拒否される誤検知を避けるため)。ただし保護ツリー
+  // 自身の名前だけは例外にする。cwd がツリーの「親」にいるとき、`cd <ツリー名> && type
+  // secret` は絶対パスの形にも区切り付き相対パスの形にもならず、文字列全体の突き合わせ
+  // にも当たらないため、実際の読み出しがそのまま通っていた(`cd <ツリー名>/ && …` と
+  // 末尾に区切りを付けただけで拒否されるのに、付けないと通るという食い違い)。
+  // 誤検知が増えるのは「cwd がちょうどツリーの親で、かつツリー名そのものを書いたとき」に
+  // 限られる一方、見逃しは保護の穴そのものなので、冒頭の方針どおり拒否側に倒す。
+  for (const tree of trees) {
+    const base = path.basename(String(tree || '').replace(/[\\/]+$/, ''));
+    if (!base) continue;
+    // 前後の境界を見るのは、別ドライブの `D:/<ツリー名>` を切り出して cwd 配下へ
+    // 解決してしまうことと、`<ツリー名>-backup` のような別ディレクトリに当てることを防ぐため
+    const re = new RegExp(`(?<![\\w.\\-\\\\/:])${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.\\-])`, 'i');
+    if (texts.some((t) => re.test(t))) out.push(resolveFrom(cwd, base));
   }
   return out.filter(Boolean);
 }
@@ -272,7 +291,7 @@ function violation(input, account, config) {
     return { broken: true, tree: CONFIG, reason: '設定ファイルを読めません', allow: [] };
   }
 
-  const targets = targetStrings(input.tool_name, input.tool_input, cwd);
+  const targets = targetStrings(input.tool_name, input.tool_input, cwd, config.rules.map((r) => r.tree));
 
   for (const rule of config.rules) {
     if (rule.allow.includes(account)) continue;

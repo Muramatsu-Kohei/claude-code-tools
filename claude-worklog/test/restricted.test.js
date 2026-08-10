@@ -333,6 +333,17 @@ const listBroken = worklog5(['list', '-n', '20']).out;
 check('list でも設定を読めていないことを伝える(--all でなくても)',
   /config\.json.*を読めない/.test(listBroken), listBroken);
 
+// 設定が壊れているとき、move の拒否理由は「設定を読めない」であるべきで、「別アカウント専用の
+// ツリーだから」ではない。config 破損時は blockedTrees が BLOCK_ALL を返して全キーが伏せられる
+// ため、resolveMoveKey が通常の制限と同じ denyReason 文言(アカウントを切り替える)を出すと、
+// 本当の原因(設定ファイルの破損)と無関係な効かない対処へ利用者を誘導してしまう
+const moveBroken = worklog5(['move', '--from', 'other-repo', '--to', 'org-tree', '--all']);
+check('設定が壊れているときの move は拒否される(exit 1)', moveBroken.code === 1,
+  `code=${moveBroken.code} ${moveBroken.out}${moveBroken.err}`);
+check('設定が壊れているときの move の拒否理由は「設定を読めない」であり、誤ってアカウント切り替えを案内しない',
+  /設定.*読めない/.test(moveBroken.err) && !moveBroken.err.includes('アカウントに切り替える'),
+  moveBroken.err);
+
 // restrictedTrees が配列でない書き損じ。そのまま filter に渡すと例外になり、
 // フック経路では上位の catch に吸われて文脈注入が黙って止まる
 // 相対パスの tree も同じ扱い。normPath(path.resolve)が実行時の cwd を基準に解決するため、
@@ -359,6 +370,32 @@ badConfigCases.forEach(([label, rawCfg], i) => {
   const res = runner(h, OTHER)(['today', '--days', '3650']);
   check(`restrictedTrees が${label}でも異常終了しない`, res.code === 0, `code=${res.code} ${res.err}`);
   check(`restrictedTrees が${label}なら壊れた設定として伏せる`,
+    !res.out.includes('保護ツリーの作業') && /config\.json.*を読めない/.test(res.out), res.out);
+});
+
+// 設定の最上位がオブジェクトでない書き損じ。loadConfig は parsed.restrictedTrees を見る前に
+// 「parsed がプレーンなオブジェクトか」を確かめていなかった。姉妹ツールの account-guard は
+// 最上位が rules 配列の設定なので、それに引きずられて worklog の config.json をいきなり
+// 配列やスカラーで書いてしまう書き損じは十分あり得る。この形だと parsed.restrictedTrees が
+// ただの undefined になるだけで下の検証を全て素通りし、restrictedTrees は空・configBroken は
+// false のまま通って、保護ツリーの記録が注記すら無しに表示されてしまう
+// (このツールが最も避けたい無言の fail-open)
+const topLevelBadConfigCases = [
+  ['配列', JSON.stringify([{ tree: TREE, allow: ['team'] }])],
+  ['スカラー(true)', 'true'],
+];
+topLevelBadConfigCases.forEach(([label, rawCfg], i) => {
+  const dir = path.join(BASE, `home-badcfg-top-${i}`);
+  const { home: h, logDir: d } = sandboxHome(dir, CONFIG);
+  setAccount(h, 'pro');
+  fs.writeFileSync(
+    path.join(d, `${projectKey(TREE)}.ndjson`),
+    fs.readFileSync(path.join(logDir, `${projectKey(TREE)}.ndjson`), 'utf8'),
+  );
+  fs.writeFileSync(path.join(d, 'config.json'), rawCfg, 'utf8');
+  const res = runner(h, OTHER)(['today', '--days', '3650']);
+  check(`設定の最上位が${label}でも異常終了しない`, res.code === 0, `code=${res.code} ${res.err}`);
+  check(`設定の最上位が${label}なら壊れた設定として伏せる`,
     !res.out.includes('保護ツリーの作業') && /config\.json.*を読めない/.test(res.out), res.out);
 });
 

@@ -279,14 +279,35 @@ console.log('account-guard');
   check('未知ツールの降りる相対パスを拒否する', decision(res) === 'deny', JSON.stringify(res));
 }
 {
-  // 区切りを伴わない言及はパスとして解決しない。ツリー名を口に出しただけで止まると、
-  // 誤検知の実害のほうが大きくなり、ガードを外したくなる圧力になる。
+  // 区切りを伴わない言及は、cwd 基準で解決してもツリーの中に落ちない限り通す。
+  // ツリー名を口に出しただけで止まると、誤検知の実害のほうが大きくなり、ガードを
+  // 外したくなる圧力になる。
   const home = sandbox('allow-mention-descend', { subscriptionType: 'pro', rules: ORG });
   const res = run(home, {
-    hook_event_name: 'PreToolUse', cwd: 'C:/', tool_name: 'Bash',
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
     tool_input: { command: 'echo org-tree の運用方針をまとめる' },
   });
-  check('区切りを伴わないツリー名の言及は通す', res === null, JSON.stringify(res));
+  check('ツリーの外から見た区切りなしのツリー名の言及は通す', res === null, JSON.stringify(res));
+}
+{
+  // cwd がツリーの「親」にいるときだけは、裸のツリー名も cwd 配下の実在パスを指す。
+  // `cd <ツリー名>/` と末尾に区切りを付ければ拒否されるのに、付けないと通るという
+  // 食い違いがあり、実際に保護ツリーの中身を読めてしまっていた。
+  const home = sandbox('deny-bare-name-from-parent', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/', tool_name: 'Bash',
+    tool_input: { command: 'cd org-tree && type secret.txt' },
+  });
+  check('ツリーの親から裸のツリー名で降りる指定は拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  // 名前の一部が一致するだけの別ディレクトリまで巻き込まない(前方一致では見ない)。
+  const home = sandbox('allow-sibling-bare-name', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/', tool_name: 'Bash',
+    tool_input: { command: 'cd org-tree-backup && type notes.md' },
+  });
+  check('似た名前の兄弟ディレクトリは裸の名前でも通す', res === null, JSON.stringify(res));
 }
 {
   // 別ドライブの同名パスまで cwd 基準で解決すると、無関係な場所の操作が止まる。
