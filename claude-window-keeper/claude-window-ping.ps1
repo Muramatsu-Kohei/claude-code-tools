@@ -124,10 +124,10 @@ function Write-Log([string]$msg, [switch]$ConsoleOnly) {
 # でき、以降は旧ファイルを見ない（旧ファイルは残るが、両方が揃えば手で消してよい）。
 $legacyStateFile = Join-Path $stateDir "state.json"
 $stateSource     = $stateFile
+$usingLegacyState = $false
 if ((Test-Path $legacyStateFile) -and (-not (Test-Path $stateFile))) {
     $stateSource = $legacyStateFile
-    # 旧記録に頼っている回であることを後から追えるようにする（-Status は読むだけなので静かに）
-    if (-not $Status) { Write-Log "STATE reading legacy state.json (account not recorded in old format)" }
+    $usingLegacyState = $true
 }
 
 # 前回のPing時間をログから復元
@@ -149,6 +149,11 @@ $now = Get-Date
 if ($Status) {
     # 枠はアカウントごとに独立しているので、どのアカウントの状態を見ているかを最初に示す
     Write-Host ("Account        : " + $account)
+    if ($usingLegacyState) {
+        # 旧形式にはアカウントが書かれていない。下に出る前回時刻が、いま表示している
+        # アカウントのものとは限らないことを明示する（他方のアカウントの Ping かもしれない）
+        Write-Host ("State source   : state.json (legacy; account not recorded)")
+    }
     if ($lastPing) {
         $elapsed = $now - $lastPing
         $reset   = $lastPing.AddMinutes($WindowMinutes)
@@ -260,6 +265,12 @@ Write-Log ("PING  sent (model={0}); reply: {1}" -f $Model, $replyText)
 
 # ログの更新
 $now = Get-Date
+# 旧 state.json を読み元にしていた回は、ここで初めてこのアカウント用のファイルができる。
+# 記録は Ping を実際に送ったときだけなので毎時のログを埋めない（毎回出していた頃は、
+# アカウントを判別できない環境では新ファイルが永久にできず、1日24行が延々と積もった）。
+if ($usingLegacyState) {
+    Write-Log ("STATE was reading legacy state.json (account not recorded); now writing " + (Split-Path $stateFile -Leaf))
+}
 @{ lastPing = $now.ToString("o") } | ConvertTo-Json | Set-Content -Path $stateFile
 $reset = $now.AddMinutes($WindowMinutes)
 Write-Log ("STATE lastPing updated; est. window reset at " + $reset.ToString("yyyy-MM-dd HH:mm:ss"))
