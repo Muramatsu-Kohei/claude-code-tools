@@ -160,6 +160,12 @@ function loadRows(logPath) {
       // collect.js の ACCOUNT_UNKNOWN と同じ値にして、新旧のデータで判別不能行が
       // 別々の名前で分裂しないようにする。
       acct: typeof obj.acct === 'string' && obj.acct ? obj.acct : ACCOUNT_UNKNOWN,
+      // フィールドそのものが無い = アカウント分離を入れる前の記録。値が 'unknown' で
+      // あることとは区別する。collect.js は記録時に credentials を読めなかった回にも
+      // 'unknown' を書くので(未ログイン、/login 中、権限エラー)、値だけを見て
+      // 「移行前だから今のアカウントのもの」と決めると、実際には別アカウントで
+      // 動いていた回の記録を混ぜてしまう。filterRowsByAccount がここを見る。
+      acctLegacy: !('acct' in obj),
       five_pct: isNum(obj.five_pct) ? obj.five_pct : null,
       five_reset_ms: normalizeResetMs(obj.five_reset),
       seven_pct: isNum(obj.seven_pct) ? obj.seven_pct : null,
@@ -188,14 +194,19 @@ function accountBreakdown(rows) {
 // 行だけを残す。ACCOUNT_ALL のときだけ素通しし、後段(buildWindows のキーや HTML の
 // 警告表示)で「混在している」ことを扱えるようにする。
 //
-// includeLegacy は --account を明示しなかった回だけ真になる。acct を書いていなかった頃の
-// ログは単一アカウント運用時代の記録なので、いまのアカウントのものとして扱う。これが無いと
-// migrate-account.js をまだ実行していない環境では既定の実行が常に0件になり、対象が無い
-// まま HTML を作って既存のレポートを空で上書きしていた。
-// 逆に --account を明示した回は、どのアカウントの記録か分からない行を混ぜない。
+// includeLegacy は --account を明示しなかった回だけ真になる。acct フィールドを書いて
+// いなかった頃のログは単一アカウント運用時代の記録なので、いまのアカウントのものとして
+// 扱う。これが無いと migrate-account.js をまだ実行していない環境では既定の実行が常に
+// 0件になり、対象が無いまま HTML を作って既存のレポートを空で上書きしていた。
+//
+// 見るのは acctLegacy(フィールドの不在)であって acct の値ではない。値が 'unknown' の行は
+// 記録時にアカウントを判別できなかっただけで、実際には別アカウントの記録でありうる。
+// これを既定の実行で取り込むと、--account の設計そのものが防ごうとしている混在が起きる。
+// --account を明示した回は合流させず、指定した acct を持つ行だけを見る(移行前の行は
+// acct が 'unknown' に落ちるので、--account unknown と明示したときだけ対象に入る)。
 function filterRowsByAccount(rows, account, includeLegacy = false) {
   if (account === ACCOUNT_ALL) return rows;
-  return rows.filter((r) => r.acct === account || (includeLegacy && r.acct === ACCOUNT_UNKNOWN));
+  return rows.filter((r) => r.acct === account || (includeLegacy && r.acctLegacy));
 }
 
 // ---------------------------------------------------------------------------
@@ -563,15 +574,20 @@ function clipToRecentWeekWindows(rows, weeks) {
     if (!startsByAcct.has(acct)) startsByAcct.set(acct, []);
     startsByAcct.get(acct).push(i);
   }
-  let cut = null;
-  for (const starts of startsByAcct.values()) {
-    // どれか一つでも手持ちの窓が要求数以下なら切らない。先頭の窓は途中から記録が
+  // 切り出し位置はアカウントごとに持つ。全体を1点で切ると、窓の少ないアカウントに
+  // 引きずられて他方まで切れなくなる(既定の --weeks 1 では、2アカウント目に週次窓が
+  // 1つあるだけで絞り込みが丸ごと効かなくなっていた)。
+  const cutByAcct = new Map();
+  for (const [acct, starts] of startsByAcct) {
+    // 手持ちの窓が要求数以下のアカウントは全部残す。先頭の窓は途中から記録が
     // 始まっていることが多いが、それを捨てると初回利用時にグラフが空になる。
-    if (starts.length <= weeks) return rows;
-    const from = starts[starts.length - weeks];
-    if (cut === null || from < cut) cut = from;
+    cutByAcct.set(acct, starts.length <= weeks ? -1 : starts[starts.length - weeks]);
   }
-  return cut === null ? rows : rows.slice(cut);
+  // 窓の境界が1つも無いアカウント(seven_reset がまだ記録されていない)は絞り込めないので残す。
+  return rows.filter((r, i) => {
+    const cut = cutByAcct.get(r.acct);
+    return cut === undefined || i >= cut;
+  });
 }
 
 // 表示範囲の決定。--days を明示したときだけ日数で切り、既定は週次枠の窓単位。
