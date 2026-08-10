@@ -49,10 +49,10 @@ write(TREE, [{ sid: 'r1', ts: T, summary: '保護ツリーの作業' }]);
 write(SIMILAR, [{ sid: 's1', ts: T, summary: '似た名前ツリーの作業' }]);
 write(OTHER, [{ sid: 'o1', ts: T, summary: '無関係ツリーの作業' }]);
 
-// F2: cwd を持たないセッション(SessionStart 未発火、move で非制限キーへ移された孤児 等)。
+// F2: cwd を持たないセッション(SessionStart が発火しなかった。端末の強制終了で起きる)。
 // write() は cwd が偽値だと repo で埋めてしまうため、ここだけ生の NDJSON を直接追記して
-// cwd フィールド自体を欠落させる。キーは無関係ツリー(OTHER)だが、cwd 側の第二の網は
-// キーに関係なく「保護ツリーの外だと証明できないセッション」を fail-closed で扱うべき対象
+// cwd フィールド自体を欠落させる。キーは無関係ツリー(OTHER)なので、キー単位の網が
+// 可視と判定する = 制限対象とみなさない側の代表例(下の F2 の check を参照)
 const noCwdLines = [
   JSON.stringify({ k: 'start', sid: 'nc1', ts: T, branch: 'main' }), // cwd フィールドが無い
   JSON.stringify({ k: 'note', sid: 'nc1', ts: T, via: 'wrap', summary: 'cwd不明セッションの作業' }),
@@ -83,13 +83,15 @@ check('無関係ツリーは today にそのまま出る', todayBlocked.includes
 // 件数はキー単位(プロジェクト)と cwd 単位(セッション)の両方を数える。後者を
 // 数えないと、第二の網が拾った取りこぼしだけが注記に現れず黙って消える
 check('除外を黙って隠さない注記が出る',
-  /別アカウント専用のツリーのため 1 件のプロジェクトと 2 件のセッションを表示していません/.test(todayBlocked),
+  /別アカウント専用のツリーのため 1 件のプロジェクトと 1 件のセッションを表示していません/.test(todayBlocked),
   todayBlocked);
-// F2: cwd の無いセッションは、キー自体は無関係ツリー(OTHER)でも fail-closed で隠れる
-// (「保護ツリーの外だと証明できない」ため。move 後の孤児などキーだけでは拾えない
-// 取りこぼしを塞ぐのがこの第二の網の役目なので、判定不能を見せる側に倒すと意味が無くなる)
-check('cwd の無いセッションは制限が有効な間は出ない(fail-closed)',
-  !todayBlocked.includes('cwd不明セッションの作業'), todayBlocked);
+// F2: cwd の無いセッションは、そのレコードが入っているキー自体が可視なら制限対象に
+// しない。キー単位の網は既にツリー情報を反映しているので二重に伏せる理由がなく、
+// 一律 fail-closed にすると restrictedTrees を1件足しただけで無関係な cwd 欠落レコードが
+// 全経路から消えて move でも動かせなくなる。保護ツリーから move された記録は cwd を
+// 持ったまま追記されるので、この緩和では漏れない(下の「大小違いcwd」がその代表例)
+check('cwd の無いセッションは、キー自体が可視なら出る',
+  todayBlocked.includes('cwd不明セッションの作業'), todayBlocked);
 check('F1: cwd の大小がツリー設定と違っても保護ツリー配下と判定される',
   !todayBlocked.includes('大小違いcwdセッションの作業'), todayBlocked);
 
@@ -199,6 +201,27 @@ check('F4: 移動元(OTHER)のログも書き換えない',
   fs.readFileSync(path.join(logDir4, `${projectKey(OTHER)}.ndjson`), 'utf8').includes('無関係ツリーの作業(move用)'),
   fs.readFileSync(path.join(logDir4, `${projectKey(OTHER)}.ndjson`), 'utf8'));
 
+// F5: F4 は spec が既存キー(org-tree)に部分一致する場合の拒否だったが、resolveMoveKey の
+// rawHit チェックは「ディスク上に実在するキーに一致した」場合しか働かない。保護ツリー配下の
+// 未使用パス(既存のどのキー名にも部分一致しない)を --to に渡すと rawHit が空のまま
+// allowNew のフォールバックに進み、repoKey(spec) で保護ツリー配下の新規キーを捏造して
+// しまう。捏造したキーにもツリー判定を掛けているか(resolveMoveKey 末尾の isKeyBlocked)を
+// 確かめる。ディスク上に存在しないパスなので repoRoot() の git rev-parse は失敗して
+// spec 自身にフォールバックするが、そのパス自体が保護ツリー配下にあれば前方一致で捕まる
+const ghostSpec = path.join(MOVE_TREE, 'ghost-sub'); // どのキー名にも部分一致しない、保護ツリー配下の未使用パス
+const ndjsonBeforeGhostMove = fs.readdirSync(logDir4).filter((f) => f.endsWith('.ndjson'));
+const moveToGhostBlocked = worklog4(['move', '--from', 'other-repo', '--to', ghostSpec, '--all']);
+check('F5: 既存キーに一致しない保護ツリー配下のパスへの move も拒否される(exit 1)',
+  moveToGhostBlocked.code === 1, `code=${moveToGhostBlocked.code} ${moveToGhostBlocked.out}${moveToGhostBlocked.err}`);
+check('F5: 拒否の理由が制限だと分かる',
+  /別アカウント専用のツリーのため/.test(moveToGhostBlocked.err), moveToGhostBlocked.err);
+check('F5: 捏造キーの新規ファイルを作らない',
+  fs.readdirSync(logDir4).filter((f) => f.endsWith('.ndjson')).join(',') === ndjsonBeforeGhostMove.join(','),
+  fs.readdirSync(logDir4).join(', '));
+check('F5: 移動元(OTHER)のログも書き換えない',
+  fs.readFileSync(path.join(logDir4, `${projectKey(OTHER)}.ndjson`), 'utf8').includes('無関係ツリーの作業(move用)'),
+  fs.readFileSync(path.join(logDir4, `${projectKey(OTHER)}.ndjson`), 'utf8'));
+
 // --- restrictedTrees が空(既定)なら誰にでも全部出る ---
 const { home: home2, logDir: logDir2 } = sandboxHome(path.join(BASE, 'home-empty'), { restrictedTrees: [] });
 setAccount(home2, 'pro');
@@ -222,15 +245,29 @@ const todayProjectOther = worklog(['today', '--days', '3650', '--project', OTHER
 check('today --project で無関係なツリーを指定したら件数の注記は出ない',
   !todayProjectOther.includes('件のプロジェクトを表示していません'), todayProjectOther);
 
+// restrictionNote は以前、問い合わせた範囲に関係なくディスク上の全キーから隠した
+// プロジェクト数を数えていた。そのため list --project <無関係なプロジェクト> のように
+// 単一プロジェクトしか見ていないときでも、一度も見ていない保護ツリー(TREE)の件数を
+// 「ここから伏せた」と伝えてしまっていた。OTHER の中には cwd 側の網(大小違いcwd)で
+// 隠れるセッションが 1 件あるので、注記自体は出るが、そこにプロジェクト件数は
+// 混ざらず(scopeKeys = 問い合わせた OTHER のキーだけ。TREE は含まれない)セッション件数
+// だけが出ることを確かめる
+const listProjectOther = worklog(['list', '--project', OTHER, '-n', '20']).out;
+check('list --project で無関係なプロジェクトを指定すると、注記の件数は問い合わせた範囲だけを数える(他プロジェクトの件数を混ぜない)',
+  !listProjectOther.includes('件のプロジェクト') && /1 件のセッションを表示していません/.test(listProjectOther),
+  listProjectOther);
+
 // --- move も cwd 単位の網をかける ---
 // resolveMoveKey はキー単位でしか止められないので、非制限キーの下にある「cwd が制限ツリー」の
 // セッション(過去の move で移された孤児など)が move の一覧に summary ごと出てしまっていた
 const moveDry = worklog(['move', '--from', 'other-repo', '--to', 'org-treeo', '--all', '--dry-run']);
 check('move の一覧に制限セッションの要約が出ない',
-  !moveDry.out.includes('大小違いcwdセッションの作業') && !moveDry.out.includes('cwd不明セッションの作業'),
-  moveDry.out);
+  !moveDry.out.includes('大小違いcwdセッションの作業'), moveDry.out);
 check('move では制限セッションを対象外として示す', /対象外.*別アカウント専用/.test(moveDry.out), moveDry.out);
 check('制限に当たらないセッションは move の対象に残る', moveDry.out.includes('無関係ツリーの作業'), moveDry.out);
+// F2: cwd の無いセッションを「別アカウント専用のツリーの記録」として弾くのは誤った理由の
+// 提示になる(そのキーは可視で、保護ツリーとは何の関係もない)。自分のログを整理できる
+check('cwd の無いセッションは move の対象に残る', moveDry.out.includes('cwd不明セッションの作業'), moveDry.out);
 
 // --- config.json が壊れているとき(fail-closed) ---
 // 「未作成」は既定設定で動く意図した状態だが、「あるが壊れている」は事故。以前は
@@ -263,6 +300,11 @@ const badConfigCases = [
   ['配列にし忘れたオブジェクト', '{ "restrictedTrees": { "tree": "C:/org-tree", "allow": ["team"] } }'],
   ['null', '{ "restrictedTrees": null }'],
   ['相対パスの tree', '{ "restrictedTrees": [ { "tree": "org-tree", "allow": ["team"] } ] }'],
+  // tree を path と書き損じた設定。以前は blockedTrees 側の filter (r.tree が無ければ
+  // 無条件で捨てる)が黙ってこのエントリを外すだけだったため、1文字のキー名の書き損じで
+  // 読み出し制限が丸ごと無効になるのに、設定ファイル自体は正常(configBroken=false)と
+  // 報告されていた。loadConfig 側で fail-closed にすることを確かめる
+  ['tree キーを書き損じた(path と誤記)', JSON.stringify({ restrictedTrees: [{ path: TREE, allow: ['team'] }] })],
 ];
 badConfigCases.forEach(([label, rawCfg], i) => {
   const dir = path.join(BASE, `home-badcfg-${i}`);
