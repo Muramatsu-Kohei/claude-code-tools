@@ -236,6 +236,55 @@ console.log('account-guard');
   check('保護ツリーに届かない相対パスは通す', res === null, JSON.stringify(res));
 }
 
+// --- cwd が保護ツリーの「親」にいるときの、降りていく相対パス ---
+// `../` を含む形だけを拾っていた頃の穴。降りる指定は cwd の配下にしか届かないので
+// cwd が内側なら別の判定で止まる、という理屈だったが、cwd が親にいる場合が抜けていた。
+// フィールドの値として解決される Read は同じ指定で拒否されるため、ツールによって
+// 結果が食い違い、拒否されない側から保護ツリーを読めてしまう。
+{
+  const home = sandbox('deny-descend-bash', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/', tool_name: 'Bash',
+    tool_input: { command: 'cat org-tree/proj/secret.py' },
+  });
+  check('親から降りる相対パスをコマンド中でも拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  const home = sandbox('deny-descend-agent', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/', tool_name: 'Agent',
+    tool_input: { prompt: 'org-tree/proj のコードを読んで要約して', description: '要約' },
+  });
+  check('親から降りる相対パスを委譲でも拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  const home = sandbox('deny-descend-mcp', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/',
+    tool_name: 'mcp__fs__read', tool_input: { p: 'org-tree/secret.txt' },
+  });
+  check('未知ツールの降りる相対パスを拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  // 区切りを伴わない言及はパスとして解決しない。ツリー名を口に出しただけで止まると、
+  // 誤検知の実害のほうが大きくなり、ガードを外したくなる圧力になる。
+  const home = sandbox('allow-mention-descend', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/', tool_name: 'Bash',
+    tool_input: { command: 'echo org-tree の運用方針をまとめる' },
+  });
+  check('区切りを伴わないツリー名の言及は通す', res === null, JSON.stringify(res));
+}
+{
+  // 別ドライブの同名パスまで cwd 基準で解決すると、無関係な場所の操作が止まる。
+  const home = sandbox('allow-other-drive', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/', tool_name: 'Bash',
+    tool_input: { command: 'cat D:/org-tree/notes.md' },
+  });
+  check('別ドライブの同名パスは通す', res === null, JSON.stringify(res));
+}
+
 // --- 途中で上に登る絶対パス ---
 // 文字列を突き合わせるだけでは `..` が畳まれないため、絶対パスの体裁のまま
 // 保護ツリーへ潜り込める。切り出して解決するまで拒否できなかった経路。
