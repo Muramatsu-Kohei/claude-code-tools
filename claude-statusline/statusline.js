@@ -280,11 +280,25 @@ write(parts.join(`${THEME.sep} | ${RESET}`));
 // 後から復元できない。表示を出し終えたこの位置で時系列として書き出しておく。
 // 表示とは無関係な副作用なので、収集側が壊れていても statusline の出力には影響しない。
 try {
-  // 既定は同じリポジトリに置かれた usage-tracker。ここに個人マシン固有の絶対パスを
-  // 焼き込むと、他の環境では require が必ず失敗し、下の catch に吸われて「動いているのに
-  // 何も記録されない」状態になる。別の場所に置くときは CLAUDE_STATUSLINE_HOOK で指す。
-  require(process.env.CLAUDE_STATUSLINE_HOOK || `${__dirname}/../usage-tracker/collect.js`).record(d);
+  // 明示指定(CLAUDE_STATUSLINE_HOOK)があれば無条件にそれを使う。誤っていても下の catch で
+  // 気付ける。未指定のときは候補を順に試す。__dirname 基準の相対パスはこのリポジトリの中から
+  // 直接動かしている場合に解決できるが、README の既定手順(statusline.js だけを
+  // ~/.claude/statusline.js にコピーする)ではこのファイルがリポジトリの外に出るため解決できない。
+  // そのケースを拾うため、このリポジトリを開いた状態で Claude Code を使っているなら指すはずの
+  // CLAUDE_PROJECT_DIR も候補に加える。どちらも「実在すれば使う」だけなので、誤って
+  // 個人マシン固有の絶対パスを焼き込む(=他環境で必ず失敗する)心配はない。
+  const explicit = process.env.CLAUDE_STATUSLINE_HOOK;
+  const fallbacks = [
+    `${__dirname}/../usage-tracker/collect.js`,
+    process.env.CLAUDE_PROJECT_DIR ? `${process.env.CLAUDE_PROJECT_DIR}/usage-tracker/collect.js` : null,
+  ].filter(Boolean);
+  const hookPath = explicit || fallbacks.find((p) => fs.existsSync(p));
+  if (!hookPath) throw new Error(`usage-tracker hook not found (tried: ${fallbacks.join(', ')})`);
+  require(hookPath).record(d);
 } catch (e) {
-  /* 収集は捨てて表示を優先する */
+  // 収集は捨てて表示を優先する。ただし無言のままだと usage.jsonl への追記が止まったことに
+  // 誰も気付けない(枠切れ警告も出なくなる)。stdout は表示そのものなので汚さず、stderr に
+  // だけ残す。通常運用では見えず、`claude --debug` で確認したときだけ表面化する控えめな形。
+  process.stderr.write(`[statusline] usage-tracker hook 失敗: ${e.message}\n`);
 }
 // --- usage-tracker hook (end) ---
