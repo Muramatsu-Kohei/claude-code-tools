@@ -43,7 +43,10 @@ try {
 $endMark
 "@
 
-$content = Get-Content -Path $StatuslinePath -Raw -Encoding utf8
+# -Raw は空ファイルに対して $null を返す。そのまま .Contains() を呼ぶと
+# 「null 値の式でメソッドを呼び出せません」で落ちるので、ここで空文字に正規化する。
+$content = (Get-Content -Path $StatuslinePath -Raw -Encoding utf8)
+if ($null -eq $content) { $content = '' }
 
 # 既存ブロックを取り除いた本体。マーカー前の改行も一緒に落として空行が増えないようにする。
 function Remove-HookBlock([string]$text) {
@@ -61,10 +64,21 @@ if ($content -like "*$legacyMark*") {
   $legacyFound = $true
 }
 
-$installed = ($content -like "*$beginMark*")
+# マーカーの有無だけを見ると、claude-statusline に同梱されたフォールバック版フック
+# (絶対パスを焼き込まず __dirname 相対 → CLAUDE_PROJECT_DIR にフォールバックするだけの版)
+# も「インストール済み」と誤判定してしまう。同梱版は他プロジェクトで動かした回の
+# usage.jsonl 記録が欠落するので、ここでは自分がこれから焼き込む絶対パス
+# ($collectorForRequire)がブロック中に実在するかまで確認し、それが無ければ
+# 「未インストール」とみなして本来のブロックへ置き換える。
+# パスには `[` `]` などの -like ワイルドカード扱いされる文字が入り得るため、
+# パターンマッチではなく厳密な部分文字列一致の .Contains() を使う。
+$hasBeginMark = $content.Contains($beginMark)
+$installed = $hasBeginMark -and $content.Contains($collectorForRequire)
 
 if ($Uninstall) {
-  if (-not $installed -and -not $legacyFound) { Write-Host 'not installed; nothing to do'; exit 0 }
+  # アンインストールはマーカーの有無だけで判断する。同梱フォールバック版であっても
+  # begin/end で囲まれている以上 Remove-HookBlock で構造的に除去できるため。
+  if (-not $hasBeginMark -and -not $legacyFound) { Write-Host 'not installed; nothing to do'; exit 0 }
   $backup = "$StatuslinePath.bak-usage-tracker"
   Copy-Item -Path $StatuslinePath -Destination $backup -Force
   $out = (Remove-HookBlock $content).TrimEnd() + "`n"
