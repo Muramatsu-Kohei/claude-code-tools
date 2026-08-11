@@ -957,6 +957,58 @@ console.log('swap');
   check('スタックトレースを投げっぱなしにしない', !/ {4}at /.test(r.err), r.err);
 }
 {
+  // 隣に credentials.js は「ある」が、無関係・古いファイルで HOME 等を export していない
+  // (`{}` を export する等)。require 自体は成功するので、素通しで分割代入すると
+  // path.join(HOME, ...) がトップレベルで TypeError を投げ、案内より前に生のスタックトレースだけが
+  // 出ていた(account-guard.js 側は同種の検証を既に持つ)。
+  const dir = path.join(BASE, 'malformed-credentials-swap');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.copyFileSync(SWAP, path.join(dir, 'swap.js'));
+  fs.writeFileSync(path.join(dir, 'credentials.js'), 'module.exports = {};', 'utf8');
+  let r;
+  try {
+    r = { code: 0, out: execFileSync(process.execPath, [path.join(dir, 'swap.js')], {
+      env: { ...process.env, USERPROFILE: dir, HOME: dir, NO_COLOR: '1' }, encoding: 'utf8' }), err: '' };
+  } catch (e) {
+    r = { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
+  }
+  check('credentials.js の形式が不正なときは真因を示して止まる',
+    r.code === 1 && /形式が想定と違います/.test(r.err), r.out + r.err);
+  check('スタックトレースを投げっぱなしにしない', !/ {4}at /.test(r.err), r.err);
+}
+{
+  // 同一プラン同士の切り替え(max ⇄ max)。この向きは planDiffers が「別アカウントだ」と
+  // 証明できないので --force でしか通れない。にもかかわらず切り替え成功時の「元に戻すには」は
+  // 素の名前だけを出していたため、案内どおり打つと必ず「別のアカウントだと確認できません」で
+  // 中止していた。案内するコマンドは、その先のガードをそのまま通れなければ意味がない。
+  const home = sandbox('return-cmd-force', {
+    current: creds('max', { token: 'personal-live' }),
+    accounts: { personal: creds('max', { token: 'personal-live' }), work: creds('max', { token: 'work-live' }) },
+    slot: 'personal',
+  });
+  const r = runSwap(home, ['work', '--force']);
+  check('同一プランでも --force なら切り替わる(前提)', r.code === 0, r.out + r.err);
+  check('「元に戻すには」に --force が付く', /元に戻すには: swap personal --force/.test(r.out), r.out);
+
+  // 案内どおりに打って実際に戻れることまで見る。文字列だけ合わせても、その先で別の理由に
+  // 当たれば行き止まりは残る。
+  const back = runSwap(home, ['personal', '--force']);
+  check('案内どおり打つと実際に元へ戻れる', back.code === 0, back.out + back.err);
+  check('戻った内容は元のアカウントのもの', tokenOf(credPath(home)) === 'personal-live', tokenOf(credPath(home)));
+
+  // 対照: プラン種別が食い違う向き(pro → team)では復元側のガードに当たらないので --force を
+  // 足さない。要らない --force を常に添えると旗の意味が摩耗し、本当に危ない場面でも素通りする。
+  const home2 = sandbox('return-cmd-plain', {
+    current: creds('pro', { token: 'pro-live' }),
+    accounts: { pro: creds('pro', { token: 'pro-live' }), team: creds('team', { token: 'team-live' }) },
+    slot: 'pro',
+  });
+  const r2 = runSwap(home2, ['team']);
+  check('プランが違えば --force なしで切り替わる(対照の前提)', r2.code === 0, r2.out + r2.err);
+  check('プランが違うときは「元に戻すには」に --force を足さない',
+    /元に戻すには: swap pro$/m.test(r2.out), r2.out);
+}
+{
   // HOME をどこからも導出できない環境。credentials.js が '.' 等へ逃げると、退避先が cwd 配下に
   // 解決されて「退避が 1 つも無い」ように見える(実際の退避は本物の HOME に残っているのに、
   // 消えたと誤解して /login し直すと現在のアカウントまで失う)。空文字だけでなく空白のみも
@@ -991,6 +1043,13 @@ console.log('swap');
       /HOME/.test(r.out + r.err) && !/退避されていません/.test(r.out), r.out + r.err);
     check(`HOME が全滅(${label})でもスタックトレースを投げっぱなしにしない`,
       !/ {4}at /.test(r.err), r.err);
+    // credentials.js は隣にある(require 自体は成功する)ので、「隣に置き忘れた」診断に
+    // 落ちてはいけない。落ちると、既に隣にある正しいファイルをコピーし直せという効かない
+    // 案内を繰り返させてしまう(account-guard.js の homeUnresolvedMessage() と同じ理由)。
+    check(`HOME が全滅(${label})でも置き場所の誤診断をしない`,
+      !/credentials\.js を読み込めません/.test(r.err), r.err);
+    check(`HOME が全滅(${label})なら環境変数を直すよう案内する`,
+      /USERPROFILE または HOME に実在するホームディレクトリを設定/.test(r.out + r.err), r.out + r.err);
   }
 }
 
@@ -1269,6 +1328,13 @@ console.log('swap');
   checkAbort('控えのコピーが失敗する上書き', home, before, r);
   check('生の Node 例外ではなく理由と対処を案内する',
     /控えを取れませんでした/.test(r.err) && !/ {4}at /.test(r.err), r.err);
+  // copyFileSync が ENOSPC/EIO 等で書き込み途中に失敗すると、切り詰められた部分ファイルが
+  // dest に残ることがある。消さずに残すと replacedCounts() が「上書きで退けた旧内容」として
+  // 数え、cmdStatus が復元可能なバックアップとして誤って案内する(しかも pruneReplaced は
+  // 読めない控えを削除対象から外すので自動でも消えない)。personal 用の控えが 1 つも
+  // 残っていないことを確認する。
+  check('控えのコピー失敗で部分ファイルの残骸を残さない',
+    replacedFiles(home, 'personal').length === 0, replacedFiles(home, 'personal').join(','));
 }
 {
   // saveInto の上書きガード(cmdSwap の「来歴は一致するが中身が違う」経路): 来歴が一致していても

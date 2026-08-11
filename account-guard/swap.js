@@ -53,9 +53,40 @@ let credentials;
 try {
   credentials = require('./credentials');
 } catch (e) {
+  // HOME_UNRESOLVED は credentials.js を読み込めた(=置き場所は合っている)うえで、
+  // USERPROFILE / HOME / os.homedir() のどれも使える値を返さない環境そのものが原因。
+  // 下の「隣に置き忘れた」診断のまま案内すると、既に隣にある正しいファイルをコピーし直せと
+  // 効かない指示を繰り返させる(account-guard.js の homeUnresolvedMessage() と同じ原因なので、
+  // 案内する対処もそちらに合わせる)。
+  if (e.code === 'HOME_UNRESOLVED') {
+    fail('ホームディレクトリを特定できないため、退避先の場所を決められません'
+      + '\n  USERPROFILE / HOME のいずれも使える値を持たず、os.homedir() も空を返しています'
+      + '\n  ここで相対パスに逃げると、本物の退避は別の場所にあるのに「退避なし」に見えてしまうため中止しました'
+      + '\n  USERPROFILE または HOME に実在するホームディレクトリを設定してから、もう一度実行してください');
+  }
   fail('swap.js の隣にある credentials.js を読み込めません'
     + '\n  (' + path.join(__dirname, 'credentials.js') + ': ' + (e.code || e.message) + ')'
     + '\n  swap.js を別の場所へ移した場合は、credentials.js も同じディレクトリへ置いてください');
+}
+// require が成功しても中身までは保証されない。無関係な・古い credentials.js が隣にあると
+// require 自体は成功するが HOME 等が期待する形でないことがあり、素通しで分割代入すると
+// この先の path.join(HOME, ...) がここより下の try/catch より前で TypeError を投げ、
+// 上のような案内が出ないまま生のスタックトレースだけで終わる(account-guard.js の
+// 同種チェックと同じ理由)。必要なエクスポートの形を検証し、欠けていれば「読み込めなかった」
+// 場合と同じ fail() 経路に合流させる。
+if (
+  !credentials
+  || typeof credentials.HOME !== 'string' || !credentials.HOME.trim()
+  || typeof credentials.CREDENTIALS !== 'string' || !credentials.CREDENTIALS
+  || typeof credentials.readCredentials !== 'function'
+  || typeof credentials.subscriptionTypeOf !== 'function'
+  || typeof credentials.hasUsableCredentials !== 'function'
+) {
+  fail('swap.js の隣にある credentials.js の形式が想定と違います'
+    + '\n  (' + path.join(__dirname, 'credentials.js') + ')'
+    + '\n  HOME / CREDENTIALS / readCredentials / subscriptionTypeOf / hasUsableCredentials のいずれかが'
+    + '欠けているか、期待する型ではありません'
+    + '\n  swap.js と対応する版の credentials.js を同じディレクトリへ置き直してください');
 }
 const { HOME, CREDENTIALS, readCredentials, subscriptionTypeOf } = credentials;
 
@@ -309,19 +340,23 @@ function hasCopyElsewhere(token, selfFile) {
 // 控えが 2 本あると、片方がもう片方の証人になって両方 unlink された)。1 件ずつ消せば、
 // 先に消した分は次の判定の証人から自然に外れる(hasCopyElsewhere は実ファイルを見るため)。
 function pruneReplaced(base, protect) {
-  const candidates = replacedEntries(base).filter(e => e.file !== protect);
+  // 中身は最初に 1 度だけ読む。控えの内容はこのループの中では変わらない(変えるのは
+  // unlink だけで、消したものは candidates からも外す)ので、反復ごとに読み直すのは
+  // 同じ結果を得るためだけのディスク I/O になる。控えが増えるほど二乗で効いてくる。
+  const candidates = replacedEntries(base)
+    .filter(e => e.file !== protect)
+    .map(e => ({ ...e, creds: readCredsOrNull(e.file) }));
   let excess = candidates.length + 1 - REPLACED_KEEP; // +1 は protect の分
   while (excess > 0) {
     // 失効済みを最優先(他の控えの状態に左右されない、最も確実な根拠)
-    let victim = candidates.find(e => {
-      const c = readCredsOrNull(e.file);
-      return c && isExpired(c.json);
-    });
+    let victim = candidates.find(e => e.creds && isExpired(e.creds.json));
     if (!victim) {
+      // 一方で hasCopyElsewhere は実ファイルを見たままにする。ここをキャッシュすると、
+      // 先に消した控えが証人として残り続け、同じ token を持つ 2 本が互いを保証して
+      // 両方消える(上のコメントの事故がそのまま戻る)。
       victim = candidates.find(e => {
-        const c = readCredsOrNull(e.file);
-        if (!c) return false; // 読めないものは複製の有無を証明できない
-        const token = refreshTokenOf(c.json);
+        if (!e.creds) return false; // 読めないものは複製の有無を証明できない
+        const token = refreshTokenOf(e.creds.json);
         return token && hasCopyElsewhere(token, e.file);
       });
     }
@@ -347,6 +382,12 @@ function keepAside(file, base) {
     // --force で「読めない現在でも進む」と案内した直後にここで同じ理由の生の Node 例外が出て、
     // 案内どおり打った利用者が行き止まりになっていた。控えを残せない以上、上書きには進めない
     // (捕まえずに投げっぱなしにすると main の catch が生のメッセージだけを出して終わる)。
+    // copyFileSync が書き込みの途中で失敗すると(ENOSPC/EIO 等)、切り詰められた部分ファイルが
+    // dest に残ることがある。消さずに fail() すると、この部分ファイルが replacedCounts() に
+    // 「上書きで退けた旧内容」として数えられ、cmdStatus が復元可能なバックアップとして案内して
+    // しまう。しかも pruneReplaced は読めない控えを削除対象から意図的に外すので、自動でも
+    // 消えない。unlink 自体の失敗は握りつぶす(そこまで失敗する環境では他に打つ手がない)。
+    try { fs.unlinkSync(dest); } catch {}
     fail('上書きで失われる内容の控えを取れませんでした(' + (e.code || e.message) + ')'
       + '\n  ' + file + ' を読み取れません。権限を確認するか、ウイルス対策やバックアップツールなど'
       + 'このファイルを掴んでいる別プロセスがあれば終了したうえで、'
@@ -554,11 +595,14 @@ function saveCurrent(explicitName, force, forceCmd, pre) {
 // 踏んだ人に、「もう一方の唯一のバックアップを潰すコマンド」を提示して終わっていた。
 // 両方の可能性を並べて、判断は人に返す。
 //
-// returnTo は「先に戻すべきスロット名」。切り替えを伴う場合に渡す。切り替えのあとで
+// returnCmd は「先に戻すためのコマンド」。切り替えを伴う場合に渡す。切り替えのあとで
 // `swap save <name> --force` を打つと、更新されるのは復元したばかりのアカウントの内容なので、
 // 名前を挙げたスロットのバックアップがそこで失われる(以前は切り替え前に案内していたため、
 // 出力どおりに打つと意味が反対になっていた)。
-function reportOtherSlots(saved, indent, returnTo) {
+// スロット名ではなくコマンドを丸ごと受け取るのは、--force の要否が呼び出し側にしか分からず、
+// ここで名前から組み立て直すと判定が二重になるため(それが実際にずれて、案内どおり打つと
+// 中止される事故になっていた。cmdSwap の restoreCmd 参照)。
+function reportOtherSlots(saved, indent, returnCmd) {
   const stale = saved.stale || [];
   const drifted = saved.drifted || null;
   const names = [...new Set([...stale, ...(drifted ? [drifted] : [])])];
@@ -577,8 +621,8 @@ function reportOtherSlots(saved, indent, returnTo) {
     + '(このツールでは見分けられません)');
   console.log(indent + '  前者だと分かっているときだけ更新してください'
     + '(後者なら、そのアカウントの退避を潰します):');
-  if (returnTo) {
-    console.log(indent + '    swap ' + returnTo
+  if (returnCmd) {
+    console.log(indent + '    ' + returnCmd
       + '   (先に戻さないと、いま復元したアカウントの内容で上書きされます)');
   }
   console.log(indent + '    swap save ' + names[0] + ' --force');
@@ -775,6 +819,18 @@ function cmdSwap(target, force) {
       + '\n  現在のログインはそのままです。承知のうえで復元するなら: swap ' + target + ' --force');
   }
 
+  // 案内に出すコマンドが、その先のガードでそのまま通るかどうか。効くのは 2 つのガードで、
+  // どちらも同じ planDiffers の値で決まる:
+  //   復元側 … 別アカウントだと証明できない(プランが同じ)なら止まる → --force が要る
+  //   退避側 … 来歴が一致していてもプラン種別が食い違えば止まる     → --force が要る
+  // 向きが逆なので、案内する場所ごとに書いていると片方だけ直して他が古いままになる。実際
+  // この取り違えで「案内どおり打つと必ず中止される」事故が、復元の案内・退避の案内・
+  // 切り替え後の戻し方でそれぞれ再現した。値も文字列の組み立ても、ここ 1 箇所に集める。
+  const planned = cur ? planDiffers(cur.json, next.json) : false;
+  // 戻す向きでも planDiffers は対称なので、切り替え後の「元に戻すには」もこれで足りる。
+  const restoreCmd = (name) => 'swap ' + name + (planned ? '' : ' --force');
+  const saveCmd = (name) => 'swap save' + (name ? ' ' + name : '') + (planned ? ' --force' : '');
+
   const provenance = readCurrentSlot();
   // cur が無い(未ログイン・読めない)ときは「すでに復元済み」とは言えない。来歴だけを見て
   // ここで止めると、credentials を失った人が退避を復元できない行き止まりになる。
@@ -791,22 +847,12 @@ function cmdSwap(target, force) {
     console.log('すでに ' + target + ' から復元した状態です。認証は変更しませんでした');
     console.log('  ただし現在の内容は ' + target + ' の退避と一致しません。退避のあとトークンが'
       + '更新されたか、このツールを通さずに /login した可能性があります');
-    // 案内するコマンドが次のガードに当たるかは、ここで分かる。当たるなら、そのとき必要になる
-    // --force まで出しておく(案内どおり打って止まるのは、案内していないのと同じ)。
-    // この時点の target の内容は上で読み込んだ next そのものなので、判定には cur と next を
-    // 比べればよい(saveInto が上書き時に見る old も、復元側が見る next も、この時点では同じ)。
-    const planned = planDiffers(cur.json, next.json);
     console.log('  現在のログインのほうが新しいなら、退避を最新にします:');
-    // saveInto の上書きガードは「来歴が一致していても、プラン種別が食い違えば止める」ため、
-    // ここで plan が違うと分かっているなら --force を添えないと同じ理由で必ず失敗する
-    // (実機で再現: --force なしの案内どおり打っても「現在と違う認証情報が入っています」で
-    //  中止していた)。
-    console.log('    swap save' + (planned ? ' --force' : ''));
+    console.log('    ' + saveCmd(null));
     console.log('  ' + target + ' の退避に戻したいなら、先に現在を別名へ退避してから復元します:');
     console.log('    swap save <別名>');
-    const unproven = !planned;
-    console.log('    swap ' + target + (unproven ? ' --force' : ''));
-    if (unproven) {
+    console.log('    ' + restoreCmd(target));
+    if (!planned) {
       console.log('  (同じプランなので別アカウントだと確認できません。--force はそれを承知で'
         + '復元するという意味です)');
     }
@@ -818,9 +864,6 @@ function cmdSwap(target, force) {
   // どちらかにしかならない。別名で退避すれば何も壊さずに切り替えられるので、その手順を出す。
   // 次の同一性の判定より先に置くのは、そちらの案内(--force)がこの状況では効かないため。
   if (cur && currentSlotOf(cur) === target) {
-    // 別名で退避したあとの復元が次の判定に当たるかは、ここで分かる。当たるなら、そのとき
-    // 必要になる --force まで出しておく(案内どおり打って止まるのは案内していないのと同じ)
-    const unproven = !planDiffers(cur.json, next.json);
     fail('現在のログインの退避先が復元元(' + target + ')と同じ名前になります'
       // 「別のアカウント」とまでは証明できない(同じアカウントの古い退避かもしれない)。
       // 確かなのは現在と違う認証情報が入っていることなので、そこまでしか言わない。
@@ -828,11 +871,11 @@ function cmdSwap(target, force) {
       + '\n  先に別名で退避してください(既存のスロットには触りません):'
       + '\n    swap save <別名>'
       + '\n  そのあと切り替えられます:'
-      + '\n    swap ' + target + (unproven ? ' --force' : '')
-      + (unproven
-        ? '\n  (プラン種別が同じか読めないため別アカウントだと確認できません。'
-          + '--force はそれを承知で復元するという意味です)'
-        : ''));
+      + '\n    ' + restoreCmd(target)
+      + (planned
+        ? ''
+        : '\n  (プラン種別が同じか読めないため別アカウントだと確認できません。'
+          + '--force はそれを承知で復元するという意味です)'));
   }
 
   // 復元先が「別アカウント」だと証明できないときは黙って進まない。同一プランの別アカウントと
@@ -846,7 +889,6 @@ function cmdSwap(target, force) {
   // そこでも復元は退化になる。ただしここで止めると日常の切り替えが常に --force を要求し、
   // 旗の意味が摩耗して本当に危ない場面でも素通りするので、進む代わりに戻し方を必ず添える
   // (この時点で現在のログインは退避済みなので、元に戻す手は必ず残っている)。
-  const planned = cur ? planDiffers(cur.json, next.json) : false;
   if (cur && !force && !planned) {
     const type = subscriptionTypeOf(cur.json);
     // --force を案内する前に、その --force が退避の段で止まらないかを見る。退避名は来歴か
@@ -893,13 +935,16 @@ function cmdSwap(target, force) {
   // 戻し方は毎回出す。復元先が「同じアカウントのプラン変更前の退避」だった場合(planDiffers は
   // それを別アカウントと区別できない)、切り替えた瞬間に全セッションが認証エラーになるが、
   // 直前の退避があるので戻すだけで復旧できる。知らなければ /login をやり直すことになる。
+  // --force の要否は切り替え前と同じ(planDiffers は向きを問わない)。素の名前だけを出して
+  // いたため、同一プラン同士の切り替え(--force でしか通れない)のあとに案内どおり打つと
+  // 「別のアカウントだと確認できません」で必ず中止されていた。
   if (saved && saved.name) {
-    console.log('  元に戻すには: swap ' + saved.name);
+    console.log('  元に戻すには: ' + restoreCmd(saved.name));
   }
 
   // 取り残された他スロットの案内は切り替えの「あと」に出す。切り替え前に出していた頃は
   // 案内の意味が反対になっていた(reportOtherSlots のコメント参照)。戻る手順を添えて渡す。
-  if (saved && saved.name) reportOtherSlots(saved, '  ', saved.name);
+  if (saved && saved.name) reportOtherSlots(saved, '  ', restoreCmd(saved.name));
 }
 
 function usage() {
