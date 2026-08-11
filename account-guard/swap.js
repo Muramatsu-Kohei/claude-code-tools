@@ -68,9 +68,11 @@ const CURRENT_FILE = path.join(ACCOUNTS_DIR, '.current');
 // 復旧はファイルを戻すだけで済む。同じ理由で、スロット一覧には出さない(復元先ではない)。
 const REPLACED_DIR = path.join(ACCOUNTS_DIR, '.replaced');
 // 控えは平文トークンなので無制限には残さない。1 本だと「間違えた上書きを 2 回続けた」ときに
-// 元が消えるので 2 本。ただしこれは上限であって保証ではない: 落とせるのは復旧に使えないもの
-// (失効済み・読めない)か、同じ資格情報が他にも残っていると言えるものだけで、どちらでもない
-// 控えは上限を超えても残す(pruneReplaced)。本数を守るために唯一の 1 本を消しては本末転倒。
+// 元が消えるので 2 本。ただしこれは上限であって保証ではない: 落とせるのは失効済み(復旧しても
+// /login のやり直しになる)か、同じ資格情報が他にも残っていると言えるものだけで、どちらでもない
+// 控えは上限を超えても残す(pruneReplaced)。読み取りに失敗したものも「復旧に使えない」とは
+// 言えない(一過性の要因もありうる)ので、証明できるものが尽きたら上限を超えても残す側に倒す。
+// 本数を守るために唯一の 1 本を消しては本末転倒。
 const REPLACED_KEEP = 2;
 // 読めない credentials の控えに使う名前。スロット名と同じ空間に置くと、退避として
 // 復元候補に見えてしまう(中身は復元に使えない)。先頭の `.` は NAME_RE が通さない文字
@@ -292,33 +294,41 @@ function hasCopyElsewhere(token, selfFile) {
 // 超過分を古い順で機械的に落としていたため、同じスロットへ 3 回続けて退避すると、最初に
 // 押し出されたアカウントの唯一の生存コピーが消えていた(復旧はブラウザ OAuth のやり直し)。
 // 冒頭で構造の保証だと書いた以上、本数のために唯一の 1 本を落とすことはしない。
-// 落としてよいのは次の 3 つだけで、この順に選ぶ。
+// 落としてよいのは次の 2 つだけで、この順に選ぶ。
 //   0. 失効済み       … 復元しても /login のやり直しになる
 //   1. 複製が他にある … refreshToken の一致で証明できる
-//   2. 読めない       … 復元に使えない中身(手掛かりとしての価値しかない)
-// どれでもない控えは、そのアカウントの最後の 1 本かもしれないので上限を超えても残す。
+// 読めない控え(readCredsOrNull が null)は落とさない。ウイルス対策やバックアップツールの
+// ロック、ACL の一時変更、EBUSY のような一過性の要因でも読めなくなるため、読めないことは
+// 「復旧に使えない」の証明にならない。証明できない以上、上限を超えても残す側に倒す。
+// どれでもない控えも、そのアカウントの最後の 1 本かもしれないので上限を超えても残す。
 // protect は今まさに退けたばかりの控え。上限判定の対象には数えるが、削除の候補からは外す。
+//
+// 「複製が他にある」は 1 件消すたびに評価し直す。同じ refreshToken を持つ控え同士は
+// 互いの証人になれてしまうため、まとめて判定すると両方とも「複製あり」と出て両方消え、
+// 唯一の生存コピーが消失する(実機で再現: 他のどこにも複製が無い状態で同じ token を持つ
+// 控えが 2 本あると、片方がもう片方の証人になって両方 unlink された)。1 件ずつ消せば、
+// 先に消した分は次の判定の証人から自然に外れる(hasCopyElsewhere は実ファイルを見るため)。
 function pruneReplaced(base, protect) {
-  const list = replacedEntries(base);
-  const excess = list.length - REPLACED_KEEP;
-  if (excess <= 0) return;
-  const rank = e => {
-    const c = readCredsOrNull(e.file);
-    if (!c) return 2;
-    if (isExpired(c.json)) return 0;
-    const token = refreshTokenOf(c.json);
-    // refreshToken が無い控えは複製かどうかを言えない。復元しても数時間で切れる中身だが、
-    // 「唯一のコピーではない」と証明できない以上、消す側には数えない。
-    return token && hasCopyElsewhere(token, e.file) ? 1 : 3;
-  };
-  const droppable = list
-    .filter(e => e.file !== protect)
-    .map(e => ({ e, r: rank(e) }))
-    .filter(x => x.r < 3)
-    // 同じ順位のなかは古い順(replacedEntries は連番の昇順)
-    .sort((a, b) => a.r - b.r || a.e.n - b.e.n);
-  for (const { e } of droppable.slice(0, excess)) {
-    try { fs.unlinkSync(e.file); } catch {}
+  const candidates = replacedEntries(base).filter(e => e.file !== protect);
+  let excess = candidates.length + 1 - REPLACED_KEEP; // +1 は protect の分
+  while (excess > 0) {
+    // 失効済みを最優先(他の控えの状態に左右されない、最も確実な根拠)
+    let victim = candidates.find(e => {
+      const c = readCredsOrNull(e.file);
+      return c && isExpired(c.json);
+    });
+    if (!victim) {
+      victim = candidates.find(e => {
+        const c = readCredsOrNull(e.file);
+        if (!c) return false; // 読めないものは複製の有無を証明できない
+        const token = refreshTokenOf(c.json);
+        return token && hasCopyElsewhere(token, e.file);
+      });
+    }
+    if (!victim) break; // 消してよいと言えるものが尽きた。上限を超えたまま残す
+    try { fs.unlinkSync(victim.file); } catch {}
+    candidates.splice(candidates.indexOf(victim), 1);
+    excess--;
   }
 }
 
@@ -330,7 +340,19 @@ function keepAside(file, base) {
   const list = replacedEntries(base);
   const n = list.length ? list[list.length - 1].n + 1 : 1;
   const dest = path.join(REPLACED_DIR, base + '-' + n + '.json');
-  fs.copyFileSync(file, dest);
+  try {
+    fs.copyFileSync(file, dest);
+  } catch (e) {
+    // ここが失敗する原因(EACCES/EPERM/EISDIR 等)は、たいてい file を読めない理由と同じなので、
+    // --force で「読めない現在でも進む」と案内した直後にここで同じ理由の生の Node 例外が出て、
+    // 案内どおり打った利用者が行き止まりになっていた。控えを残せない以上、上書きには進めない
+    // (捕まえずに投げっぱなしにすると main の catch が生のメッセージだけを出して終わる)。
+    fail('上書きで失われる内容の控えを取れませんでした(' + (e.code || e.message) + ')'
+      + '\n  ' + file + ' を読み取れません。権限を確認するか、ウイルス対策やバックアップツールなど'
+      + 'このファイルを掴んでいる別プロセスがあれば終了したうえで、'
+      + '先ほどと同じ swap コマンドをもう一度実行してください'
+      + '\n  控えを残せない以上、上書きは行っていません(元のファイルは手つかずです)');
+  }
   try { fs.chmodSync(dest, 0o600); } catch {}
   pruneReplaced(base, dest);
   return dest;
@@ -663,9 +685,16 @@ function cmdSave(name, force) {
       + '\n  Claude Code で `/login` してから、もう一度 `swap save` を実行してください');
   }
   if (saved.degraded) {
-    console.log('現在の credentials は復元に使える形ではないため、退避しませんでした');
-    console.log('  中身の控え: ' + saved.kept);
-    return;
+    // README は「切り替え(退避)が起きなかったときは終了コードを成功にしない」と明記している。
+    // ここを exit 0 で抜けると、`swap save --force && ...` のようなラッパーが「退避できた」
+    // ものとして次へ進み、続く /login が書き込み途中だった正規の credentials を上書きして消す。
+    // 理由は unreadableReason で改めて確認する(--force を挟む間にファイルの状態が変わって
+    // いることもあるため、saveCurrent の中で見た理由を使い回さない)。
+    const why = unreadableReason(CREDENTIALS);
+    fail('現在の credentials を読めないため、退避しませんでした(' + why.label + ')'
+      + (why.retryable ? '\n  時間をおいて再実行してください。' : '\n  ')
+      + '中身の控えは残しました: ' + saved.kept
+      + '\n  控えの中身を確認したうえで、`/login` してから `swap save` をやり直してください');
   }
   console.log('退避しました: ' + saved.name + ' -> ' + accountFile(saved.name));
   reportOtherSlots(saved, '  ', null);
@@ -762,13 +791,20 @@ function cmdSwap(target, force) {
     console.log('すでに ' + target + ' から復元した状態です。認証は変更しませんでした');
     console.log('  ただし現在の内容は ' + target + ' の退避と一致しません。退避のあとトークンが'
       + '更新されたか、このツールを通さずに /login した可能性があります');
+    // 案内するコマンドが次のガードに当たるかは、ここで分かる。当たるなら、そのとき必要になる
+    // --force まで出しておく(案内どおり打って止まるのは、案内していないのと同じ)。
+    // この時点の target の内容は上で読み込んだ next そのものなので、判定には cur と next を
+    // 比べればよい(saveInto が上書き時に見る old も、復元側が見る next も、この時点では同じ)。
+    const planned = planDiffers(cur.json, next.json);
     console.log('  現在のログインのほうが新しいなら、退避を最新にします:');
-    console.log('    swap save');
+    // saveInto の上書きガードは「来歴が一致していても、プラン種別が食い違えば止める」ため、
+    // ここで plan が違うと分かっているなら --force を添えないと同じ理由で必ず失敗する
+    // (実機で再現: --force なしの案内どおり打っても「現在と違う認証情報が入っています」で
+    //  中止していた)。
+    console.log('    swap save' + (planned ? ' --force' : ''));
     console.log('  ' + target + ' の退避に戻したいなら、先に現在を別名へ退避してから復元します:');
     console.log('    swap save <別名>');
-    // 復元の段で同一性のガードに当たるかはここで分かる。当たるなら、そのとき必要になる
-    // --force まで出しておく(案内どおり打って止まるのは、案内していないのと同じ)
-    const unproven = !planDiffers(cur.json, next.json);
+    const unproven = !planned;
     console.log('    swap ' + target + (unproven ? ' --force' : ''));
     if (unproven) {
       console.log('  (同じプランなので別アカウントだと確認できません。--force はそれを承知で'
@@ -892,10 +928,24 @@ function usage() {
 function main() {
   const args = process.argv.slice(2);
   if (args.length === 0) return cmdStatus();
-  const [cmd, ...rest] = args;
+  // --force はサブコマンド判定より前に、置かれた位置に関わらず取り除く。以前は rest
+  // (第一引数の後ろ)からしか探していなかったため、`swap --force team` のように第一引数の
+  // 位置に置くと --force がサブコマンド名として解釈され、`swap save --force team` と
+  // 同じ意図で打っても「引数が多すぎます」で止まっていた。
+  // スロット名として文字どおり "--force" を使いたい場合との衝突は起きない: ここで無条件に
+  // 取り除く以上、"--force" という文字列が cmd や extra に残ることは無く、validateName まで
+  // 届かない(NAME_RE 単体は "--force" を弾かないが、CLI の入り口で先に消費される)。
+  const force = args.includes('--force');
+  const rest0 = args.filter(a => a !== '--force');
+  if (rest0.length === 0) {
+    // --force だけを渡された(適用対象が無い)。cmdStatus に横流しすると
+    // 「引数が無いので状態表示」と「--force だけ渡した」が区別できず、typo に気づけない。
+    fail('--force を付けるコマンドがありません'
+      + '\n  `swap <name> --force` または `swap save --force` の形で指定してください');
+  }
+  const [cmd, ...rest] = rest0;
   if (cmd === '-h' || cmd === '--help' || cmd === 'help') return usage();
-  const force = rest.includes('--force');
-  const extra = rest.filter(a => a !== '--force');
+  const extra = rest;
   // 余分な引数は typo の兆候なので黙って捨てない(save は名前を 1 つだけ取る)
   if (cmd === 'save') {
     if (extra.length > 1) {

@@ -569,6 +569,54 @@ console.log('swap');
     replacedFiles(home, 'personal').join(','));
 }
 {
+  // pruneReplaced(データ消失、実機で再現): 同じ refreshToken を持つ控え同士は、他のどこにも
+  // 複製が無くても「複製が他にある」の証人になり合える。まとめて判定すると両方とも
+  // droppable と出て、同じ回の刈り込みで両方消えてしまう(ツリー上のどこにも残らない)。
+  // 1 件消すたびに残りの控えで判定を取り直せば、片方を消した時点でもう片方は証人を失って
+  // 残る側に回るはず。
+  const home = sandbox('prune-mutual-witness', {
+    current: creds('pro', { token: 'incoming' }),
+    accounts: { personal: creds('pro', { token: 'old-in-slot' }) },
+  });
+  fs.mkdirSync(replacedDir(home), { recursive: true });
+  fs.writeFileSync(path.join(replacedDir(home), 'personal-1.json'),
+    JSON.stringify(creds('pro', { token: 'dup-X' })), 'utf8');
+  fs.writeFileSync(path.join(replacedDir(home), 'personal-2.json'),
+    JSON.stringify(creds('pro', { token: 'dup-X' })), 'utf8');
+  fs.writeFileSync(path.join(replacedDir(home), 'personal-3.json'),
+    JSON.stringify(creds('pro', { token: 'unique-Z' })), 'utf8');
+  const r = runSwap(home, ['save', 'personal', '--force']);
+  check('相互に証人になる控えがあっても実行は成功する', r.code === 0, r.out + r.err);
+  const survivorTokens = replacedFiles(home, 'personal')
+    .map(f => tokenOf(path.join(replacedDir(home), f)));
+  check('複製元(dup-X)がツリー上のどこかに必ず残っている(データ消失なし)',
+    survivorTokens.includes('dup-X'), survivorTokens.join(','));
+  check('他に複製の無い控え(unique-Z)は落とさない', survivorTokens.includes('unique-Z'),
+    survivorTokens.join(','));
+}
+{
+  // pruneReplaced(読み取り失敗の誤同一視): 読み取りに失敗した控えは「復元に使えない中身」だと
+  // 決め打ちできない(ウイルス対策やバックアップツールのロック、ACL の一時変更、EBUSY のような
+  // 一過性の事象でも同じ null が返る)。唯一のコピーが一過性の読み取り失敗で消えないよう、
+  // 「複製があると証明できない」側として上限を超えても残すこと。
+  const home = sandbox('prune-unreadable-not-provable', {
+    current: creds('pro', { token: 'gen1' }),
+    accounts: { personal: creds('pro', { token: 'old1' }) },
+  });
+  fs.mkdirSync(replacedDir(home), { recursive: true });
+  fs.writeFileSync(path.join(replacedDir(home), 'personal-1.json'), 'not valid json', 'utf8');
+  let allOk = true;
+  for (const t of ['gen2', 'gen3']) {
+    fs.writeFileSync(credPath(home), JSON.stringify(creds('pro', { token: t })), 'utf8');
+    const r = runSwap(home, ['save', 'personal', '--force']);
+    if (r.code !== 0) allOk = false;
+  }
+  check('読めない控えがあっても反復はすべて成功する', allOk);
+  check('読めない控えは複製の有無を証明できないので上限を超えても残す',
+    fs.existsSync(path.join(replacedDir(home), 'personal-1.json')),
+    replacedFiles(home, 'personal').join(','));
+}
+{
   // 来歴が一致するスロットは自分のバックアップなので、確認を挟まず更新できないと
   // 通常の `swap save` が毎回 --force を要求することになって使い物にならない。
   const home = sandbox('overwrite-own', {
@@ -1153,6 +1201,75 @@ console.log('swap');
   const before = snapshotTree(home);
   const r = runSwap(home, ['team', 'extra']);
   checkAbort('swap への引数過多', home, before, r);
+}
+
+// --- レビュー指摘: 行き止まりと誤った成功終了の回帰 ---
+{
+  // cmdSave(degraded 経路): 退避が起きなかった以上、成功終了で返さない(README:
+  // 「切り替え(退避)が起きなかったときは終了コードを成功にしない」)。ここが exit 0 のままだと、
+  // `swap save --force && ...` のようなラッパーが「退避できた」ものとして次へ進み、続く /login が
+  // 書き込み途中だった正規の credentials を上書きして消す(実測済み)。
+  // 控え(手掛かり)は作るのでツリーは変わる。checkAbort の「何も書き換えない」は使えないため
+  // 個別に確認する。
+  const home = sandbox('save-degraded-nonzero', { current: '{ broken' });
+  const r = runSwap(home, ['save', '--force']);
+  check('読めない現在を --force で退避しても成功終了しない', r.code !== 0, r.out + r.err);
+  check('中身の控えは残す(手掛かりとしての価値)', replacedFiles(home).length === 1,
+    r.out + r.err + replacedFiles(home).join(','));
+  check('中止しても次の一手を示す(行き止まりにしない)',
+    /\/login/.test(r.out + r.err) || /swap /.test(r.out + r.err), r.out + r.err);
+}
+{
+  // keepAside(控えのコピー失敗): fs.copyFileSync 自体が失敗すると、以前は生の Node 例外
+  // (EPERM 等)がそのまま main の catch を通って出て、案内された --force が行き止まりになって
+  // いた。ディレクトリを退避先に置いて確実に EPERM を再現する(実機では権限や別プロセスの
+  // ロックで同じことが起きる)。
+  const home = sandbox('keepaside-copy-fails', { current: creds('pro', { token: 'incoming' }) });
+  fs.mkdirSync(acctPath(home, 'personal'), { recursive: true }); // ファイルの代わりにディレクトリ
+  fs.mkdirSync(replacedDir(home), { recursive: true }); // 事前に作り、mkdirSync 自体を差分にしない
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['save', 'personal', '--force']);
+  checkAbort('控えのコピーが失敗する上書き', home, before, r);
+  check('生の Node 例外ではなく理由と対処を案内する',
+    /控えを取れませんでした/.test(r.err) && !/ {4}at /.test(r.err), r.err);
+}
+{
+  // saveInto の上書きガード(cmdSwap の「来歴は一致するが中身が違う」経路): 来歴が一致していても
+  // プラン種別が食い違えば、案内した `swap save` は上書きガードに当たって必ず失敗していた
+  // (実機で再現)。他の中止経路と同じく、当たるなら --force を添えて案内すること。
+  const home = sandbox('provenance-save-needs-force', {
+    current: creds('pro', { token: 'pro-live' }),
+    accounts: { team: creds('team', { token: 'team-old' }) },
+    slot: 'team',
+  });
+  const r = runSwap(home, ['team']);
+  check('来歴一致でもプラン種別が食い違えば中止する', r.code === 1, r.out + r.err);
+  check('案内する swap save に --force が付いている(行き止まりにしない)',
+    /swap save --force/.test(r.out + r.err), r.out + r.err);
+  const follow = runSwap(home, ['save', '--force']);
+  check('案内どおり実行すると実際に通る', follow.code === 0, follow.out + follow.err);
+  check('退避先が現在の内容で更新される', tokenOf(acctPath(home, 'team')) === 'pro-live',
+    follow.out + follow.err);
+}
+{
+  // main(--force の位置): 一般的なフラグ位置で打っても、サブコマンド判定より前に --force を
+  // 認識すること。`swap save --force team` は通るのに `swap --force team` は
+  // 「引数が多すぎます」で止まっていた(実機で再現)。
+  const home = sandbox('force-flag-position', {
+    current: creds('pro', { token: 'live' }),
+    accounts: { team: creds('team', { token: 'team-tok' }) },
+  });
+  const r = runSwap(home, ['--force', 'team']);
+  check('--force を先頭に置いても通常の位置と同じ意味になる(行き止まりにしない)',
+    r.code === 0 && tokenOf(credPath(home)) === 'team-tok', r.out + r.err);
+}
+{
+  // main(--force の位置): --force だけを渡す(適用対象が無い)。cmdStatus に紛れ込ませると
+  // 「引数無しなので状態表示」なのか「--force だけ渡された」なのか typo に気づけない。
+  const home = sandbox('force-flag-alone', { current: creds('pro') });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['--force']);
+  checkAbort('--force だけを渡した', home, before, r);
 }
 
 // --- README の初回手順をそのままなぞる ---
