@@ -610,6 +610,13 @@ console.log('account-guard');
     tool_input: { file_path: 'a.py' },
   });
   check('credentials.js が無くても保護ツリーは拒否する', decision(res) === 'deny', JSON.stringify(res));
+  // 真因は隣のファイルなのに /login を促すと、正しいアカウントで入っている人が
+  // 何度ログインし直しても直らない袋小路に入る。拒否の文面が真因を指すこと。
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('拒否理由が真因(credentials.js が読めない)を指す',
+    /credentials\.js/.test(reason), reason);
+  check('効かない対処(/login)を唯一の次の一手として案内しない',
+    /`\/login` では直りません/.test(reason), reason);
 
   res = runAlone(home, {
     hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',

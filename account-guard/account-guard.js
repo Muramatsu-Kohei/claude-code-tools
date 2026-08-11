@@ -33,10 +33,15 @@ const path = require('path');
 // つまり credentials.js を隣に置き忘れた構成では、保護が丸ごと外れたことに誰も
 // 気づけないまま素通しになる。読めなくても「判別不能」として動き続けるほうが安全。
 let credentials = null;
+// 読めなかった理由は捨てない。ここで落ちると「正しいアカウントでログインしているのに
+// 全部 deny される」状態になり、原因は隣のファイルなのに拒否メッセージが /login を促すと、
+// 何度ログインし直しても直らない袋小路に入る(拒否の文面で真因を出すために使う)。
+let credentialsLoadError = null;
 try {
   credentials = require('./credentials');
-} catch {
+} catch (e) {
   // 単体配置・コピー漏れ・権限。下のフォールバックで拒否側に倒す
+  credentialsLoadError = e;
 }
 
 // HOME の導出だけは自前でも持つ(テストが USERPROFILE / HOME を差し替えるため、
@@ -335,16 +340,32 @@ function denyMessage(hit, account) {
   if (hit.broken) return brokenConfigMessage();
 
   const allowed = hit.allow.length ? hit.allow.join(' / ') : '(許可アカウントの設定なし)';
-  return [
+  const head = [
     `[account-guard] ${hit.tree} は別アカウント専用のツリーです。`,
     `${hit.reason}が、現在ログイン中のアカウントは "${account}" です(許可: ${allowed})。`,
     '',
+  ];
+
+  // 判別不能の原因が「credentials.js を隣に置き忘れた」ときは、ログインし直しても直らない。
+  // ここで /login を促すと、正しいアカウントで入っている人に効かない操作を繰り返させる。
+  if (account === ACCOUNT_UNKNOWN && credentialsLoadError) {
+    return head.concat([
+      `アカウントを判別できません。account-guard.js の隣にある credentials.js を読み込めませんでした`,
+      `(${path.join(__dirname, 'credentials.js')}: ${credentialsLoadError.code || credentialsLoadError.message})。`,
+      '',
+      'ログインの問題ではないため `/login` では直りません。account-guard.js だけを別の場所へ',
+      'コピーした場合は、credentials.js も同じディレクトリへ置いてください。',
+      '判別できない間は保護ツリーへの操作をすべて拒否します(素通しにすると保護が無言で外れるため)。',
+    ]).join('\n');
+  }
+
+  return head.concat([
     account === ACCOUNT_UNKNOWN
       ? 'アカウントを判別できませんでした。未ログインか、認証情報の形式が変わった可能性があります。'
       : 'このツリーのコードを現在のアカウントに読み込ませないため、操作を拒否しました。',
     '`/login` で正しいアカウントに切り替えてから操作してください。回避しようとせず、',
     'ユーザーにアカウントの切り替えが必要であることを伝えてください。',
-  ].join('\n');
+  ]).join('\n');
 }
 
 function brokenConfigMessage() {
