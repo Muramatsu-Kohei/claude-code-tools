@@ -29,7 +29,11 @@ if (!HOME) {
   // 保護や退避が消えたように見える」事故を空文字経由で再現してしまう。呼び出し側
   // (account-guard.js / swap.js)は require の失敗として拾い、既存の「読めない」経路
   // (拒否側に倒す・真因を案内する)にそのまま合流する。
-  throw new Error('HOME を解決できません(USERPROFILE / HOME / os.homedir() のいずれも使える値を返しませんでした)');
+  // 呼び出し側が「ファイルが無い・置き場所が違う」と取り違えないよう、原因を code で示す。
+  // 文面での判別に頼ると、メッセージを直した瞬間に静かに誤診断へ戻る。
+  const e = new Error('HOME を解決できません(USERPROFILE / HOME / os.homedir() のいずれも使える値を返しませんでした)');
+  e.code = 'HOME_UNRESOLVED';
+  throw e;
 }
 const CREDENTIALS = path.join(HOME, '.claude', '.credentials.json');
 
@@ -41,6 +45,15 @@ const ACCOUNT_UNKNOWN = 'unknown';
 function readCredentials(file) {
   const raw = fs.readFileSync(file, 'utf8');
   return { raw, json: JSON.parse(raw) };
+}
+
+// 「復元に使える中身か」の判定。JSON として読めることと、認証に使えることは別で、
+// `{}` や `{"claudeAiOauth":{}}` は JSON.parse を通るが復元しても意味がない。
+// ここを 1 箇所に置くのは、ガードと swap で基準がずれると「ガードは正常と判定して
+// swap を案内するのに、swap は読めないと言って必ず失敗する」袋小路が生まれるため
+// (実際にそうなっていた: ガードは JSON.parse の成否だけを見ていた)。
+function hasUsableCredentials(json) {
+  return Boolean(json && json.claudeAiOauth && json.claudeAiOauth.accessToken);
 }
 
 // credentials に uuid やメールアドレスのような identity フィールドは存在しないため、
@@ -65,6 +78,7 @@ module.exports = {
   CREDENTIALS,
   ACCOUNT_UNKNOWN,
   readCredentials,
+  hasUsableCredentials,
   subscriptionTypeOf,
   currentAccount,
 };
