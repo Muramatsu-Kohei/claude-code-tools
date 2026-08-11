@@ -96,7 +96,11 @@ function fail(msg) {
 // もう片方では扱えない名前ができる(実際、予約語の判定が save 側に無かったため
 // `accounts/save.json` を作れてしまい、復元できないスロットが残せた)。
 function validateName(name) {
-  if (!NAME_RE.test(name)) fail('アカウント名に使えない文字が含まれています: ' + name);
+  if (!NAME_RE.test(name)) {
+    fail('アカウント名に使えない文字が含まれています: ' + name
+      + '\n  使えるのは英数字とハイフン(-)、アンダースコア(_)だけです'
+      + '\n  別の名前で `swap save <名前>` を実行し直してください');
+  }
   if (RESERVED_NAMES.has(name)) {
     fail('その名前は swap のサブコマンドと同じなので使えません: ' + name
       + '\n  作れたとしても `swap ' + name + '` はサブコマンドとして解釈されるため、'
@@ -654,7 +658,10 @@ function cmdSave(name, force) {
   // save の --force は「このスロットを上書きしてよい」という明示なので、両方に効かせる
   const saved = saveCurrent(name, { unreadable: force, overwrite: force },
     'swap save ' + (name || '<name>') + ' --force');
-  if (!saved) fail('現在 credentials がありません(未ログイン)');
+  if (!saved) {
+    fail('現在 credentials がありません(未ログイン)'
+      + '\n  Claude Code で `/login` してから、もう一度 `swap save` を実行してください');
+  }
   if (saved.degraded) {
     console.log('現在の credentials は復元に使える形ではないため、退避しませんでした');
     console.log('  中身の控え: ' + saved.kept);
@@ -665,11 +672,23 @@ function cmdSave(name, force) {
 }
 
 function cmdSwap(target, force) {
-  if (!NAME_RE.test(target)) fail('アカウント名に使えない文字が含まれています: ' + target);
+  if (!NAME_RE.test(target)) {
+    fail('アカウント名に使えない文字が含まれています: ' + target
+      + '\n  使えるのは英数字とハイフン(-)、アンダースコア(_)だけです'
+      + '\n  退避済みの名前は、引数なしで swap を実行すると一覧できます');
+  }
 
   const file = accountFile(target);
   if (!fs.existsSync(file)) {
-    fail('退避されていません: ' + target + '\n  利用可能: ' + (savedAccounts().join(', ') || 'なし'));
+    const saved = savedAccounts();
+    if (saved.length > 0) {
+      fail('退避されていません: ' + target
+        + '\n  利用可能: ' + saved.join(', ')
+        + '\n  この中の名前で `swap <名前>` を実行してください');
+    } else {
+      fail('退避されていません: ' + target
+        + '\n  まだ何も退避されていません。先に `swap save` で現在のアカウントを退避してください');
+    }
   }
 
   // 復元先を先に検証する。壊れたファイルで現在のログインを潰さないため
@@ -680,7 +699,9 @@ function cmdSwap(target, force) {
     // 例外メッセージは出さない。JSON.parse の失敗文はファイル先頭を引用するため、
     // credentials が相手だとトークンの断片が端末やログに残る
     fail(target + ' の内容が壊れているか、想定した形式ではありません。上書きを中止しました'
-      + '\n  ファイル: ' + file);
+      + '\n  ファイル: ' + file
+      + '\n  そのアカウントで `/login` し直してから `swap save ' + target + ' --force` で入れ直してください'
+      + '\n  上書きで失われた旧内容の控えが残っていれば ' + REPLACED_DIR + ' から戻せることがあります');
   }
 
   const cur = readCredsOrNull(CREDENTIALS);
@@ -877,10 +898,16 @@ function main() {
   const extra = rest.filter(a => a !== '--force');
   // 余分な引数は typo の兆候なので黙って捨てない(save は名前を 1 つだけ取る)
   if (cmd === 'save') {
-    if (extra.length > 1) fail('引数が多すぎます: ' + args.join(' '));
+    if (extra.length > 1) {
+      fail('引数が多すぎます: ' + args.join(' ')
+        + '\n  `swap save` が取る名前は 1 つだけです。`swap save <名前>` の形で指定し直してください');
+    }
     return cmdSave(extra[0], force);
   }
-  if (extra.length > 0) fail('引数が多すぎます: ' + args.join(' '));
+  if (extra.length > 0) {
+    fail('引数が多すぎます: ' + args.join(' ')
+      + '\n  `swap <名前>` の形で名前を 1 つだけ指定してください。使い方は `swap help` で確認できます');
+  }
   return cmdSwap(cmd, force);
 }
 

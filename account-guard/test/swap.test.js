@@ -62,6 +62,11 @@ const typeOf = (p) => readJson(p).claudeAiOauth.subscriptionType;
 const tokenOf = (p) => (fs.existsSync(p) ? readJson(p).claudeAiOauth.accessToken : null);
 const slotOf = (home) => (fs.existsSync(slotPath(home))
   ? fs.readFileSync(slotPath(home), 'utf8').trim() : null);
+// 本数制限の刈り込み(pruneReplaced)が控え(.replaced 配下)以外に手を出していないかを見るため、
+// accounts/ 直下のスロット本体(*.json)だけを数える(.replaced はサブディレクトリなので
+// endsWith('.json') のフィルタに引っかからず、自然に除外される)。
+const slotCount = (home) => fs.readdirSync(path.join(home, '.claude', 'accounts'))
+  .filter((f) => f.endsWith('.json')).length;
 
 // current / accounts に文字列を渡すと壊れたファイルを再現できる(JSON にならない中身を置く)。
 // slot は来歴(.current)。省略すると「まだ記録が無い」= 使い始めた直後の状態になる。
@@ -87,6 +92,42 @@ function runSwap(home, argv = []) {
   } catch (e) {
     return { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
   }
+}
+
+// 中止の不変条件を確かめるため、home 配下の .claude ツリーを丸ごと比較できる形にする。
+// D/F の接頭辞でディレクトリの有無も分かるようにし、内容込みで 1 本の文字列にする
+// (中止したなら丸ごと一致するはずなので、前後の突き合わせで足りる)。
+function snapshotTree(home) {
+  const root = path.join(home, '.claude');
+  const out = [];
+  (function walk(dir, rel) {
+    if (!fs.existsSync(dir)) return;
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })
+      .sort((a, b) => a.name.localeCompare(b.name))) {
+      const relPath = rel ? rel + '/' + ent.name : ent.name;
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) { out.push('D ' + relPath); walk(full, relPath); }
+      else out.push('F ' + relPath + ': ' + fs.readFileSync(full, 'utf8'));
+    }
+  })(root, '');
+  return out.join('\n');
+}
+
+// 中止したときに必ず成り立つべき 3 つ(非ゼロ終了・何も書き換えない・次の一手がある)を
+// まとめて確かめる。個別の check() に分けるのは、どれが破れたかを label だけで判別できるように
+// するため。「次の一手」の判定は「`swap ` を含む行が 1 行以上ある、または `/login` を含む」で
+// 足りるとする(行き止まりにしないことが目的で、案内の文面そのものを厳密に問わない)。
+// 空白付きの `swap ` で見るのは、コマンドではない単なる言及(「swap のサブコマンドと同じ」等)を
+// 次の一手と数えないため。引数なしの swap を案内するときだけは後ろに引数が来ないので、
+// 「swap を実行すると」のように空白を挟んだ地の文で書くこと(バッククォートで囲んだだけでは弾かれる)。
+function checkAbort(label, home, before, r) {
+  check(label + ': 中止しても成功終了しない', r.code !== 0, `code=${r.code}\n` + r.out + r.err);
+  const after = snapshotTree(home);
+  check(label + ': 中止しても何も書き換えない', after === before,
+    `-- before --\n${before}\n-- after --\n${after}`);
+  const hasNextStep = (r.out + r.err).split('\n').some((l) => l.includes('swap '))
+    || (r.out + r.err).includes('/login');
+  check(label + ': 中止しても次の一手を示す', hasNextStep, r.out + r.err);
 }
 
 console.log('swap');
@@ -187,6 +228,7 @@ console.log('swap');
     slot: 'personal',
   });
   const r = runSwap(home, ['team']);
+  check('切り替えは成功する', r.code === 0, r.out + r.err);
   check('切り替え時、来歴が指すスロットが更新される',
     tokenOf(acctPath(home, 'personal')) === 'pro-new', r.out + r.err);
   check('来歴と関係ないスロットは作らない', !fs.existsSync(acctPath(home, 'pro')),
@@ -200,6 +242,7 @@ console.log('swap');
     slot: 'personal',
   });
   const r = runSwap(home, ['save']);
+  check('save は成功する', r.code === 0, r.out + r.err);
   check('save でも来歴が指すスロットを更新する',
     tokenOf(acctPath(home, 'personal')) === 'pro-new', r.out + r.err);
 }
@@ -359,6 +402,7 @@ console.log('swap');
     slot: 'team',
   });
   const r = runSwap(home, ['personal']);
+  check('中断後の再実行は成功する', r.code === 0, r.out + r.err);
   check('中断で来歴が古いまま再実行しても、他アカウントのスロットを上書きしない',
     tokenOf(acctPath(home, 'team')) === 'team-tok', r.out + r.err);
   check('中断後の再実行で来歴が実体に合う', slotOf(home) === 'personal', slotOf(home));
@@ -445,10 +489,20 @@ console.log('swap');
     current: creds('pro', { token: 'gen1' }),
     accounts: { personal: creds('pro', { token: 'old1' }) },
   });
+  // ループ内で毎回 check を出すと件数が膨らむので、全反復の結果を旗に集約して 1 件にまとめる。
+  let allOk = true;
+  let neverShrank = true; // 本数制限の刈り込みはスロット本体(*.json)を減らしてはいけない
+  let count = slotCount(home);
   for (const t of ['gen2', 'gen3', 'gen4']) {
     fs.writeFileSync(credPath(home), JSON.stringify(creds('pro', { token: t })), 'utf8');
-    runSwap(home, ['save', 'personal', '--force']);
+    const r = runSwap(home, ['save', 'personal', '--force']);
+    if (r.code !== 0) allOk = false;
+    const next = slotCount(home);
+    if (next < count) neverShrank = false;
+    count = next;
   }
+  check('反復はすべて成功する(exit code 0)', allOk);
+  check('本数制限の刈り込みでスロット本体(*.json)は減らない', neverShrank);
   check('唯一のコピーは上限を超えても落とさない', replacedFiles(home, 'personal').length === 3,
     replacedFiles(home, 'personal').join(','));
   check('最初に押し出した内容が残っている(唯一のコピーだった)',
@@ -465,10 +519,19 @@ console.log('swap');
     current: creds('pro', { token: 'gen1' }),
     accounts: { personal: creds('pro', { token: 'dead1', expiresInDays: -1 }) },
   });
+  let allOk = true;
+  let neverShrank = true;
+  let count = slotCount(home);
   for (const t of ['gen2', 'gen3', 'gen4']) {
     fs.writeFileSync(credPath(home), JSON.stringify(creds('pro', { token: t })), 'utf8');
-    runSwap(home, ['save', 'personal', '--force']);
+    const r = runSwap(home, ['save', 'personal', '--force']);
+    if (r.code !== 0) allOk = false;
+    const next = slotCount(home);
+    if (next < count) neverShrank = false;
+    count = next;
   }
+  check('反復はすべて成功する(exit code 0)', allOk);
+  check('本数制限の刈り込みでスロット本体(*.json)は減らない', neverShrank);
   check('失効済みの控えは落として上限に戻す', replacedFiles(home, 'personal').length === 2,
     replacedFiles(home, 'personal').join(','));
   check('落ちたのは失効済みの方',
@@ -485,10 +548,19 @@ console.log('swap');
     current: creds('pro', { token: 'gen1' }),
     accounts: { personal: creds('pro', { token: 'dup' }), mirror: creds('pro', { token: 'dup' }) },
   });
+  let allOk = true;
+  let neverShrank = true;
+  let count = slotCount(home);
   for (const t of ['gen2', 'gen3', 'gen4']) {
     fs.writeFileSync(credPath(home), JSON.stringify(creds('pro', { token: t })), 'utf8');
-    runSwap(home, ['save', 'personal', '--force']);
+    const r = runSwap(home, ['save', 'personal', '--force']);
+    if (r.code !== 0) allOk = false;
+    const next = slotCount(home);
+    if (next < count) neverShrank = false;
+    count = next;
   }
+  check('反復はすべて成功する(exit code 0)', allOk);
+  check('本数制限の刈り込みでスロット本体(*.json)は減らない', neverShrank);
   check('複製が他にある控えは落としてよい', replacedFiles(home, 'personal').length === 2,
     replacedFiles(home, 'personal').join(','));
   check('落ちたのは mirror に同じものが残っている控え',
@@ -936,6 +1008,169 @@ console.log('swap');
   check('復元できない名前の退避は status が名指しする',
     /復元できない名前の退避があります: save/.test(r.out), r.out + r.err);
   check('改名という実際に効く対処を出す', /改名してください/.test(r.out), r.out);
+}
+
+// --- 中止の不変条件 ---
+// swap.js の中止経路それぞれについて、「実行前スナップショットを取る → 中止させる →
+// checkAbort」を繰り返す。個々の中止理由の妥当性は上のテストで確認済みなので、ここでは
+// 「中止したなら 3 つとも必ず成り立つ」ことだけを機械的に確かめる。
+{
+  // validateName(99行目): アカウント名に使えない文字は save 経由でも弾く
+  const home = sandbox('abort-bad-name-save', { current: creds('pro') });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['save', '../evil']);
+  checkAbort('不正な文字を含む名前での save', home, before, r);
+}
+{
+  // validateName(101行目): サブコマンドと同じ名前のスロットは作れない
+  const home = sandbox('abort-reserved-name', { current: creds('pro') });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['save', 'save']);
+  checkAbort('予約語をスロット名に使う save', home, before, r);
+}
+{
+  // saveCurrent(500行目): save 経路で現在の credentials が読めないときは --force なしで中止する
+  const home = sandbox('abort-unreadable-save', {
+    current: '{ broken',
+    accounts: { team: creds('team') },
+  });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['save']);
+  checkAbort('現在の credentials が読めない save', home, before, r);
+}
+{
+  // saveCurrent(514行目): subscriptionType も来歴も無いと退避名を決められない
+  const home = sandbox('abort-no-name', { current: creds(null, { token: 'no-type' }) });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['save']);
+  checkAbort('退避名を決められない save', home, before, r);
+}
+{
+  // cmdSave(657行目): 未ログインでの save はエラーで中止する(swap 側は中止しない点と違う)
+  const home = sandbox('abort-no-current-save', {});
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['save']);
+  checkAbort('未ログインでの save', home, before, r);
+}
+{
+  // cmdSwap(668行目): 復元先の名前も不正な文字を弾く
+  const home = sandbox('abort-bad-name-swap', { current: creds('pro') });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['../evil']);
+  checkAbort('不正な文字を含む復元先への切り替え', home, before, r);
+}
+{
+  // cmdSwap(672行目): 退避されていない名前への切り替えは拒否する
+  const home = sandbox('abort-missing-target', { current: creds('pro') });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['team']);
+  checkAbort('退避されていない名前への切り替え', home, before, r);
+}
+{
+  // cmdSwap(682行目): 復元先が JSON として読めなければ中止する
+  const home = sandbox('abort-broken-target', {
+    current: creds('pro'),
+    accounts: { team: 'not json' },
+  });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['team']);
+  checkAbort('壊れた復元先への切り替え', home, before, r);
+}
+{
+  // cmdSwap(706行目): 失効済みの復元先には --force なしで切り替えない
+  const home = sandbox('abort-expired-target', {
+    current: creds('pro'),
+    accounts: { team: creds('team', { expiresInDays: -1 }) },
+  });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['team']);
+  checkAbort('失効済みの復元先への切り替え', home, before, r);
+}
+{
+  // cmdSwap(714行目): refreshToken が無い復元先には --force なしで切り替えない
+  const home = sandbox('abort-no-refresh', {
+    current: creds('pro', { token: 'live' }),
+    accounts: { team: creds('team', { token: 'no-refresh', noRefresh: true }) },
+    slot: 'pro',
+  });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['team']);
+  checkAbort('refreshToken が無い復元先への切り替え', home, before, r);
+}
+{
+  // cmdSwap(723行目): subscriptionType が無い復元先には --force なしで切り替えない
+  const home = sandbox('abort-no-type-target', {
+    current: creds('pro'),
+    accounts: { odd: creds(null, { token: 'odd' }) },
+  });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['odd']);
+  checkAbort('subscriptionType が無い復元先への切り替え', home, before, r);
+}
+{
+  // cmdSwap(767行目): 退避先が復元元と同じ名前になる場合は中止する
+  const home = sandbox('abort-name-collision', {
+    current: creds('pro', { token: 'acct-B' }),
+    accounts: { pro: creds('pro', { token: 'acct-A' }) },
+  });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['pro']);
+  checkAbort('退避先と復元元の名前が衝突する切り替え', home, before, r);
+}
+{
+  // cmdSwap(799行目): 復元先が別アカウントだと証明できないときは --force なしで中止する
+  const home = sandbox('abort-unproven', {
+    current: creds('pro', { token: 'pro-new' }),
+    accounts: { personal: creds('pro', { token: 'pro-old' }) },
+  });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['personal']);
+  checkAbort('別アカウントだと証明できない切り替え', home, before, r);
+}
+{
+  // failOverwrite(417/419行目): 退避先に別の認証情報が入っているときは save を中止する
+  const home = sandbox('abort-overwrite-other', {
+    current: creds('pro', { token: 'acct-B' }),
+    accounts: { personal: creds('pro', { token: 'acct-A' }) },
+  });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['save', 'personal']);
+  checkAbort('別の認証情報が入ったスロットへの save', home, before, r);
+}
+{
+  // main(880行目): save に名前を 2 つ以上渡すと typo とみなして中止する
+  const home = sandbox('abort-too-many-args-save', { current: creds('pro') });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['save', 'a', 'b']);
+  checkAbort('save への引数過多', home, before, r);
+}
+{
+  // main(883行目): swap <name> に余分な引数が付くと typo とみなして中止する
+  const home = sandbox('abort-too-many-args-swap', {
+    current: creds('pro'),
+    accounts: { team: creds('team') },
+  });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['team', 'extra']);
+  checkAbort('swap への引数過多', home, before, r);
+}
+
+// --- README の初回手順をそのままなぞる ---
+{
+  // README 200-209行目付近: 「swap save」→「/login」→「swap save <名前>」の順で初回に通す手順。
+  // /login は実行できないので、Claude Code が .credentials.json を置き換える動きを直接ファイルの
+  // 上書きで再現する。2 つのアカウントは README の注記(同一プランだと判別できない)を踏まえて
+  // プラン種別を変えておく。最後に最初のアカウント名で戻れることまで確認する。
+  const home = sandbox('readme-first-run', { current: creds('pro', { token: 'acct-A' }) });
+  const first = runSwap(home, ['save']);
+  check('README手順: 1 回目の save は成功する', first.code === 0, first.out + first.err);
+  fs.writeFileSync(credPath(home), JSON.stringify(creds('team', { token: 'acct-B' })), 'utf8');
+  const second = runSwap(home, ['save', 'second']);
+  check('README手順: 2 回目は名前を明示すれば save できる', second.code === 0, second.out + second.err);
+  const back = runSwap(home, ['pro']);
+  check('README手順: 最初のアカウントへ戻れる(exit 0)', back.code === 0, back.out + back.err);
+  check('README手順: 戻った内容は最初のアカウントのもの',
+    tokenOf(credPath(home)) === 'acct-A', back.out + back.err);
 }
 
 console.log(`\n  ${state.pass} PASS / ${state.fail} FAIL`);
