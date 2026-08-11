@@ -6,11 +6,16 @@
 // 前提は 1 箇所に置き、両方が同じものを見るようにする。
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
-// os.homedir() ではなく環境変数を見る。テストが USERPROFILE / HOME を差し替えて
-// 隔離した HOME でフックを動かすため(os.homedir() は差し替えを反映しないことがある)。
-const HOME = process.env.USERPROFILE || process.env.HOME || '.';
+// 環境変数を先に見るのは、テストが USERPROFILE / HOME を差し替えて隔離した HOME で
+// フックを動かすため(os.homedir() は差し替えを反映しないことがある)。
+// 最後の砦を '.' にしないのは、両方とも持たない環境(サービスアカウント、絞ったシェル、
+// 一部の CI)で credentials とスロットがカレントディレクトリ配下として解決され、
+// 「未ログイン・退避なし」に見えてしまうため。退避が消えたと誤解させる表示になるうえ、
+// 原因(HOME の誤解決)はどこにも出ない。os.homedir() なら誤解決にはならない。
+const HOME = process.env.USERPROFILE || process.env.HOME || os.homedir();
 const CREDENTIALS = path.join(HOME, '.claude', '.credentials.json');
 
 // アカウントを判別できなかったときの値。collect.js と同じ規約。

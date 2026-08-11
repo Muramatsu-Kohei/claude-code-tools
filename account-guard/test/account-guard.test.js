@@ -59,6 +59,14 @@ console.log('account-guard');
   const res = run(home, { hook_event_name: 'PreToolUse', cwd: 'C:\\org-tree\\proj', tool_name: 'Read', tool_input: { file_path: 'src/main.py' } });
   check('保護ツリー内の cwd は拒否する', decision(res) === 'deny', JSON.stringify(res));
   check('拒否理由にツリー名が入る', /org-tree/.test(res?.hookSpecificOutput?.permissionDecisionReason || ''), JSON.stringify(res));
+  // 拒否の文面は実際に安全な手順を出すこと。先に `/login` させると、まだ swap で退避して
+  // いないアカウントの認証情報はその場で消え、復旧はブラウザ OAuth のやり直しになる
+  // (README の「拒否されたときの挙動」と同じ順序を、利用者が実際に読むこの文面でも守る)。
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('切り替えは退避してからだと案内する',
+    /swap save/.test(reason) && /先に `\/login` すると/.test(reason), reason);
+  check('/login を最初の一手として案内しない',
+    !/^`?\/login`? で正しいアカウントに切り替えて/m.test(reason), reason);
 }
 {
   const home = sandbox('deny-arg', { subscriptionType: 'pro', rules: ORG });
