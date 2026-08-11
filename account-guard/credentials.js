@@ -9,13 +9,28 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// HOME として使える値か。空文字・空白のみは「無い」のと同じに扱う。Windows では
+// USERPROFILE が「空文字として存在する」だけのことがあり(実測)、素通しにすると
+// `||` チェーンがそこで確定してしまい、後段の os.homedir() まで辿り着けない。
+function usableHome(v) {
+  return typeof v === 'string' && v.trim() !== '' ? v : null;
+}
+
 // 環境変数を先に見るのは、テストが USERPROFILE / HOME を差し替えて隔離した HOME で
 // フックを動かすため(os.homedir() は差し替えを反映しないことがある)。
 // 最後の砦を '.' にしないのは、両方とも持たない環境(サービスアカウント、絞ったシェル、
 // 一部の CI)で credentials とスロットがカレントディレクトリ配下として解決され、
 // 「未ログイン・退避なし」に見えてしまうため。退避が消えたと誤解させる表示になるうえ、
 // 原因(HOME の誤解決)はどこにも出ない。os.homedir() なら誤解決にはならない。
-const HOME = process.env.USERPROFILE || process.env.HOME || os.homedir();
+const HOME = usableHome(process.env.USERPROFILE) || usableHome(process.env.HOME) || usableHome(os.homedir());
+if (!HOME) {
+  // 環境変数も os.homedir() も使える値を返さない、極端に壊れた環境。ここで '.' 等の
+  // 相対パスへ逃げると、上のコメントで避けたはずの「カレントディレクトリ配下として解決され、
+  // 保護や退避が消えたように見える」事故を空文字経由で再現してしまう。呼び出し側
+  // (account-guard.js / swap.js)は require の失敗として拾い、既存の「読めない」経路
+  // (拒否側に倒す・真因を案内する)にそのまま合流する。
+  throw new Error('HOME を解決できません(USERPROFILE / HOME / os.homedir() のいずれも使える値を返しませんでした)');
+}
 const CREDENTIALS = path.join(HOME, '.claude', '.credentials.json');
 
 // アカウントを判別できなかったときの値。collect.js と同じ規約。

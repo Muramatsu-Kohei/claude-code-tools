@@ -26,6 +26,14 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// HOME として使える値か。空文字・空白のみは「無い」のと同じに扱う。os.homedir() や
+// 環境変数は「存在するが空文字」を返すことがある(Windows で実測)。素通しにすると
+// この先のパスが cwd 相対に解決され、設定の無い場所では保護ルールが 0 件になって
+// 無言で全部通ってしまう(credentials.js 側にも同じ検証がある)。
+function usableHome(v) {
+  return typeof v === 'string' && v.trim() !== '' ? v : null;
+}
+
 // credentials の場所と読み方は swap.js と共有する(credentials.js のコメント参照)。
 //
 // require を素通しで書かないのは、これがトップレベルで投げると末尾の catch
@@ -33,32 +41,63 @@ const path = require('path');
 // 標準出力に何も出さないまま exit 1 で終わり、Claude Code はブロックせず処理を続ける。
 // つまり credentials.js を隣に置き忘れた構成では、保護が丸ごと外れたことに誰も
 // 気づけないまま素通しになる。読めなくても「判別不能」として動き続けるほうが安全。
+//
+// require が成功しても中身までは保証されない。account-guard.js を置いたディレクトリに
+// 無関係な・古い credentials.js が同名で存在すると require 自体は成功するが、HOME 等が
+// 期待する形でないことがあり、そのまま使うとこの先の path.join(HOME, ...) がトップレベルで
+// 例外を投げて同じ無言 fail-open を起こす。必要なエクスポートの形を検証し、欠けていれば
+// 「読み込めなかった」場合とまったく同じ経路(下の catch)に合流させる。
 let credentials = null;
 // 読めなかった理由は捨てない。ここで落ちると「正しいアカウントでログインしているのに
 // 全部 deny される」状態になり、原因は隣のファイルなのに拒否メッセージが /login を促すと、
 // 何度ログインし直しても直らない袋小路に入る(拒否の文面で真因を出すために使う)。
 let credentialsLoadError = null;
 try {
-  credentials = require('./credentials');
+  const loaded = require('./credentials');
+  if (
+    !loaded
+    || !usableHome(loaded.HOME)
+    || typeof loaded.CREDENTIALS !== 'string' || !loaded.CREDENTIALS
+    || typeof loaded.ACCOUNT_UNKNOWN !== 'string' || !loaded.ACCOUNT_UNKNOWN
+    || typeof loaded.currentAccount !== 'function'
+    // readCredentials は readableCredentials() が使う。ここで検証しておかないと、
+    // 欠けている場合に readableCredentials() の catch が拾って「credentials が壊れている」
+    // という別の案内に落ち、真因(credentials.js の形式不正)がどこにも出なくなる。
+    || typeof loaded.readCredentials !== 'function'
+  ) {
+    throw new Error('credentials.js の形式が不正です(HOME / CREDENTIALS / ACCOUNT_UNKNOWN / currentAccount / readCredentials のいずれかが欠けています)');
+  }
+  credentials = loaded;
 } catch (e) {
-  // 単体配置・コピー漏れ・権限。下のフォールバックで拒否側に倒す
+  // 単体配置・コピー漏れ・権限・形式不正。下のフォールバックで拒否側に倒す
   credentialsLoadError = e;
 }
 
 // HOME の導出だけは自前でも持つ(テストが USERPROFILE / HOME を差し替えるため、
 // os.homedir() ではなく環境変数を先に見る。credentials.js と同じ規約)。
+// credentials.js から受け取った値も usableHome に通す。上の検証で弾いているので通常は
+// 有効なはずだが、二重チェックの費用は無視できるほど小さく、検証漏れの経路を一本化できる。
+//
 // 最後の砦を '.' にしないのは credentials.js と同じ理由で、こちらではさらに重い:
-// 両方の環境変数を持たない環境で config がカレントディレクトリ配下として解決されると、
-// ルールが 1 つも読めず、保護ツリーへの操作が黙って許可される(exit 0・出力なし)。
-// credentialsLoadError を足して塞いだはずの「保護が無言で外れる」を、HOME 側から作っていた。
-const HOME = credentials ? credentials.HOME
-  : (process.env.USERPROFILE || process.env.HOME || os.homedir());
+// 両方の環境変数を持たない・空文字な環境で config がカレントディレクトリ配下として
+// 解決されると、ルールが 1 つも読めず、保護ツリーへの操作が黙って許可される
+// (exit 0・出力なし)。credentialsLoadError を足して塞いだはずの「保護が無言で外れる」を、
+// HOME 側から作っていた。
+const HOME = usableHome(credentials && credentials.HOME)
+  || usableHome(process.env.USERPROFILE)
+  || usableHome(process.env.HOME)
+  || usableHome(os.homedir());
+
+// 環境変数も os.homedir() も使える値を返さない、極端に壊れた環境。相対パスへ逃げると
+// 上と同じ無言 fail-open を再現するので逃げない。CONFIG はダミー値にして path.join の
+// トップレベル即死だけ避け、以降は homeUnresolved で強制的に拒否側へ倒す(loadConfig 参照)。
+const homeUnresolved = !HOME;
 const ACCOUNT_UNKNOWN = credentials ? credentials.ACCOUNT_UNKNOWN : 'unknown';
 // credentials.js が無ければ誰のログインかを知る手段が無い。ACCOUNT_UNKNOWN は判定側が
 // 拒否に倒す値なので、保護ツリーへの操作は deny され、設定漏れに気づける。
 const currentAccount = credentials ? credentials.currentAccount : () => ACCOUNT_UNKNOWN;
 
-const CONFIG = path.join(HOME, '.claude', 'account-guard', 'config.json');
+const CONFIG = path.join(homeUnresolved ? '(home-unresolved)' : HOME, '.claude', 'account-guard', 'config.json');
 
 // 既定では何も保護しない。守るべきツリーは環境ごとに違ううえ、実在するパスを
 // 公開リポジトリに焼き込みたくないため、設定ファイルで明示させる。
@@ -262,6 +301,10 @@ function targetStrings(toolName, toolInput, cwd, trees = []) {
 // 全ての保護が無言で消えていた。設定していないのは意図した状態だが、壊れているのは
 // 事故であって、素通しにしてよい理由がない。冒頭の方針どおり後者は拒否側に倒す。
 function loadConfig() {
+  // HOME を導出できていない場合、CONFIG はダミー値でしかなく、どこを読んでも意味がない。
+  // ここで確定的に broken 扱いにする(素通しにすると保護が無言で外れるのは他の broken と同じ)。
+  if (homeUnresolved) return { rules: DEFAULT_RULES, broken: true, homeUnresolved: true };
+
   let text;
   try {
     text = fs.readFileSync(CONFIG, 'utf8');
@@ -314,9 +357,16 @@ function violation(input, account, config) {
   const cwd = input.cwd || process.cwd();
 
   // 設定が壊れているときは、どのツリーを守るべきかが分からない。素通しにすると
-  // 保護が丸ごと外れるので、修復操作を除いて拒否する。
+  // 保護が丸ごと外れるので、修復操作を除いて拒否する。HOME 未解決もこの扱いに合流する
+  // (CONFIG がダミー値で、そもそもどこを読むべきかすら分からないため)。
   if (config.broken && !isConfigRepair(input)) {
-    return { broken: true, tree: CONFIG, reason: '設定ファイルを読めません', allow: [] };
+    return {
+      broken: true,
+      tree: CONFIG,
+      reason: config.homeUnresolved ? 'HOME を特定できません' : '設定ファイルを読めません',
+      allow: [],
+      homeUnresolved: !!config.homeUnresolved,
+    };
   }
 
   const targets = targetStrings(input.tool_name, input.tool_input, cwd, config.rules.map((r) => r.tree));
@@ -329,6 +379,9 @@ function violation(input, account, config) {
         tree: rule.tree,
         reason: `作業ディレクトリが ${rule.tree} 配下にあります`,
         allow: rule.allow,
+        // cwd 自体が保護ツリーの内側だと、案内する swap コマンド(Bash 経由)もこの判定で
+        // 同じく拒否される。denyMessage 側で「ツリーの外で実行すること」を案内するために使う。
+        cwdInsideTree: true,
       };
     }
     if (targets.some((s) => mentionsTree(s, rule.tree))) {
@@ -336,14 +389,57 @@ function violation(input, account, config) {
         tree: rule.tree,
         reason: `操作の対象が ${rule.tree} 配下です`,
         allow: rule.allow,
+        // ここに来た時点で cwd はこのツリーの内側ではない(内側なら上の分岐で先に返っている)。
+        cwdInsideTree: false,
       };
     }
   }
   return null;
 }
 
+// credentials ファイルが存在していても、書き込み途中の中断やディスク不足で 0 バイト・
+// 破損していることがある。existsSync は true を返すので、それだけでは「未ログイン」と
+// 区別できない。実際に読めて JSON として解釈できるかまで確認する。
+function readableCredentials() {
+  if (!credentials) return false;
+  try {
+    credentials.readCredentials(credentials.CREDENTIALS);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// swap は Bash 経由の呼び出しになる。cwd が保護ツリーの内側だと、案内した swap コマンドの
+// 呼び出しそのものが violation() の cwd 判定に先に当たり、同じ deny を返す堂々巡りになる
+// (/login はスラッシュコマンドでフックを通らないため影響を受けない)。cwd の内外は
+// violation() が既に判定しているので、その結果をそのまま案内に使う
+// (コマンド文字列を見て swap を特別扱いする例外は作らない。パースは容易に迂回できるため)。
+function swapCwdNote(hit) {
+  if (!hit.cwdInsideTree) return [];
+  return [
+    '',
+    `swap は Bash 経由の呼び出しのため、作業ディレクトリが ${hit.tree} 配下のままだと同じ理由で`,
+    '拒否されます。ホームディレクトリなど、このツリーの外に cd してから実行してください。',
+  ];
+}
+
+// 失って困る認証情報が無い状態(未ログイン/破損)で共通に使う案内。どちらも
+// `swap save <name>` は必ず失敗し、退避が 1 つも無ければ `swap <name>` も必ず失敗するので、
+// /login を抑止したままだと打つ手が無くなる。
+function noCredentialsAtStakeMessage(head, situation, hit) {
+  return head.concat([
+    situation,
+    'この状態で失われる認証情報はないので、次のどちらかで復帰してください。',
+    '  swap <name>   … 退避済みのアカウントがあれば復元する(`swap` で一覧を確認できます)',
+    '  /login        … 退避が無い場合はログインし直す(消える退避はありません)',
+    ...swapCwdNote(hit),
+    '回避しようとせず、ユーザーに許可アカウントでのログインが必要であることを伝えてください。',
+  ]).join('\n');
+}
+
 function denyMessage(hit, account) {
-  if (hit.broken) return brokenConfigMessage();
+  if (hit.broken) return hit.homeUnresolved ? homeUnresolvedMessage() : brokenConfigMessage();
 
   const allowed = hit.allow.length ? hit.allow.join(' / ') : '(許可アカウントの設定なし)';
   const head = [
@@ -352,15 +448,17 @@ function denyMessage(hit, account) {
     '',
   ];
 
-  // 判別不能の原因が「credentials.js を隣に置き忘れた」ときは、ログインし直しても直らない。
-  // ここで /login を促すと、正しいアカウントで入っている人に効かない操作を繰り返させる。
+  // 判別不能の原因が「credentials.js を隣に置き忘れた・形式が壊れている」ときは、
+  // ログインし直しても直らない。ここで /login を促すと、正しいアカウントで入っている人に
+  // 効かない操作を繰り返させる。
   if (account === ACCOUNT_UNKNOWN && credentialsLoadError) {
     return head.concat([
-      `アカウントを判別できません。account-guard.js の隣にある credentials.js を読み込めませんでした`,
+      'アカウントを判別できません。account-guard.js の隣にある credentials.js を読み込めなかったか、',
+      `想定した形式ではありませんでした`,
       `(${path.join(__dirname, 'credentials.js')}: ${credentialsLoadError.code || credentialsLoadError.message})。`,
       '',
       'ログインの問題ではないため `/login` では直りません。account-guard.js だけを別の場所へ',
-      'コピーした場合は、credentials.js も同じディレクトリへ置いてください。',
+      'コピーした場合は、正しい形式の credentials.js も同じディレクトリへ置いてください。',
       '判別できない間は保護ツリーへの操作をすべて拒否します(素通しにすると保護が無言で外れるため)。',
       // 他の deny 経路と同じ一文をここにも置く。設置ミスだと読んだ Claude が「ガードの都合だから」と
       // 別経路(ツリー名を書かない Bash など)で読み直すと、保護の目的そのものが崩れる。
@@ -368,19 +466,24 @@ function denyMessage(hit, account) {
     ]).join('\n');
   }
 
-  // 未ログイン(credentials that がそもそも無い)なら、失って困る認証情報も存在しない。
+  // 未ログイン(credentials がそもそも無い)なら、失って困る認証情報も存在しない。
   // このとき swap だけを案内すると打つ手が 1 つも残らない: `swap save <name>` は
   // 「現在 credentials がありません」で、退避が 1 つも無ければ `swap <name>` も
   // 「退避されていません」で、どちらも必ず失敗する。/login を抑止したまま行き止まりになる。
   const loggedOut = !!credentials && !fs.existsSync(credentials.CREDENTIALS);
   if (account === ACCOUNT_UNKNOWN && loggedOut) {
-    return head.concat([
-      'ログインしていません(認証情報のファイルがありません)。',
-      'この状態で失われる認証情報はないので、次のどちらかで復帰してください。',
-      '  swap <name>   … 退避済みのアカウントがあれば復元する(`swap` で一覧を確認できます)',
-      '  /login        … 退避が無い場合はログインし直す(消える退避はありません)',
-      '回避しようとせず、ユーザーに許可アカウントでのログインが必要であることを伝えてください。',
-    ]).join('\n');
+    return noCredentialsAtStakeMessage(head, 'ログインしていません(認証情報のファイルがありません)。', hit);
+  }
+
+  // ファイルはあるが読めない(0バイト・破損・権限)。existsSync だけでは上の loggedOut と
+  // 区別できず、下の「切り替え手順」に落ちて swap save を勧めてしまうが、それは
+  // 「現在の credentials を読めません」で必ず失敗し、退避も無ければ行き止まりになる。
+  // ここで残っているファイルの中身はもう使えない(壊れている)ので、失って困るものは無い。
+  const corrupted = !loggedOut && !!credentials && fs.existsSync(credentials.CREDENTIALS) && !readableCredentials();
+  if (account === ACCOUNT_UNKNOWN && corrupted) {
+    return noCredentialsAtStakeMessage(
+      head, '認証情報のファイルはありますが、読み取れません(壊れているか空です)。', hit
+    );
   }
 
   return head.concat([
@@ -390,14 +493,28 @@ function denyMessage(hit, account) {
     // 先に `/login` させない。/login は credentials を上書きするので、まだ swap で退避して
     // いないアカウントはその場で失われ、復旧はブラウザ OAuth のやり直しになる
     // (account-guard/README.md の「拒否されたときの挙動」と同じ順序をここでも案内する)。
-    // 未ログインで swap が効かない場合は上の分岐が /login を案内するので、ここは行き止まりに
-    // ならない(この経路には失って困る認証情報が現に存在する)。
+    // 未ログイン・破損で swap が効かない場合は上の分岐が /login を案内するので、ここは
+    // 行き止まりにならない(この経路には失って困る認証情報が現に存在する)。
     'アカウントを切り替えてから操作してください。手順は次のとおりです。',
     '  swap save <name>   … 現在のアカウントを先に退避する(まだ退避していない場合)',
     '  swap <name>        … 退避済みの別アカウントへ切り替える',
     '先に `/login` すると、まだ退避していないアカウントの認証情報はその時点で消えます。',
+    ...swapCwdNote(hit),
     '回避しようとせず、ユーザーにアカウントの切り替えが必要であることを伝えてください。',
   ]).join('\n');
+}
+
+function homeUnresolvedMessage() {
+  return [
+    '[account-guard] ホームディレクトリを特定できないため、操作を拒否しました。',
+    'USERPROFILE / HOME のいずれも使える値を持たず、os.homedir() も空文字を返しています。',
+    'この状態では設定ファイルの場所も特定できず、どのツリーを保護すべきか判断できません。',
+    '',
+    '素通しにすると保護が無言で外れるため、安全側に倒しています。',
+    'USERPROFILE または HOME 環境変数に実在するホームディレクトリを設定してから、',
+    'もう一度実行してください。',
+    '回避しようとせず、ユーザーに状況を伝えてください。',
+  ].join('\n');
 }
 
 function brokenConfigMessage() {
