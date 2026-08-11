@@ -23,6 +23,7 @@
 // 巻き添えにはしない。判定できたものだけを拒否し、それ以外は通常の権限フローに委ねる。
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 // credentials の場所と読み方は swap.js と共有する(credentials.js のコメント参照)。
@@ -45,8 +46,13 @@ try {
 }
 
 // HOME の導出だけは自前でも持つ(テストが USERPROFILE / HOME を差し替えるため、
-// os.homedir() ではなく環境変数を見る。credentials.js と同じ規約)。
-const HOME = credentials ? credentials.HOME : (process.env.USERPROFILE || process.env.HOME || '.');
+// os.homedir() ではなく環境変数を先に見る。credentials.js と同じ規約)。
+// 最後の砦を '.' にしないのは credentials.js と同じ理由で、こちらではさらに重い:
+// 両方の環境変数を持たない環境で config がカレントディレクトリ配下として解決されると、
+// ルールが 1 つも読めず、保護ツリーへの操作が黙って許可される(exit 0・出力なし)。
+// credentialsLoadError を足して塞いだはずの「保護が無言で外れる」を、HOME 側から作っていた。
+const HOME = credentials ? credentials.HOME
+  : (process.env.USERPROFILE || process.env.HOME || os.homedir());
 const ACCOUNT_UNKNOWN = credentials ? credentials.ACCOUNT_UNKNOWN : 'unknown';
 // credentials.js が無ければ誰のログインかを知る手段が無い。ACCOUNT_UNKNOWN は判定側が
 // 拒否に倒す値なので、保護ツリーへの操作は deny され、設定漏れに気づける。
@@ -362,13 +368,30 @@ function denyMessage(hit, account) {
     ]).join('\n');
   }
 
+  // 未ログイン(credentials that がそもそも無い)なら、失って困る認証情報も存在しない。
+  // このとき swap だけを案内すると打つ手が 1 つも残らない: `swap save <name>` は
+  // 「現在 credentials がありません」で、退避が 1 つも無ければ `swap <name>` も
+  // 「退避されていません」で、どちらも必ず失敗する。/login を抑止したまま行き止まりになる。
+  const loggedOut = !!credentials && !fs.existsSync(credentials.CREDENTIALS);
+  if (account === ACCOUNT_UNKNOWN && loggedOut) {
+    return head.concat([
+      'ログインしていません(認証情報のファイルがありません)。',
+      'この状態で失われる認証情報はないので、次のどちらかで復帰してください。',
+      '  swap <name>   … 退避済みのアカウントがあれば復元する(`swap` で一覧を確認できます)',
+      '  /login        … 退避が無い場合はログインし直す(消える退避はありません)',
+      '回避しようとせず、ユーザーに許可アカウントでのログインが必要であることを伝えてください。',
+    ]).join('\n');
+  }
+
   return head.concat([
     account === ACCOUNT_UNKNOWN
-      ? 'アカウントを判別できませんでした。未ログインか、認証情報の形式が変わった可能性があります。'
+      ? 'アカウントを判別できませんでした。認証情報の形式が変わったか、読み取れない状態です。'
       : 'このツリーのコードを現在のアカウントに読み込ませないため、操作を拒否しました。',
     // 先に `/login` させない。/login は credentials を上書きするので、まだ swap で退避して
     // いないアカウントはその場で失われ、復旧はブラウザ OAuth のやり直しになる
     // (account-guard/README.md の「拒否されたときの挙動」と同じ順序をここでも案内する)。
+    // 未ログインで swap が効かない場合は上の分岐が /login を案内するので、ここは行き止まりに
+    // ならない(この経路には失って困る認証情報が現に存在する)。
     'アカウントを切り替えてから操作してください。手順は次のとおりです。',
     '  swap save <name>   … 現在のアカウントを先に退避する(まだ退避していない場合)',
     '  swap <name>        … 退避済みの別アカウントへ切り替える',

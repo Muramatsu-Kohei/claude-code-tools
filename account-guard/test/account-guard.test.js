@@ -85,6 +85,22 @@ console.log('account-guard');
   check('アカウントを判別できないときは拒否側に倒す', decision(res) === 'deny', JSON.stringify(res));
 }
 {
+  // credentials ファイルそのものが無い(未ログイン)。JSON が壊れている deny-unknown とは
+  // 別経路だが、どちらもアカウントは判別不能(unknown)になる。denyMessage() はこの経路
+  // でだけ /login を案内してよい: `swap save <name>` は credentials が無ければ必ず失敗し、
+  // 退避が1つも無ければ `swap <name>` も必ず失敗するため、/login を抑止すると打つ手が
+  // 1つも残らない行き止まりになっていた(失って困る認証情報が無いので /login は安全)。
+  const home = sandbox('deny-loggedout', { rules: ORG });
+  const res = run(home, { hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read', tool_input: {} });
+  check('未ログインでも保護ツリーは拒否する', decision(res) === 'deny', JSON.stringify(res));
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  // 他の deny 経路にも「先に `/login` すると…消えます」という抑止の一文があるため、
+  // それと区別できる形(バッククォート無しで箇条書きの案内として出ている行)を見る。
+  check('未ログインなら /login を案内する(swap はどちらも失敗するため)',
+    /^\s*\/login\s+…/m.test(reason), reason);
+  check('/login で失うものが無いことも伝える', /消える退避はありません/.test(reason), reason);
+}
+{
   // allow を書き損じたルールで保護が外れないこと。
   const home = sandbox('deny-malformed-allow', { subscriptionType: 'pro', rules: [{ tree: 'C:/org-tree', allow: 'team' }] });
   const res = run(home, { hook_event_name: 'PreToolUse', cwd: 'C:/org-tree', tool_name: 'Read', tool_input: {} });
@@ -643,6 +659,58 @@ console.log('account-guard');
     tool_input: { command: 'echo hello' },
   });
   check('credentials.js が無くても保護ツリー外は巻き込まない', res === null, JSON.stringify(res));
+}
+
+// --- HOME を導出できない環境 ---
+// credentials.js が読めず、かつ USERPROFILE も HOME も未設定の環境では、フォールバックの
+// 最後の砦を '.' にすると CONFIG が cwd 配下(./.claude/account-guard/config.json)として
+// 解決されてしまう。cwd から読めてしまうと、たまたま設定の無い場所では保護が丸ごと外れる
+// (exit 0・標準出力なし = fail-open)。os.homedir() を最後の砦にすることで、cwd に本物の
+// ルールを置いても、それが設定として読まれないことを確かめる。
+//
+// 環境変数の delete / 空文字では再現できない(このマシンで実測して確認した Windows 特有の癖):
+//   - delete すると、Windows では子プロセス生成時に libuv が USERPROFILE / HOMEDRIVE などを
+//     実在する値で勝手に補ってしまう(キーが丸ごと無いときだけ発動する)。すると
+//     `process.env.USERPROFILE || ...` の最初の項で真になり、直したい3項目め
+//     (`|| os.homedir()`)自体を通らない。バグを戻しても再現できず、テストとして無意味になる。
+//   - 空文字にすると、Windows の os.homedir() は USERPROFILE が「空文字として存在する」だけで
+//     その空文字をそのまま返す(実プロファイルへはフォールバックしない)。つまり
+//     `|| os.homedir()` に辿り着いても壊れた値(空文字)になり、修正前の `'.'` と
+//     見分けが付かない(どちらも cwd 相対に解決されて同じ結果になる)。
+// そこで os.homedir() 自体をテスト用の値に差し替え、cwd とは無関係な既知の場所を返すようにする。
+// これで「3項目めまで来たら cwd ではなくその値が使われる」ことを確定的に検証できる。
+{
+  const ALONE_DIR = path.join(BASE, 'homefallback-alone');
+  fs.mkdirSync(ALONE_DIR, { recursive: true });
+  fs.copyFileSync(GUARD, path.join(ALONE_DIR, 'account-guard.js')); // credentials.js は意図的に置かない
+
+  // os.homedir() の差し替え先。cwd(後述の home)とは別物で、かつ設定ファイルを一切
+  // 置かない実在しないディレクトリにする。ここが CONFIG の基準になれば「ルール未設定」
+  // として何も拒否されないはずで、cwd 側のルールが読まれていないことの裏付けになる。
+  const FAKE_HOME = path.join(BASE, 'homefallback-real-home');
+  const RUNNER = path.join(ALONE_DIR, 'run-with-fake-home.js');
+  fs.writeFileSync(RUNNER, [
+    "'use strict';",
+    `require('os').homedir = () => ${JSON.stringify(FAKE_HOME)};`,
+    "require('./account-guard.js');", // 差し替え後に本体を読み込む。os は Node 内でキャッシュ共有される
+  ].join('\n'), 'utf8');
+
+  // cwd には「本物の」保護ルールを置く。HOME='.' のバグが残っていれば、これが読まれて拒否される。
+  const TARGET = path.join(BASE, 'nohome-target');
+  const home = sandbox('nohome-cwd', { rules: [{ tree: TARGET, allow: [] }] });
+
+  const env = { ...process.env, NO_COLOR: '1', USERPROFILE: '', HOME: '' };
+
+  const out = execFileSync(process.execPath, [RUNNER], {
+    cwd: home, // プロセスの実際の cwd。HOME='.' のバグがあればここが CONFIG の基準になる
+    env,
+    input: JSON.stringify({
+      hook_event_name: 'PreToolUse', cwd: TARGET, tool_name: 'Read', tool_input: { file_path: 'x' },
+    }),
+    encoding: 'utf8',
+  });
+  const res = out.trim() ? JSON.parse(out) : null;
+  check('HOME が無い環境でも設定をカレントディレクトリから読まない', res === null, JSON.stringify(res));
 }
 
 console.log(`\n  ${state.pass} passed, ${state.fail} failed`);

@@ -210,8 +210,10 @@ console.log('swap');
     slot: 'personal',
   });
   const r = runSwap(home, ['personal']);
-  check('来歴が指すスロットへの切り替えは認証を変えない',
-    r.code === 0 && /認証は変更しませんでした/.test(r.out), r.out + r.err);
+  // 終了コードは失敗にする。要求された切り替えは起きていないので、成功で返すと
+  // `swap team && claude -p ...` のようなラッパーが別アカウントのまま次へ進む。
+  check('来歴が指すスロットへの切り替えは認証を変えず、成功として返さない',
+    r.code !== 0 && /認証は変更しませんでした/.test(r.out), `code=${r.code}\n` + r.out + r.err);
   check('現在のログインを古いスナップショットに戻さない',
     tokenOf(credPath(home)) === 'pro-new');
   // 中身が違う理由は「ローテートした」だけでなく「外から /login した」もありうる。
@@ -241,10 +243,12 @@ console.log('swap');
   check('書き換えるのは名前で指定されたスロットだけ',
     tokenOf(acctPath(home, 'pro')) === 'pro-new'
     && tokenOf(acctPath(home, 'personal')) === 'pro-old', r.out + r.err);
-  check('古いまま残るスロットは名前を挙げて知らせる',
-    /古いままの退避があります: personal/.test(r.out), r.out);
+  check('取り残されるスロットは名前を挙げて知らせる',
+    /内容が違うスロットがあります: personal/.test(r.out), r.out);
+  // 「古い」と断定しないこと。現在のログインが同じアカウントの新しい世代なのか、別アカウントへ
+  // /login した結果なのかは見分けられず、後者に --force を勧めると唯一の退避を潰す。
   check('更新する手順と、触ってはいけない場合の両方を出す',
-    /swap save personal --force/.test(r.out) && /別のアカウントなら触らないで/.test(r.out), r.out);
+    /swap save personal --force/.test(r.out) && /見分けられません/.test(r.out), r.out);
   check('内容が違う無関係のスロットは案内にも出さない', !/team/.test(r.out), r.out);
 }
 {
@@ -266,8 +270,12 @@ console.log('swap');
   check('来歴が指すスロットの控えは残る(そちらは改名で戻せる)',
     tokenOf(path.join(replacedDir(home), 'personal-1.json')) === 'acct-A',
     replacedFiles(home).join(','));
-  check('巻き添えを避けたぶん、古いまま残ることは知らせる',
-    /古いままの退避があります: work/.test(r.out), r.out);
+  check('巻き添えを避けたぶん、取り残されることは知らせる',
+    /内容が違うスロットがあります: work/.test(r.out), r.out);
+  // ここは実際に「別アカウントを上書きした」側の経路。案内が work の更新を断定的に勧めると、
+  // acct-A の accounts/ 上の最後の 1 本が消える(復旧は .replaced からの改名になる)。
+  check('別アカウントの退避かもしれないことを同じ強さで書く',
+    /別アカウントの最新の退避/.test(r.out), r.out);
 }
 {
   // 切り替えに伴う退避でも同じ。ここでも揃えて書いていたので、swap 経由でも巻き添えが起きた。
@@ -284,8 +292,15 @@ console.log('swap');
   check('切り替え時の退避でも他スロットは書き換えない',
     r.code === 0 && tokenOf(acctPath(home, 'personal')) === 'pro-old', r.out + r.err);
   check('切り替え時も来歴が指すスロットは更新される', tokenOf(acctPath(home, 'pro')) === 'pro-new');
-  check('切り替え時も古いまま残るスロットを知らせる',
-    /古いままの退避があります: personal/.test(r.out), r.out);
+  check('切り替え時も取り残されるスロットを知らせる',
+    /内容が違うスロットがあります: personal/.test(r.out), r.out);
+  // 案内は切り替えの「あと」に出す。切り替え前に出していた頃は、そのまま
+  // `swap save personal --force` を打つと personal が team の内容で上書きされていた。
+  check('更新の前に元のスロットへ戻す手順を出す',
+    r.out.indexOf('swap pro\n') > r.out.indexOf('切り替え: ')
+    && /先に戻さないと/.test(r.out), r.out);
+  check('案内は切り替えの報告より後に出る',
+    r.out.indexOf('内容が違うスロットがあります') > r.out.indexOf('切り替え: '), r.out);
 }
 {
   // 新しい名前へ退避すると、来歴が指していたスロットが古いまま残る。旧実装は「既存スロットを
@@ -298,9 +313,27 @@ console.log('swap');
     slot: 'personal',
   });
   const r = runSwap(home, ['save', 'pro']);
-  check('新しい名前への退避でも、古くなる来歴スロットを知らせる',
-    r.code === 0 && /古いままの退避があります: personal/.test(r.out), r.out + r.err);
+  check('新しい名前への退避でも、取り残される来歴スロットを知らせる',
+    r.code === 0 && /内容が違うスロットがあります: personal/.test(r.out), r.out + r.err);
   check('知らせるだけで、書き換えはしない', tokenOf(acctPath(home, 'personal')) === 'tok-old');
+}
+{
+  // 同じ形の操作でも、来歴スロットが「別アカウントの新鮮な退避」であることがある。
+  // README が案内する初回手順(1 つ目を退避 → 2 つ目のアカウントで /login → 2 つ目を退避)が
+  // まさにこれで、以前はその出力が「古いままの退避があります: pro / swap save pro --force で
+  // 更新できます」となり、案内どおり打つとアカウント A の唯一のバックアップが消えていた。
+  // 2 つの可能性は区別できないので、断定せず両方を出す。
+  const home = sandbox('onboarding-second-account', {
+    current: creds('pro', { token: 'acct-B' }),
+    accounts: { pro: creds('pro', { token: 'acct-A' }) },
+    slot: 'pro',
+  });
+  const r = runSwap(home, ['save', 'personal']);
+  check('初回手順の 2 つ目の退避は成功する', r.code === 0, r.out + r.err);
+  check('もう一方のアカウントの退避は書き換えない', tokenOf(acctPath(home, 'pro')) === 'acct-A');
+  check('「古い」と断定しない', !/古いままの退避/.test(r.out), r.out);
+  check('別アカウントの最新の退避かもしれないと書く',
+    /別アカウントの最新の退避/.test(r.out) && /見分けられません/.test(r.out), r.out);
 }
 {
   // 別名スロットが最新なら、そこへの切り替えは認証を何も変えない。復元して書き直すと
@@ -404,8 +437,10 @@ console.log('swap');
     tokenOf(path.join(replacedDir(home), 'personal-1.json')) === 'dead');
 }
 {
-  // 控えを無制限には残さない(平文トークンなので)。上限を超えた分だけ落ちること、
-  // 落ちるのが古い方で、最後に退けた控えは必ず残ることを見る。
+  // 控えの上限は「消してよいと言えるものが足りている範囲」でしか守らない。以前は超過分を
+  // 古い順で機械的に落としていたため、同じスロットへ 3 回続けて退避すると、最初に押し出した
+  // アカウントの唯一の生存コピーが消えていた(復旧はブラウザ OAuth のやり直し)。
+  // ここでは 3 世代とも他のどこにも残っていないので、上限を超えても 1 本も落とさないこと。
   const home = sandbox('keepaside-limit', {
     current: creds('pro', { token: 'gen1' }),
     accounts: { personal: creds('pro', { token: 'old1' }) },
@@ -414,11 +449,51 @@ console.log('swap');
     fs.writeFileSync(credPath(home), JSON.stringify(creds('pro', { token: t })), 'utf8');
     runSwap(home, ['save', 'personal', '--force']);
   }
-  check('控えは上限(2 本)までに保つ', replacedFiles(home, 'personal').length === 2,
+  check('唯一のコピーは上限を超えても落とさない', replacedFiles(home, 'personal').length === 3,
+    replacedFiles(home, 'personal').join(','));
+  check('最初に押し出した内容が残っている(唯一のコピーだった)',
+    tokenOf(path.join(replacedDir(home), 'personal-1.json')) === 'old1',
+    replacedFiles(home, 'personal').join(','));
+  check('直前に退けた控えも残っている',
+    tokenOf(path.join(replacedDir(home), 'personal-3.json')) === 'gen3',
+    replacedFiles(home, 'personal').join(','));
+}
+{
+  // 落としてよいと言えるものがあるときは、上限どおりに減らす。失効済み(復元しても /login の
+  // やり直しになる)から順に落ち、最後に退けた控えは必ず残る。
+  const home = sandbox('keepaside-limit-expired', {
+    current: creds('pro', { token: 'gen1' }),
+    accounts: { personal: creds('pro', { token: 'dead1', expiresInDays: -1 }) },
+  });
+  for (const t of ['gen2', 'gen3', 'gen4']) {
+    fs.writeFileSync(credPath(home), JSON.stringify(creds('pro', { token: t })), 'utf8');
+    runSwap(home, ['save', 'personal', '--force']);
+  }
+  check('失効済みの控えは落として上限に戻す', replacedFiles(home, 'personal').length === 2,
+    replacedFiles(home, 'personal').join(','));
+  check('落ちたのは失効済みの方',
+    !fs.existsSync(path.join(replacedDir(home), 'personal-1.json')),
     replacedFiles(home, 'personal').join(','));
   check('直前に退けた控えは残っている',
-    fs.existsSync(path.join(replacedDir(home), 'personal-3.json'))
-    && tokenOf(path.join(replacedDir(home), 'personal-3.json')) === 'gen3',
+    tokenOf(path.join(replacedDir(home), 'personal-3.json')) === 'gen3',
+    replacedFiles(home, 'personal').join(','));
+}
+{
+  // 同じ資格情報が他のスロットに残っているなら、控えを落としても復旧の手立ては減らない。
+  // 「唯一のコピーは残す」を口実に無制限へ倒さないこと(平文トークンの本数は増やしたくない)。
+  const home = sandbox('keepaside-limit-duplicate', {
+    current: creds('pro', { token: 'gen1' }),
+    accounts: { personal: creds('pro', { token: 'dup' }), mirror: creds('pro', { token: 'dup' }) },
+  });
+  for (const t of ['gen2', 'gen3', 'gen4']) {
+    fs.writeFileSync(credPath(home), JSON.stringify(creds('pro', { token: t })), 'utf8');
+    runSwap(home, ['save', 'personal', '--force']);
+  }
+  check('複製が他にある控えは落としてよい', replacedFiles(home, 'personal').length === 2,
+    replacedFiles(home, 'personal').join(','));
+  check('落ちたのは mirror に同じものが残っている控え',
+    !fs.existsSync(path.join(replacedDir(home), 'personal-1.json'))
+    && tokenOf(acctPath(home, 'mirror')) === 'dup',
     replacedFiles(home, 'personal').join(','));
 }
 {
@@ -760,6 +835,107 @@ console.log('swap');
   check('credentials.js が無いときは真因と置き場所を示して止まる',
     r.code === 1 && /credentials\.js/.test(r.err) && /同じディレクトリ/.test(r.err), r.out + r.err);
   check('スタックトレースを投げっぱなしにしない', !/ {4}at /.test(r.err), r.err);
+}
+
+// --- プラン種別は「別アカウント」を証明しない ---
+{
+  // プランを上げると(Pro → Max)、昇格前に退避したスロットとは subscriptionType が食い違う。
+  // 以前はこれを「別アカウントだから復元してよい」と読んでいたので、同じアカウントの
+  // ローテート済みの古いトークンが --force なしでマシン全体に書き戻り、稼働中の全セッションが
+  // 認証エラーになっていた(account-guard も昇格前のプランと誤認識して拒否を始める)。
+  // ここで止めると日常の切り替えが常に --force を要求して旗の意味が摩耗するので、進む代わりに
+  // 戻し方を必ず出す。直前に退避しているので、戻す手は必ず残っている。
+  // 昇格後に `swap save max` と名前を明示して退避した状態(来歴は max を指す)。ここから
+  // 昇格前の退避 pro を復元しようとすると、来歴の一致でも退避先の同名でもないので、
+  // 最後に残るのはプラン種別の比較だけになる。
+  const home = sandbox('plan-change-not-proof', {
+    current: creds('max', { token: 'acct-A-new' }),
+    accounts: {
+      pro: creds('pro', { token: 'acct-A-old' }),
+      max: creds('max', { token: 'acct-A-new' }),
+    },
+    slot: 'max',
+  });
+  const r = runSwap(home, ['pro']);
+  check('プラン種別が違えば切り替えは進む', r.code === 0 && tokenOf(credPath(home)) === 'acct-A-old',
+    r.out + r.err);
+  check('切り替え前の内容は退避されている', tokenOf(acctPath(home, 'max')) === 'acct-A-new',
+    r.out + r.err);
+  check('プラン変更前の退避だった場合に備えて戻し方を出す',
+    /元に戻すには: swap max/.test(r.out), r.out);
+}
+
+// --- 復元先の健全性チェックより、同一内容の短絡を先に見る ---
+{
+  // 現在のログインが b と同じ内容なのに来歴が a を指している(中断か手作業)。この状態で
+  // `swap b` は認証を何も変えないので、b が失効していようと関係がない。以前は失効チェックが
+  // 先に走って中止し、来歴の自己修復まで飛ばしていた。来歴が a のまま残ると、次の
+  // `swap save` が a を狙い、そこにあるアカウントの退避を上書きしてしまう。
+  const home = sandbox('selfheal-before-expiry', {
+    current: creds('pro', { token: 'b-tok', expiresInDays: -1 }),
+    accounts: {
+      a: creds('pro', { token: 'a-tok' }),
+      b: creds('pro', { token: 'b-tok', expiresInDays: -1 }),
+    },
+    slot: 'a',
+  });
+  const r = runSwap(home, ['b']);
+  check('同じ内容なら復元先が失効していても中止しない',
+    r.code === 0 && /認証は変更しませんでした/.test(r.out), r.out + r.err);
+  check('来歴が直る(次の save が別スロットを狙わない)', slotOf(home) === 'b', slotOf(home));
+  check('認証には触らない', tokenOf(credPath(home)) === 'b-tok');
+}
+
+// --- 陳腐化の信号を一過性の警告だけにしない ---
+{
+  // 退避のあとトークンが更新されても、失効期限は元のままなので一覧は「残り N 日」と健全に見える。
+  // 退避したときの警告を見逃すと二度と気づけないので、status にも印を残す。ただし理由は
+  // 「更新された」と「ツールを通さずに /login した」の 2 つあり、扱いは正反対なので断定しない。
+  const home = sandbox('status-outdated-mark', {
+    current: creds('pro', { token: 'new' }),
+    accounts: {
+      pro: creds('pro', { token: 'old' }),
+      mirror: creds('pro', { token: 'old' }),
+      team: creds('team'),
+    },
+    slot: 'pro',
+  });
+  const r = runSwap(home, []);
+  check('来歴が指すスロットの内容が現在と違えば印を付ける',
+    /pro\s+\[残り \d+ 日\]\s+\[現在のログインと内容が違います\]/.test(r.out), r.out + r.err);
+  check('同じ資格情報を持つ別名スロットにも印を付ける(一致は証明)',
+    /mirror\s+\[残り \d+ 日\]\s+\[現在のログインと内容が違います\]/.test(r.out), r.out);
+  check('無関係のスロットには付けない',
+    r.out.split('\n').some(l => /^\s+team\s+\[残り \d+ 日\]$/.test(l)), r.out);
+  check('2 つの可能性を並べて、断定はしない',
+    /トークンが更新された/.test(r.out) && /\/login した/.test(r.out), r.out);
+}
+
+// --- サブコマンドと同じ名前のスロットは作らせない ---
+{
+  // `accounts/save.json` を作れてしまうと、main() は第一引数を必ずサブコマンドとして読むので
+  // `swap save` は復元ではなく退避に走り、そのスロットを復元する引数の形が存在しなくなる。
+  // 一覧には出るのに戻せない(手でファイルを動かすしかない)行き止まりだった。
+  const home = sandbox('reserved-name', {
+    current: creds('pro', { token: 'tok' }),
+  });
+  const r = runSwap(home, ['save', 'save']);
+  check('サブコマンドと同じ名前では退避できない',
+    r.code === 1 && /サブコマンドと同じ/.test(r.err), r.out + r.err);
+  check('中止したのでファイルも作らない', !fs.existsSync(acctPath(home, 'save')), r.err);
+  check('復元できなくなることを理由として書く', /復元する手段がなくなります/.test(r.err), r.err);
+}
+{
+  // 予約語チェックより前に作られたスロットは、放置すると復元できないまま一覧に居座り、
+  // 「退避してあるから大丈夫」と誤解させる。改名すれば使えるので、status で名指しする。
+  const home = sandbox('reserved-name-existing', {
+    current: creds('pro', { token: 'tok' }),
+    accounts: { save: creds('pro', { token: 'stuck' }), pro: creds('pro', { token: 'tok' }) },
+  });
+  const r = runSwap(home, []);
+  check('復元できない名前の退避は status が名指しする',
+    /復元できない名前の退避があります: save/.test(r.out), r.out + r.err);
+  check('改名という実際に効く対処を出す', /改名してください/.test(r.out), r.out);
 }
 
 console.log(`\n  ${state.pass} PASS / ${state.fail} FAIL`);
