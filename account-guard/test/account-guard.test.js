@@ -10,6 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { makeHarness } = require('./harness');
 
 // .tmp 直下ではなく自分専用のサブディレクトリを使う。以前は .tmp 全体を消していたため、
 // swap.test.js のサンドボックス(.tmp/swap)まで巻き添えで消えた。2 つのスイートを同時に
@@ -18,13 +19,9 @@ const BASE = path.join(__dirname, '.tmp', 'guard');
 const GUARD = path.join(__dirname, '..', 'account-guard.js');
 fs.rmSync(BASE, { recursive: true, force: true });
 
-const state = { pass: 0, fail: 0 };
-// extra は失敗時の手掛かり。落ちた行だけでは原因が分からないことが多いので実出力を添える
-function check(label, cond, extra) {
-  if (cond) state.pass++; else state.fail++;
-  const tail = extra && !cond ? `\n      ${String(extra).replace(/\n/g, '\n      ')}` : '';
-  console.log(`  ${cond ? 'PASS' : 'FAIL'} ${label}${tail}`);
-}
+// state カウンタと check()・最後の集計は swap.test.js と共通なので harness.js に
+// 切り出してある(詳しい経緯はそちらのコメント参照)。
+const { check, report } = makeHarness();
 
 // subscriptionType だけを持つ最小の credentials を置く。raw / rawRules に文字列を渡すと
 // 壊れたファイルを再現でき、「読めないときに拒否側へ倒れるか」を試せる。
@@ -995,5 +992,4 @@ console.log('account-guard');
     JSON.stringify(res2));
 }
 
-console.log(`\n  ${state.pass} passed, ${state.fail} failed`);
-process.exit(state.fail ? 1 : 0);
+report();

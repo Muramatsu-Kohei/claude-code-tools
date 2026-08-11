@@ -458,11 +458,16 @@ function slotsHolding(token, exclude) {
 // 「外れても案内が 1 行増えるだけ」ではなく、外れると唯一のバックアップを壊す案内になる。
 // 現在の内容と一致するスロットは古くないので外す。読めないスロットは古いかどうか
 // 判断できないので挙げない(status が [読めません] として別に扱う)。
+//
+// 以前は slotsHolding で全 accounts/*.json を読んで refreshToken の一致を調べたあと、
+// 一致したスロットだけをここでもう一度開き直して sameCreds を見ていた。退避のたびに
+// 同じファイルを二重に読むだけで判定自体は 1 回の読み込みで組み立てられるので、
+// slotsHolding は経由せずここで直接読む。
 function staleSlots(cur, name, oldToken) {
   if (!oldToken) return [];
-  return slotsHolding(oldToken, name).filter(n => {
+  return savedAccounts().filter(n => n !== name).filter(n => {
     const c = readCredsOrNull(accountFile(n));
-    return c && !sameCreds(cur.json, c.json);
+    return c && refreshTokenOf(c.json) === oldToken && !sameCreds(cur.json, c.json);
   }).sort();
 }
 
@@ -638,12 +643,20 @@ function reportOtherSlots(saved, indent, returnCmd) {
 // なお、この食い違いは「トークンが更新された」だけでなく「ツールを通さずに /login した」
 // でも起きる。後者ならそのスロットは別アカウントの新鮮な退避なので、印の意味は
 // 「現在と内容が違う」までにとどめ、更新を促す言い方はしない。
-function outdatedSlots(cur, curSlot) {
+// savedCreds は呼び出し元(cmdStatus)が全スロットを 1 回読んで作った name -> creds の
+// キャッシュ。以前はここで accountFile(curSlot) を読み直し、さらに slotsHolding が
+// 全 accounts/*.json をもう一度読んでいた。cmdStatus 側の表示ループも同じファイル群を
+// 読むため、1 回の `swap`(status)実行で各スロットを複数回読むことになっていた。
+function outdatedSlots(cur, curSlot, savedCreds) {
   if (!cur || !curSlot) return new Set();
-  const c = readCredsOrNull(accountFile(curSlot));
+  const c = savedCreds.get(curSlot);
   if (!c || sameCreds(cur.json, c.json)) return new Set();
   const token = refreshTokenOf(c.json);
-  return new Set([curSlot, ...(token ? slotsHolding(token, curSlot) : [])]);
+  if (!token) return new Set([curSlot]);
+  const holding = [...savedCreds.entries()]
+    .filter(([n, cc]) => n !== curSlot && cc && refreshTokenOf(cc.json) === token)
+    .map(([n]) => n);
+  return new Set([curSlot, ...holding]);
 }
 
 function cmdStatus() {
@@ -670,14 +683,17 @@ function cmdStatus() {
   }
 
   const saved = savedAccounts();
-  const outdated = outdatedSlots(cur, curSlot);
+  // 各スロットの中身はここで 1 回だけ読み、outdatedSlots の判定と下の表示ループの両方で
+  // 使い回す(前は判定と表示で別々に全スロットを読んでいた)。
+  const savedCreds = new Map(saved.map(n => [n, readCredsOrNull(accountFile(n))]));
+  const outdated = outdatedSlots(cur, curSlot, savedCreds);
   const unreachable = saved.filter(n => RESERVED_NAMES.has(n));
   console.log('\n退避済み (' + ACCOUNTS_DIR + '):');
   if (saved.length === 0) {
     console.log('  なし。`swap save` で現在のアカウントを退避してください');
   } else {
     for (const name of saved) {
-      const c = readCredsOrNull(accountFile(name));
+      const c = savedCreds.get(name);
       // 印は来歴が指すスロットにだけ付ける。プラン種別で合わせると、同一プランの別アカウントに
       // まで印が付き、「これが現在のバックアップだ」と誤解したまま上書きさせてしまう。
       console.log((name === curSlot ? '* ' : '  ') + name.padEnd(8)

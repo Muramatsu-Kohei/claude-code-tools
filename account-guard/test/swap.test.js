@@ -16,20 +16,16 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { makeHarness } = require('./harness');
 
 const BASE = path.join(__dirname, '.tmp', 'swap');
 const SWAP = path.join(__dirname, '..', 'swap.js');
 fs.rmSync(BASE, { recursive: true, force: true });
 
 const DAY = 86400000;
-const state = { pass: 0, fail: 0 };
-
-// extra は失敗時の手掛かり。落ちた行だけでは原因が分からないことが多いので実出力を添える
-function check(label, cond, extra) {
-  if (cond) state.pass++; else state.fail++;
-  const tail = extra && !cond ? `\n      ${String(extra).replace(/\n/g, '\n      ')}` : '';
-  console.log(`  ${cond ? 'PASS' : 'FAIL'} ${label}${tail}`);
-}
+// state カウンタと check()・最後の集計は account-guard.test.js と共通なので harness.js に
+// 切り出してある(詳しい経緯はそちらのコメント参照)。
+const { check, report } = makeHarness();
 
 // accessToken を退避スロットごとに変えられるようにしてあるのは、「更新されたか」「古いままか」を
 // 中身で見分けるため。名前だけを見ていると、指摘のあった「別名スロットが取り残される」種類の
@@ -1393,5 +1389,4 @@ console.log('swap');
     tokenOf(credPath(home)) === 'acct-A', back.out + back.err);
 }
 
-console.log(`\n  ${state.pass} PASS / ${state.fail} FAIL`);
-process.exit(state.fail ? 1 : 0);
+report();
