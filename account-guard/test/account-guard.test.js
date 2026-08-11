@@ -883,6 +883,33 @@ console.log('account-guard');
   const reason2 = res2?.hookSpecificOutput?.permissionDecisionReason || '';
   check('拒否理由が HOME を特定できないことを言う(無言で終わっていない)',
     /HOME|ホームディレクトリ/.test(reason2), reason2);
+
+  // 空白のみの HOME。空文字は falsy なので素朴な `||` チェーンでも先へ進むが、空白のみは
+  // truthy なため usableHome の trim() が無いとそのまま採用され、path.join(' ', ...) が
+  // cwd 配下の実在しない場所を指して「設定が無い」= ルール 0 件の素通しに戻る。
+  // trim() を消すリグレッションを捉えられるのはこの経路だけなので、空文字とは別に見る。
+  const RUNNER3 = path.join(NORMAL_DIR, 'run-with-blank-home.js');
+  fs.writeFileSync(RUNNER3, [
+    "'use strict';",
+    "require('os').homedir = () => '   ';",
+    "require('./account-guard.js');",
+  ].join('\n'), 'utf8');
+
+  const out3 = execFileSync(process.execPath, [RUNNER3], {
+    cwd: home2,
+    env: { ...process.env, NO_COLOR: '1', USERPROFILE: '   ', HOME: '   ' },
+    input: JSON.stringify({
+      hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+      tool_input: { command: 'echo hello' },
+    }),
+    encoding: 'utf8',
+  });
+  const res3 = out3.trim() ? JSON.parse(out3) : null;
+  check('空白のみの HOME でも無言で通さない', res3 !== null, JSON.stringify(res3));
+  check('空白のみの HOME でも拒否する', decision(res3) === 'deny', JSON.stringify(res3));
+  check('空白のみの HOME でも理由が HOME を特定できないことを言う',
+    /HOME|ホームディレクトリ/.test(res3?.hookSpecificOutput?.permissionDecisionReason || ''),
+    JSON.stringify(res3));
 }
 
 console.log(`\n  ${state.pass} passed, ${state.fail} failed`);

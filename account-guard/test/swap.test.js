@@ -956,6 +956,43 @@ console.log('swap');
     r.code === 1 && /credentials\.js/.test(r.err) && /同じディレクトリ/.test(r.err), r.out + r.err);
   check('スタックトレースを投げっぱなしにしない', !/ {4}at /.test(r.err), r.err);
 }
+{
+  // HOME をどこからも導出できない環境。credentials.js が '.' 等へ逃げると、退避先が cwd 配下に
+  // 解決されて「退避が 1 つも無い」ように見える(実際の退避は本物の HOME に残っているのに、
+  // 消えたと誤解して /login し直すと現在のアカウントまで失う)。空文字だけでなく空白のみも
+  // 見るのは、後者が truthy で usableHome の trim() が無いと素通りするため。
+  const dir = path.join(BASE, 'nohome-swap');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.copyFileSync(SWAP, path.join(dir, 'swap.js'));
+  fs.copyFileSync(path.join(__dirname, '..', 'credentials.js'), path.join(dir, 'credentials.js'));
+  // os.homedir() まで壊れた環境は環境変数だけでは作れないので、ラッパー経由で差し替える
+  // (account-guard.test.js の同種テストと同じ手口。理由はそちらのコメントに書いた)。
+  for (const [label, value] of [['空文字', ''], ['空白のみ', '   ']]) {
+    const runner = path.join(dir, 'run-' + (value === '' ? 'empty' : 'blank') + '.js');
+    fs.writeFileSync(runner, [
+      "'use strict';",
+      `require('os').homedir = () => ${JSON.stringify(value)};`,
+      "require('./swap.js');",
+    ].join('\n'), 'utf8');
+    let r;
+    try {
+      r = { code: 0, out: execFileSync(process.execPath, [runner], {
+        cwd: dir,
+        env: { ...process.env, USERPROFILE: value, HOME: value, NO_COLOR: '1' },
+        encoding: 'utf8',
+      }), err: '' };
+    } catch (e) {
+      r = { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
+    }
+    // 要点は「退避なし」と表示して成功終了しないこと。cwd 配下へ逃げた状態と見分けるため、
+    // 終了コードと真因(HOME)の両方を見る。
+    check(`HOME が全滅(${label})なら成功終了しない`, r.code !== 0, `code=${r.code} ` + r.out + r.err);
+    check(`HOME が全滅(${label})なら退避を空と偽らず真因を出す`,
+      /HOME/.test(r.out + r.err) && !/退避されていません/.test(r.out), r.out + r.err);
+    check(`HOME が全滅(${label})でもスタックトレースを投げっぱなしにしない`,
+      !/ {4}at /.test(r.err), r.err);
+  }
+}
 
 // --- プラン種別は「別アカウント」を証明しない ---
 {
