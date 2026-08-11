@@ -356,6 +356,9 @@ function denyMessage(hit, account) {
       'ログインの問題ではないため `/login` では直りません。account-guard.js だけを別の場所へ',
       'コピーした場合は、credentials.js も同じディレクトリへ置いてください。',
       '判別できない間は保護ツリーへの操作をすべて拒否します(素通しにすると保護が無言で外れるため)。',
+      // 他の deny 経路と同じ一文をここにも置く。設置ミスだと読んだ Claude が「ガードの都合だから」と
+      // 別経路(ツリー名を書かない Bash など)で読み直すと、保護の目的そのものが崩れる。
+      '回避しようとせず、ユーザーに状況を伝えてください。',
     ]).join('\n');
   }
 
@@ -404,6 +407,15 @@ function main() {
   // 手元での確認用。フックからは呼ばれない。
   if (mode === 'status') {
     console.log(`アカウント: ${account}`);
+    // 判別不能の原因が credentials.js の置き忘れなら、ここで言わないと未ログインと区別が
+    // 付かない。deny メッセージ側でわざわざ塞いだ袋小路(/login を繰り返しても直らない)を、
+    // 確認用の入り口で踏ませないため。
+    if (credentialsLoadError) {
+      console.log(`  credentials.js を読み込めません (${path.join(__dirname, 'credentials.js')}: `
+        + `${credentialsLoadError.code || credentialsLoadError.message})`);
+      console.log('  未ログインではなく、判別する手段が無い状態です。`/login` では直りません。');
+      console.log('  account-guard.js の隣に credentials.js を置いてください。');
+    }
     console.log(`設定: ${CONFIG}${fs.existsSync(CONFIG) ? '' : ' (未作成 — 保護は無効)'}`);
     if (config.broken) {
       console.log('設定を読めません — 修復するまで、設定ファイル自身の編集以外は拒否します。');

@@ -617,6 +617,18 @@ console.log('account-guard');
     /credentials\.js/.test(reason), reason);
   check('効かない対処(/login)を唯一の次の一手として案内しない',
     /`\/login` では直りません/.test(reason), reason);
+  // 他の deny 経路にはある一文。設置ミスだと読んだ Claude が「ガードの都合だから」と
+  // 別経路(ツリー名を書かない Bash など)で読み直すと、保護の目的そのものが崩れる。
+  check('この経路でも迂回禁止とユーザーへの報告を指示する',
+    /回避しようとせず/.test(reason) && /ユーザー/.test(reason), reason);
+
+  // 確認用の入り口(status)でも真因を出す。'アカウント: unknown' だけでは未ログインと
+  // 区別が付かず、deny 側でわざわざ塞いだ袋小路(/login の繰り返し)をここで踏む。
+  const statusOut = execFileSync(process.execPath, [ALONE, 'status'], {
+    env: { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' }, encoding: 'utf8',
+  });
+  check('status も credentials.js が読めないことを言う',
+    /credentials\.js/.test(statusOut) && /`\/login` では直りません/.test(statusOut), statusOut);
 
   res = runAlone(home, {
     hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',

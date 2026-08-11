@@ -20,8 +20,14 @@
 //      書き込みが途中で落ちたりすると古くなるので、単独では上書きの根拠にしない
 // どれでも決着しない組み合わせ(同一プランの別アカウント同士)は原理的に残る。そこは
 // 判断で守らず構造で守る: 既存の退避を上書きするときは、1 の証明が無い限り旧内容を
-// accounts/.replaced/ へ退けてから書く。--force も、壊れた credentials の経路も例外なく
-// この順を通るので、「唯一のバックアップが消える」は起こらない(復旧はファイルの改名で済む)。
+// accounts/.replaced/ へ退けてから書く。スロットへの書き込みを writeSlot 1 箇所に集約して
+// あるので、--force も、壊れた credentials の経路も、別名スロットの同期も例外なくこの順を
+// 通る。したがって「唯一のバックアップが消える」は起こらない(復旧はファイルの改名で済む)。
+//
+// --force は 1 つの旗だが、意味する判断は 2 つある(混ぜると片方の都合でもう片方が外れる)。
+//   swap <name> --force      … 復元側。失効済み・判別不能・同一プランでも復元へ進む。
+//                              退避先に別のアカウントが入っていれば、それでも中止する
+//   swap save <name> --force … 退避側。そのスロットを上書きしてよいという明示
 //
 // このツールで最も高い代償を払う失敗は、退避されていない資格情報を失うこと(ブラウザ
 // OAuth のやり直しになる)。判断に迷う場面では、切り替えを諦めて現状を保つ方に倒す。
@@ -31,7 +37,18 @@
 const fs = require('fs');
 const path = require('path');
 // credentials の場所と読み方は account-guard.js と共有する(credentials.js のコメント参照)。
-const { HOME, CREDENTIALS, readCredentials, subscriptionTypeOf } = require('./credentials');
+// require を素通しにすると、隣に置き忘れた構成で生の MODULE_NOT_FOUND だけが出て真因に
+// たどり着けない(swap.cmd のパスを書き換えて swap.js だけ移すのは README が案内する配置)。
+// ガード側と違って swap は credentials の読み方を知らないまま動けないので、ここで止める。
+let credentials;
+try {
+  credentials = require('./credentials');
+} catch (e) {
+  fail('swap.js の隣にある credentials.js を読み込めません'
+    + '\n  (' + path.join(__dirname, 'credentials.js') + ': ' + (e.code || e.message) + ')'
+    + '\n  swap.js を別の場所へ移した場合は、credentials.js も同じディレクトリへ置いてください');
+}
+const { HOME, CREDENTIALS, readCredentials, subscriptionTypeOf } = credentials;
 
 // 退避先を ~/.claude 配下に置くのは、元の credentials と同じ ACL を継承させるため。
 // 平文トークンの本数は増えるが、保護レベルは変わらない(§6.1 の「残るリスク」)。
@@ -77,18 +94,32 @@ function readCredsOrNull(file) {
   }
 }
 
-// 読めない理由を案内に反映するために、もう一度だけ読んで err.code を見る。ここを
+// 読めない理由を案内に反映するために、もう一度だけ読んで原因を切り分ける。ここを
 // 「破損しているか書き込み中」と決め打ちすると、権限で読めない環境の人に
 // 「時間をおいて再実行」という永久に効かない対処を繰り返させることになる。
-// 返り値の retryable は「待てば直りうるか」で、案内の文面を分ける。
+// 返り値の retryable は「待てば直りうるか」で、案内の文面を分ける。待てば直るのは
+// 「書き込みの途中を読んだ」場合だけなので、JSON として読めたのに形が違うもの
+// (手で編集した、別バージョンが書いた、将来の構造変更)は retryable にしない。
 function unreadableReason(file) {
+  let raw;
   try {
-    fs.readFileSync(file, 'utf8');
-    return { label: '破損しているか、他のプロセスが書き込み中', retryable: true };
+    raw = fs.readFileSync(file, 'utf8');
   } catch (e) {
     if (e.code === 'ENOENT') return { label: 'ファイルがありません', retryable: false };
     return { label: '読み取りに失敗しました(' + e.code + ')。権限を確認してください', retryable: false };
   }
+  let json;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    // 途中まで書かれたファイルは JSON として壊れて見える。書き込み中なら待てば直る
+    return { label: '壊れているか、他のプロセスが書き込み中', retryable: true };
+  }
+  if (!json || !json.claudeAiOauth || !json.claudeAiOauth.accessToken) {
+    return { label: 'claudeAiOauth.accessToken がありません(形式が想定と違います)', retryable: false };
+  }
+  // readCreds が落ちたのにここへ来る = 上の条件で拾えていない理由。決め打ちで案内しない
+  return { label: '内容を解釈できません', retryable: false };
 }
 
 // 同一性の判断材料 1。値そのものは比較にしか使わず、出力にもログにも出さない。
@@ -191,18 +222,25 @@ function replacedEntries(base) {
     .sort((a, b) => a.n - b.n);
 }
 
-// 消すのは「もう復旧に使えない」と分かるものから。失効済みを先に落とし、それでも
-// 上限を超える分だけ古い順に落とす。読めない控えは中身を判断できないので本数でのみ扱う。
-function pruneReplaced(base) {
-  let list = replacedEntries(base);
-  for (const e of list) {
+// 控えを減らすのは上限を超えたときだけにする。「失効済みだから」で無条件に消すと、
+// 退けたばかりの控えがその場で消える(上書きされる旧内容が失効していた場合)。案内が約束する
+// 「旧内容は .replaced に控えを残します」が破れ、マシンの時計が進んでいる環境では
+// 失効していない控えまで巻き添えになる。落とす順だけを「復旧に使えないと分かるもの」から
+// にすれば、上限は守りつつ、控えが約束より少なくなることはない。
+// protect は今まさに退けたばかりの控え。上限判定の対象には数えるが、削除の候補からは外す。
+function pruneReplaced(base, protect) {
+  const list = replacedEntries(base);
+  const excess = list.length - REPLACED_KEEP;
+  if (excess <= 0) return;
+  const candidates = list.filter(e => e.file !== protect);
+  // 失効済み = 復元しても /login のやり直しになるので、真っ先に落としてよい。
+  // 残りは古い順(replacedEntries は連番の昇順)。
+  const expired = candidates.filter(e => {
     const c = readCredsOrNull(e.file);
-    if (c && isExpired(c.json)) {
-      try { fs.unlinkSync(e.file); e.gone = true; } catch {}
-    }
-  }
-  list = list.filter(e => !e.gone);
-  for (const e of list.slice(0, Math.max(0, list.length - REPLACED_KEEP))) {
+    return c && isExpired(c.json);
+  });
+  const order = expired.concat(candidates.filter(e => !expired.includes(e)));
+  for (const e of order.slice(0, excess)) {
     try { fs.unlinkSync(e.file); } catch {}
   }
 }
@@ -217,13 +255,18 @@ function keepAside(file, base) {
   const dest = path.join(REPLACED_DIR, base + '-' + n + '.json');
   fs.copyFileSync(file, dest);
   try { fs.chmodSync(dest, 0o600); } catch {}
-  pruneReplaced(base);
+  pruneReplaced(base, dest);
   return dest;
 }
 
-function replacedCount() {
-  if (!fs.existsSync(REPLACED_DIR)) return 0;
-  return fs.readdirSync(REPLACED_DIR).filter(f => f.endsWith('.json')).length;
+// 「上書きで退けた旧内容」と「読めなかった現在の credentials の控え」は用途が違う。
+// 前者はスロットへ戻せば復旧できるが、後者は復元に使えない中身なので、戻す案内に混ぜると
+// 壊れたバイト列を有効なスロットへ書かせることになる。数える段階から分ける。
+function replacedCounts() {
+  if (!fs.existsSync(REPLACED_DIR)) return { overwritten: 0, unreadable: 0 };
+  const files = fs.readdirSync(REPLACED_DIR).filter(f => f.endsWith('.json'));
+  const unreadable = files.filter(f => f.startsWith(UNREADABLE_BASE + '-')).length;
+  return { overwritten: files.length - unreadable, unreadable };
 }
 
 // --- 来歴(.current) ---
@@ -278,11 +321,25 @@ function failOverwrite(name, old, provenance, different) {
     + '\n    swap save ' + name + ' --force');
 }
 
+// スロットへの書き込みは必ずここを通す。「上書きの前に旧内容を退ける」を呼び出し側の
+// 記憶に任せると、後から足した経路(別名スロットの同期)がすり抜けて、控えを 1 本も
+// 残さないまま上書きする。冒頭で構造の保証だと書いた以上、経路は 1 つにしておく。
+// 控えを省いてよいのは「同じ資格情報」だと証明できるときだけ(読めない旧内容は証明できない
+// ので必ず退ける)。
+function writeSlot(name, cur) {
+  const file = accountFile(name);
+  if (fs.existsSync(file)) {
+    const old = readCredsOrNull(file);
+    if (!(old && sameCreds(cur.json, old.json))) keepAside(file, name);
+  }
+  writeAtomic(file, cur.raw);
+}
+
 // 退避の実体。読み込み済みの cur をそのまま書くのは、CREDENTIALS を二度読むと
 // 「比較したバイト列」と「退避するバイト列」がずれるため(その隙に Claude Code が
 // トークンを更新すると、退避したつもりの中身が別物になる)。
 // 戻り値は、ついでに更新した別名スロットの一覧。
-function saveInto(cur, name, force) {
+function saveInto(cur, name, forceOverwrite) {
   const file = accountFile(name);
   const exists = fs.existsSync(file);
   const old = exists ? readCredsOrNull(file) : null;
@@ -293,9 +350,8 @@ function saveInto(cur, name, force) {
   const provenance = readCurrentSlot() === name;
   const different = old ? provablyDifferent(cur.json, old.json) : false;
 
-  if (exists && !identical) {
-    if (!force && (!provenance || different)) failOverwrite(name, old, provenance, different);
-    keepAside(file, name);
+  if (exists && !identical && !forceOverwrite && (!provenance || different)) {
+    failOverwrite(name, old, provenance, different);
   }
 
   // 別名スロットを揃えるのは「同じアカウントの新しい世代で置き換える」と言えるときだけ。
@@ -303,14 +359,18 @@ function saveInto(cur, name, force) {
   // 巻き添えで書き換えてしまう(そちらのバックアップを増やすどころか全部消すことになる)。
   const sameAccount = exists && !identical && !different && provenance;
   const aliases = sameAccount && oldToken ? slotsHolding(oldToken, name) : [];
-  writeAtomic(file, cur.raw);
-  for (const a of aliases) writeAtomic(accountFile(a), cur.raw);
+  writeSlot(name, cur);
+  for (const a of aliases) writeSlot(a, cur);
   writeCurrentSlot(name);
   return aliases;
 }
 
 // 現在ログイン中の認証情報を accounts/ に退避する。
 // 戻り値は { name, aliases } / 読めない場合は { degraded:true, kept } / 未ログインなら null。
+// force は 2 つの別々の判断を分けて渡す。まとめて 1 つの --force にすると、復元側の都合
+// (失効済みを承知で復元したい)で付けた --force が、退避側の上書きガードまで黙って外す。
+//   unreadable … 現在の credentials が読めなくても、控えだけ残して先へ進む
+//   overwrite  … 別の認証情報が入っているスロットを上書きしてよい
 // forceCmd は「読めないまま先へ進む」ための実際に効くコマンド(呼び出し元で文面が変わる)。
 function saveCurrent(explicitName, force, forceCmd) {
   const cur = readCredsOrNull(CREDENTIALS);
@@ -320,7 +380,7 @@ function saveCurrent(explicitName, force, forceCmd) {
     // 「読めない」で止めるだけだと、この状態から抜け出す手段が無くなる(swap も save も
     // 同じ判定で止まるため)。中身を確認した人が先へ進めるよう --force を用意する。
     const why = unreadableReason(CREDENTIALS);
-    if (!force) {
+    if (!force.unreadable) {
       fail('現在の credentials を読めません(' + why.label + ')'
         + (why.retryable ? '\n  時間をおいて再実行してください。' : '\n  ')
         + '中身を確認したうえで、そのまま先へ進めるなら:'
@@ -339,7 +399,7 @@ function saveCurrent(explicitName, force, forceCmd) {
       + '\n  `swap save <name>` で名前を明示してください。以後その名前が来歴として記録され、'
       + '名前を省略しても退避できるようになります');
   }
-  const aliases = saveInto(cur, name, force);
+  const aliases = saveInto(cur, name, force.overwrite);
   return { name, aliases };
 }
 
@@ -372,10 +432,17 @@ function cmdStatus() {
         + (c ? expiryNote(c.json) : '  [読めません]'));
     }
   }
-  const replaced = replacedCount();
-  if (replaced > 0) {
-    console.log('\n上書きで退けた旧内容: ' + replaced + ' 件 (' + REPLACED_DIR + ')');
+  const replaced = replacedCounts();
+  if (replaced.overwritten > 0) {
+    console.log('\n上書きで退けた旧内容: ' + replaced.overwritten + ' 件 (' + REPLACED_DIR + ')');
     console.log('  取り違えて上書きしたときは、ここから accounts/<name>.json へ戻せます');
+  }
+  if (replaced.unreadable > 0) {
+    // 復元先には使えない中身なので、上と同じ「戻せます」の案内に混ぜない
+    console.log('\n読めなかった credentials の控え: ' + replaced.unreadable + ' 件 ('
+      + path.join(REPLACED_DIR, UNREADABLE_BASE + '-*.json') + ')');
+    console.log('  復元には使えません(accessToken を取り出せない中身です)。'
+      + '原因を調べ終えたら消して構いません');
   }
   if (!curSlot && cur && saved.length > 0) {
     console.log('\n来歴が未記録です。`swap save <name>` で退避すると、以後どのスロット由来かを記録します');
@@ -384,7 +451,9 @@ function cmdStatus() {
 
 function cmdSave(name, force) {
   if (name && !NAME_RE.test(name)) fail('アカウント名に使えない文字が含まれています: ' + name);
-  const saved = saveCurrent(name, force, 'swap save ' + (name || '<name>') + ' --force');
+  // save の --force は「このスロットを上書きしてよい」という明示なので、両方に効かせる
+  const saved = saveCurrent(name, { unreadable: force, overwrite: force },
+    'swap save ' + (name || '<name>') + ' --force');
   if (!saved) fail('現在 credentials がありません(未ログイン)');
   if (saved.degraded) {
     console.log('現在の credentials は復元に使える形ではないため、退避しませんでした');
@@ -444,43 +513,78 @@ function cmdSwap(target, force) {
   }
 
   const provenance = readCurrentSlot();
-  if (provenance === target) {
-    // 来歴が一致していて中身が違う = 退避したあとにトークンがローテートした状態。
-    // 復元すると現在のログインが古い世代に退化するだけなので、切り替えない。
-    console.log('すでに ' + target + ' でログインしています。何もしません');
-    console.log('  現在のログインは ' + target + ' の退避より新しい可能性があります。'
-      + '退避を最新にするなら: swap save');
+  // cur が無い(未ログイン・読めない)ときは「すでに復元済み」とは言えない。来歴だけを見て
+  // ここで止めると、credentials を失った人が退避を復元できない行き止まりになる。
+  if (cur && provenance === target && !force) {
+    // 来歴が一致していて中身が違う理由は 2 つあり、どちらかは判別できない。
+    //   a) 退避したあとトークンがローテートした … 現在のほうが新しく、復元は退化にしかならない
+    //   b) このツールを通さずに /login した … 現在は別アカウントで、退避を復元したい
+    // 既定は何もしない側(a を壊さない)に倒すが、「何もしません」で終えると b の人が
+    // 抜け出せなくなる(--force も同じ文言で止まっていた)。両方の次の一手を必ず出す。
+    console.log('すでに ' + target + ' から復元した状態です。認証は変更しませんでした');
+    console.log('  ただし現在の内容は ' + target + ' の退避と一致しません。退避のあとトークンが'
+      + '更新されたか、このツールを通さずに /login した可能性があります');
+    console.log('  現在のログインのほうが新しいなら、退避を最新にします:');
+    console.log('    swap save');
+    console.log('  ' + target + ' の退避に戻したいなら、先に現在を別名へ退避してから復元します:');
+    console.log('    swap save <別名>');
+    // 復元の段で同一性のガードに当たるかはここで分かる。当たるなら、そのとき必要になる
+    // --force まで出しておく(案内どおり打って止まるのは、案内していないのと同じ)
+    const unproven = !provablyDifferent(cur.json, next.json);
+    console.log('    swap ' + target + (unproven ? ' --force' : ''));
+    if (unproven) {
+      console.log('  (同じプランなので別アカウントだと確認できません。--force はそれを承知で'
+        + '復元するという意味です)');
+    }
     return;
   }
 
   // 退避先が復元元と同じファイルになる場合は、名前を分けてもらう。--force で押し切っても
   // 「復元元を上書きしてから、その上書きした内容を復元する」か「来歴が実体と食い違う」かの
   // どちらかにしかならない。別名で退避すれば何も壊さずに切り替えられるので、その手順を出す。
-  // 次のプラン一致の判定より先に置くのは、そちらの案内(--force)がこの状況では効かないため。
+  // 次の同一性の判定より先に置くのは、そちらの案内(--force)がこの状況では効かないため。
   if (cur && currentSlotOf(cur) === target) {
+    // 別名で退避したあとの復元が次の判定に当たるかは、ここで分かる。当たるなら、そのとき
+    // 必要になる --force まで出しておく(案内どおり打って止まるのは案内していないのと同じ)
+    const unproven = !provablyDifferent(cur.json, next.json);
     fail('現在のログインの退避先が復元元(' + target + ')と同じ名前になります'
-      + '\n  ' + target + ' には別のアカウントが入っているため、このままでは復元元を上書きします'
+      // 「別のアカウント」とまでは証明できない(同じアカウントの古い退避かもしれない)。
+      // 確かなのは現在と違う認証情報が入っていることなので、そこまでしか言わない。
+      + '\n  ' + target + ' には現在と違う認証情報が入っているため、このままでは復元元を上書きします'
       + '\n  先に別名で退避してください(既存のスロットには触りません):'
       + '\n    swap save <別名>'
-      + '\n  そのあと `swap ' + target + '` で切り替えられます');
+      + '\n  そのあと切り替えられます:'
+      + '\n    swap ' + target + (unproven ? ' --force' : '')
+      + (unproven
+        ? '\n  (プラン種別が同じか読めないため別アカウントだと確認できません。'
+          + '--force はそれを承知で復元するという意味です)'
+        : ''));
   }
 
-  // 来歴がまだ無いときは、復元先が「同じアカウントの古い退避」なのか「別アカウント」なのかを
-  // 見分けられない。前者だと切り替えたつもりで古い認証情報へ退化し、トークンがローテート済みなら
-  // 認証が通らなくなる。同じプランなら黙って進まず、判断を人に返す。
-  if (!provenance && cur && !force) {
+  // 復元先が「別アカウント」だと証明できないときは黙って進まない。同一プランの別アカウントと
+  // 「同じアカウントの古い退避」は原理的に見分けられず(冒頭の 2)、後者だと切り替えたつもりで
+  // ローテート前のトークンに退化し、稼働中のセッションが次のリクエストで認証エラーになる。
+  // 来歴の有無で判断を変えないのは、来歴が語るのは現在のログインの出どころだけで、復元先が
+  // 何者かについては何も証明しないため(来歴が第三のスロットを指していても不確かさは同じ)。
+  if (cur && !force && !provablyDifferent(cur.json, next.json)) {
     const type = subscriptionTypeOf(cur.json);
-    if (type && type === subscriptionTypeOf(next.json)) {
-      fail(target + ' は現在と同じプラン(' + type + ')ですが、来歴が記録されていないため'
-        + '同一アカウントか判別できません'
-        + '\n  同じアカウントだった場合、復元すると古い認証情報に戻り、認証が通らなくなることがあります'
-        + '\n  現在のログインはそのままです。別のアカウントだと分かっているなら:'
-        + '\n    swap ' + target + ' --force');
-    }
+    fail(target + ' が現在のログインとは別のアカウントだと確認できません'
+      + (type ? '(どちらも ' + type + ')' : '(プラン種別を読めないため比較できません)')
+      + '\n  同じアカウントの古い退避だった場合、復元するとローテート前のトークンに戻り、'
+      + '認証が通らなくなることがあります'
+      + '\n  現在のログインはそのままです'
+      + '\n  別のアカウントだと分かっているなら(現在のログインは退避してから切り替えます):'
+      + '\n    swap ' + target + ' --force'
+      + '\n  同じアカウントなら、復元ではなく退避を最新にするだけで済みます:'
+      + '\n    swap save');
   }
 
-  // 現在を退避してから差し替える。この退避が唯一のバックアップなので、失敗したら進まない
-  const saved = saveCurrent(null, force, 'swap ' + target + ' --force');
+  // 現在を退避してから差し替える。この退避が唯一のバックアップなので、失敗したら進まない。
+  // 上書きは許可しない: ここでの --force は「復元先が失効済みでも進む」「読めない現在を
+  // 諦めて進む」という復元側の判断であって、退避先に入っている別アカウントを潰してよいとは
+  // 言っていない(退避名はプラン種別から決まることがあるので、無関係なスロットに当たりうる)。
+  const saved = saveCurrent(null, { unreadable: force, overwrite: false },
+    'swap ' + target + ' --force');
   if (!saved) {
     console.log('現在ログインしていないため、退避はしません');
   } else if (saved.degraded) {
@@ -502,8 +606,10 @@ function usage() {
 
   swap                 現在のアカウントと退避済み一覧を表示
   swap <name>          現在を退避してから <name> を復元
-  swap <name> --force  復元先が失効済み・判別不能でも中止せずに切り替える
+  swap <name> --force  復元先が失効済み・判別不能・同一プランでも中止せずに切り替える
                        現在の credentials が読めない場合も、控えを残して進む
+                       (退避先に別のアカウントが入っている場合は上書きせずに中止する。
+                        それを許すのは swap save <name> --force だけ)
   swap save [<name>]   現在のアカウントを退避するだけ(切り替えない)
                        名前を省略すると来歴(前回のスロット名)か subscriptionType を使う
   swap save <name> --force

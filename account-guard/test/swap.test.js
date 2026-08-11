@@ -55,7 +55,9 @@ const replacedFiles = (home, base) => (fs.existsSync(replacedDir(home))
   ? fs.readdirSync(replacedDir(home)).filter((f) => !base || f.startsWith(base + '-')) : []);
 const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
 const typeOf = (p) => readJson(p).claudeAiOauth.subscriptionType;
-const tokenOf = (p) => readJson(p).claudeAiOauth.accessToken;
+// 無い場合に例外で落とさないのは、控えが消えている系の失敗で残りのテストまで止めないため
+// (この種の壊れ方は「1 件だけ落ちる」よりも「どこまで壊れているか」を知りたい)
+const tokenOf = (p) => (fs.existsSync(p) ? readJson(p).claudeAiOauth.accessToken : null);
 const slotOf = (home) => (fs.existsSync(slotPath(home))
   ? fs.readFileSync(slotPath(home), 'utf8').trim() : null);
 
@@ -129,6 +131,17 @@ console.log('swap');
   check('未ログインからの切り替え後は team になる', typeOf(credPath(home)) === 'team');
 }
 {
+  // 来歴が復元先を指したまま credentials を失った状態。比較する現在が無いので「すでに復元済み」
+  // とは言えない。来歴だけを見て止めると、退避を持っているのに復元できない行き止まりになる。
+  const home = sandbox('no-current-same-slot', {
+    accounts: { team: creds('team') },
+    slot: 'team',
+  });
+  const r = runSwap(home, ['team']);
+  check('来歴が指す先でも、未ログインなら復元する', r.code === 0, r.out + r.err);
+  check('未ログインからの復元で credentials が戻る', typeOf(credPath(home)) === 'team');
+}
+{
   const SECRET = 'sk-ant-oat01-DUMMYSECRET';
   const home = sandbox('broken-target', {
     current: creds('pro'),
@@ -195,9 +208,16 @@ console.log('swap');
     slot: 'personal',
   });
   const r = runSwap(home, ['personal']);
-  check('来歴が指すスロットへの切り替えは何もしない', /何もしません/.test(r.out), r.out + r.err);
+  check('来歴が指すスロットへの切り替えは認証を変えない',
+    r.code === 0 && /認証は変更しませんでした/.test(r.out), r.out + r.err);
   check('現在のログインを古いスナップショットに戻さない',
     tokenOf(credPath(home)) === 'pro-new');
+  // 中身が違う理由は「ローテートした」だけでなく「外から /login した」もありうる。
+  // 前者しか想定せずに終えると、後者の人は退避に戻す手段が無いまま行き止まりになる
+  // (以前は --force を付けても同じ文言で止まっていた)。両方の次の一手を出すこと。
+  check('退避を最新にする手順を出す', /swap save\n/.test(r.out), r.out);
+  check('退避に戻したい人向けの手順も出す',
+    /別名/.test(r.out) && /swap personal --force/.test(r.out), r.out);
 }
 
 {
@@ -218,6 +238,29 @@ console.log('swap');
   check('同じ内容だと証明できた別名スロットも揃って更新する',
     tokenOf(acctPath(home, 'personal')) === 'pro-new', r.out + r.err);
   check('内容が違うスロットは巻き添えにしない', tokenOf(acctPath(home, 'team')) === 'tok-team');
+}
+{
+  // 別名スロットの同期だけが「上書きの前に旧内容を退ける」経路を通っていなかった。
+  // 同じアカウントを 2 つの名前で退避している状態で、このツールを通さず別アカウントへ
+  // /login してから退避すると(同一プランなので中止できない)、押し出される旧内容の控えが
+  // 片方しか残らない。控えは 2 本までしか保たないので、上書きを重ねると元が消える。
+  const home = sandbox('alias-keepaside', {
+    current: creds('pro', { token: 'acct-B' }),
+    accounts: {
+      personal: creds('pro', { token: 'acct-A' }),
+      work: creds('pro', { token: 'acct-A' }),
+    },
+    slot: 'personal',
+  });
+  const r = runSwap(home, ['save']);
+  check('別名スロットも現在の内容で更新する',
+    r.code === 0 && tokenOf(acctPath(home, 'work')) === 'acct-B', r.out + r.err);
+  check('別名スロットの上書きでも旧内容の控えを残す',
+    replacedFiles(home, 'work').length === 1, replacedFiles(home).join(','));
+  check('控えの中身は押し出された旧内容',
+    tokenOf(path.join(replacedDir(home), 'work-1.json')) === 'acct-A');
+  check('来歴が指すスロットの控えも残る',
+    tokenOf(path.join(replacedDir(home), 'personal-1.json')) === 'acct-A');
 }
 {
   // 切り替えに伴う退避でも同じこと。ここが漏れると、次に personal を復元したときに
@@ -324,6 +367,38 @@ console.log('swap');
     r.code === 0 && tokenOf(acctPath(home, 'work')) === 'acct-A', r.out + r.err);
 }
 {
+  // 控えを取った直後に刈り込みを走らせていたため、上書きされる旧内容が失効していると
+  // その控えが同じ呼び出しの中で消えていた。案内が約束する「旧内容は .replaced に控えを
+  // 残します」が破れ、スロット名を打ち間違えただけで復旧手段が無くなる。
+  const home = sandbox('keepaside-expired', {
+    current: creds('pro', { token: 'live' }),
+    accounts: { personal: creds('pro', { token: 'dead', expiresInDays: -1 }) },
+  });
+  const r = runSwap(home, ['save', 'personal', '--force']);
+  check('失効した旧内容でも控えを残す(その場で消さない)',
+    replacedFiles(home, 'personal').length === 1, r.out + r.err + replacedFiles(home).join(','));
+  check('控えの中身は上書きされた旧内容',
+    tokenOf(path.join(replacedDir(home), 'personal-1.json')) === 'dead');
+}
+{
+  // 控えを無制限には残さない(平文トークンなので)。上限を超えた分だけ落ちること、
+  // 落ちるのが古い方で、最後に退けた控えは必ず残ることを見る。
+  const home = sandbox('keepaside-limit', {
+    current: creds('pro', { token: 'gen1' }),
+    accounts: { personal: creds('pro', { token: 'old1' }) },
+  });
+  for (const t of ['gen2', 'gen3', 'gen4']) {
+    fs.writeFileSync(credPath(home), JSON.stringify(creds('pro', { token: t })), 'utf8');
+    runSwap(home, ['save', 'personal', '--force']);
+  }
+  check('控えは上限(2 本)までに保つ', replacedFiles(home, 'personal').length === 2,
+    replacedFiles(home, 'personal').join(','));
+  check('直前に退けた控えは残っている',
+    fs.existsSync(path.join(replacedDir(home), 'personal-3.json'))
+    && tokenOf(path.join(replacedDir(home), 'personal-3.json')) === 'gen3',
+    replacedFiles(home, 'personal').join(','));
+}
+{
   // 来歴が一致するスロットは自分のバックアップなので、確認を挟まず更新できないと
   // 通常の `swap save` が毎回 --force を要求することになって使い物にならない。
   const home = sandbox('overwrite-own', {
@@ -372,12 +447,57 @@ console.log('swap');
   const forced = runSwap(home, ['pro', '--force']);
   check('--force でも復元元を上書きして進んだりしない',
     forced.code === 1 && tokenOf(acctPath(home, 'pro')) === 'acct-A', forced.out + forced.err);
+  // 中止するときは、案内どおり打てば実際に通る手順を出すこと。同一プランでは復元側の
+  // 同一性ガードに当たるので、案内にも --force が含まれていなければ「案内どおり打って
+  // また止まる」になる(それは行き止まりを一段先送りしただけ)。
+  check('案内に、そのあと実際に効くコマンドが載っている',
+    /swap save <別名>/.test(first.err) && /swap pro --force/.test(first.err), first.err);
   const saved = runSwap(home, ['save', 'mine']);
   check('別名での退避は通る', saved.code === 0, saved.out + saved.err);
-  const second = runSwap(home, ['pro']);
+  const second = runSwap(home, ['pro', '--force']);
   check('別名で退避すれば切り替えられる(行き止まりにしない)', second.code === 0, second.out + second.err);
   check('切り替え後もアカウントA の退避は無傷', tokenOf(acctPath(home, 'pro')) === 'acct-A');
   check('アカウントB は別名スロットに残る', tokenOf(acctPath(home, 'mine')) === 'acct-B');
+}
+
+// --- 復元側の --force と退避側の上書きは別の判断 ---
+{
+  // 復元側の --force(失効済み・判別不能でも進む)で退避側の上書きガードまで外すと、
+  // 退避名がプラン種別から決まったときに、無関係のスロットを確認も警告もなく潰す。
+  const home = sandbox('force-scope', {
+    current: creds('pro', { token: 'acct-B' }),
+    accounts: { pro: creds('pro', { token: 'acct-A' }), personal: creds('pro', { token: 'acct-C' }) },
+  });
+  const r = runSwap(home, ['personal', '--force']);
+  check('復元側の --force は他アカウントの退避を上書きしない',
+    tokenOf(acctPath(home, 'pro')) === 'acct-A', r.out + r.err);
+  check('上書きが必要になるなら中止して知らせる',
+    r.code === 1 && /別のアカウントが入っています/.test(r.err), r.out + r.err);
+  check('中止したので現在のログインもそのまま', tokenOf(credPath(home)) === 'acct-B');
+}
+
+// --- 復元先が「別アカウント」だと証明できないとき ---
+{
+  // 来歴は現在のログインの出どころしか語らないので、それが第三のスロットを指していても
+  // 復元先が何者かは分からない。ここを素通しにすると、同じアカウントの古い退避へ黙って
+  // 巻き戻り、ローテート済みのトークンで稼働中の全セッションが認証エラーになる。
+  const home = sandbox('rollback-other-slot', {
+    current: creds('pro', { token: 'acctA-new' }),
+    accounts: {
+      team: creds('pro', { token: 'acctA-new' }),
+      personal: creds('pro', { token: 'acctA-veryold' }),
+    },
+    slot: 'team',
+  });
+  const r = runSwap(home, ['personal']);
+  check('来歴が別スロットを指していても、同一性を確認できなければ中止する',
+    r.code === 1 && /確認できません/.test(r.err), r.out + r.err);
+  check('古い世代へ黙って巻き戻さない', tokenOf(credPath(home)) === 'acctA-new');
+  check('中止のときは両方の次の一手を出す',
+    /swap personal --force/.test(r.err) && /swap save/.test(r.err), r.err);
+  const forced = runSwap(home, ['personal', '--force']);
+  check('別アカウントだと分かっていれば --force で通る(行き止まりにしない)',
+    forced.code === 0 && tokenOf(credPath(home)) === 'acctA-veryold', forced.out + forced.err);
 }
 
 // --- subscriptionType が読めない場合 ---
@@ -392,8 +512,13 @@ console.log('swap');
   check('退避名を決められないときは切り替えを中止する', first.code === 1, first.out + first.err);
   const saved = runSwap(home, ['save', 'mine']);
   check('名前を明示すれば退避できる', saved.code === 0, saved.out + saved.err);
-  const second = runSwap(home, ['team']);
-  check('一度退避すれば来歴が効いて切り替えが通る(行き止まりにしない)',
+  // 現在のプラン種別が読めない以上、復元先が別アカウントである証明も立たない。中止するが、
+  // 案内した --force で必ず抜けられること(止まったまま出られないのは安全ではない)。
+  const blocked = runSwap(home, ['team']);
+  check('プラン種別を比較できないときは復元を中止する',
+    blocked.code === 1 && /確認できません/.test(blocked.err), blocked.out + blocked.err);
+  const second = runSwap(home, ['team', '--force']);
+  check('一度退避すれば --force で切り替えが通る(行き止まりにしない)',
     second.code === 0, second.out + second.err);
   check('退避した中身は元の credentials', tokenOf(acctPath(home, 'mine')) === 'no-type');
   check('切り替え後は team', typeOf(credPath(home)) === 'team');
@@ -494,9 +619,55 @@ console.log('swap');
   check('status はファイルが無いときだけ未ログインと言う', /未ログイン/.test(r.out), r.out + r.err);
 }
 {
+  // JSON としては読めるのに accessToken が無い(手で編集した、別バージョンが書いた、
+  // 将来の構造変更)。待っても直らないので「時間をおいて再実行」は永久に効かない案内になる。
+  const home = sandbox('status-no-token', {
+    current: { claudeAiOauth: { subscriptionType: 'pro' } },
+    accounts: { team: creds('team') },
+  });
+  const s = runSwap(home, []);
+  check('status は形式の問題を「書き込み中」と言わない',
+    /accessToken/.test(s.out) && !/書き込み中/.test(s.out), s.out + s.err);
+  const r = runSwap(home, ['team']);
+  check('待っても直らない理由では再実行を案内しない', !/時間をおいて/.test(r.err), r.out + r.err);
+  check('先へ進む手段は案内する', /--force/.test(r.err), r.err);
+}
+{
+  // 「上書きで退けた旧内容」と「読めなかった credentials の控え」を同じ件数に混ぜると、
+  // 案内どおり accounts/<name>.json へ戻した人が、復元に使えない中身を有効なスロットに書く。
+  const home = sandbox('status-replaced-kinds', {
+    current: '{ broken',
+    accounts: { team: creds('team') },
+  });
+  runSwap(home, ['team', '--force']); // 読めない現在の控えだけができる
+  const r = runSwap(home, []);
+  check('読めない控えを「上書きで退けた旧内容」に数えない',
+    !/上書きで退けた旧内容/.test(r.out), r.out + r.err);
+  check('読めない控えは別項目で出す', /読めなかった credentials の控え: 1 件/.test(r.out), r.out);
+  check('復元に使えないことを伝える', /復元には使えません/.test(r.out), r.out);
+}
+{
   const home = sandbox('bad-name', { current: creds('pro') });
   const r = runSwap(home, ['../evil']);
   check('パス区切りを含む名前は拒否する(ファイル名になるため)', r.code === 1, r.out + r.err);
+}
+{
+  // README は swap.cmd のパスを書き換えて別の場所へ置く手順を案内しており、swap.js だけを
+  // 移す配置は現実に起きる。require を素通しにすると main() の try/catch より前に落ちて
+  // 生のスタックトレースだけが出る(account-guard.js 側は同じ状況で真因を示す)。
+  const dir = path.join(BASE, 'lone-swap');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.copyFileSync(SWAP, path.join(dir, 'swap.js')); // credentials.js は意図的に置かない
+  let r;
+  try {
+    r = { code: 0, out: execFileSync(process.execPath, [path.join(dir, 'swap.js')], {
+      env: { ...process.env, USERPROFILE: dir, HOME: dir, NO_COLOR: '1' }, encoding: 'utf8' }), err: '' };
+  } catch (e) {
+    r = { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
+  }
+  check('credentials.js が無いときは真因と置き場所を示して止まる',
+    r.code === 1 && /credentials\.js/.test(r.err) && /同じディレクトリ/.test(r.err), r.out + r.err);
+  check('スタックトレースを投げっぱなしにしない', !/ {4}at /.test(r.err), r.err);
 }
 
 console.log(`\n  ${state.pass} PASS / ${state.fail} FAIL`);
