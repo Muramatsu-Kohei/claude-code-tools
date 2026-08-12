@@ -1589,4 +1589,77 @@ console.log('swap');
     r2.out + r2.err);
 }
 
+{
+  // cmdSwap の degraded 案内: 「読めなかった」は「中身が無価値」ではない。権限・ロック・
+  // 書き込み途中でも degraded になるので、そこで「復元に使える形ではない」と断定すると、
+  // 未退避アカウントの唯一のコピーになっている控えを、無価値だと言い切って捨てさせる。
+  const home = sandbox('swap-degraded-reason', {
+    current: '{ broken',
+    accounts: { team: creds('team') },
+  });
+  const r = runSwap(home, ['team', '--force']);
+  check('読めない現在でも --force なら切り替わる', r.code === 0, r.out + r.err);
+  check('読めなかっただけの中身を「使えない」と断定しない',
+    !/復元に使える形ではない/.test(r.out), r.out + r.err);
+  check('退避しなかった理由を添える', /読めなかったため/.test(r.out), r.out + r.err);
+  check('待てば直る壊れ方では控えを消さないよう伝える',
+    /控えは消さないでください/.test(r.out), r.out + r.err);
+}
+
+{
+  // 対照: JSON としては読めるが accessToken が無い(待っても直らない)場合は、控えが復元に
+  // 使えないことまで言い切ってよい。上の断定を避けるのは理由が分からないときだけ。
+  const home = sandbox('swap-degraded-unusable', {
+    current: { claudeAiOauth: { subscriptionType: 'pro' } },
+    accounts: { team: creds('team') },
+  });
+  const r = runSwap(home, ['team', '--force']);
+  check('待っても直らない壊れ方では控えが使えないと明示する',
+    /復元には使えません/.test(r.out), r.out + r.err);
+}
+
+{
+  // forceHint(saveBlocked): --force は復元側の判断でしかなく、退避先の上書きまでは許さない。
+  // 来歴の指すスロットがプラン変更前の内容だと(driftedProvenance として明示的に扱う状態)、
+  // 素の `swap <target> --force` は退避の段で上書きガードに当たって二度目の中止になる。
+  // 案内には別名での退避を先に置き、そのとおり打てば切り替えられることまで見る。
+  const home = sandbox('swap-force-blocked-by-save', {
+    current: creds('max', { token: 'now' }),
+    slot: 'personal',
+    accounts: {
+      personal: creds('pro', { token: 'older' }),
+      team: creds('team', { token: 'gone', expiresInDays: -1 }),
+    },
+  });
+  const r = runSwap(home, ['team']);
+  check('失効した復元先は --force なしで中止する', r.code !== 0, r.out + r.err);
+  check('案内は別名での退避を先に置く', /swap save <別名>/.test(r.err), r.out + r.err);
+  check('退避の段で止まる理由も添える', /退避先 personal/.test(r.err), r.out + r.err);
+  const s = runSwap(home, ['save', 'alias']);
+  check('案内どおり別名で退避できる', s.code === 0, s.out + s.err);
+  const f = runSwap(home, ['team', '--force']);
+  check('案内どおり打てば切り替えられる(退避の段で止まらない)', f.code === 0, f.out + f.err);
+  check('切り替え後の内容は復元先のもの', typeOf(credPath(home)) === 'team', f.out + f.err);
+}
+
+{
+  // reportOtherSlots: 同じ内容を複数の名前で退避している場合、取り残されるスロットは複数ある。
+  // 先頭 1 つにしかコマンドを出していなかった頃は、案内どおり打っても残りがローテート前の
+  // トークンを持ったままになり、後でそちらを復元した時点でこの関数が防ぐはずの退化が起きた。
+  const home = sandbox('report-other-slots-all', {
+    current: creds('pro', { token: 'fresh' }),
+    slot: 'pro',
+    accounts: {
+      pro: creds('pro', { token: 'stale' }),
+      alias1: creds('pro', { token: 'stale' }),
+      alias2: creds('pro', { token: 'stale' }),
+    },
+  });
+  const r = runSwap(home, ['save']);
+  check('取り残されるスロットを挙げる', /alias1/.test(r.out) && /alias2/.test(r.out), r.out + r.err);
+  check('取り残される全スロットに更新コマンドを出す',
+    /swap save alias1 --force/.test(r.out) && /swap save alias2 --force/.test(r.out),
+    r.out + r.err);
+}
+
 report();

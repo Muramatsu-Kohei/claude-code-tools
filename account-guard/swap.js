@@ -569,6 +569,27 @@ function driftedProvenance(cur, name, prevSlot) {
 // プラン種別が食い違っても「別のアカウント」とまでは言えない(同じアカウントのプラン変更前の
 // 退避でも食い違う)。断定すると、同じアカウントの古い退避に対して「別のアカウントです(pro)」と
 // 現在と同じプラン名を並べた自己矛盾した案内になり、利用者は不要な別名スロットを増やす。
+// 退避が上書きガードに当たるか、その判断材料ごと返す。saveInto が上書きの前に読むものと同じ
+// なので、案内を組み立てる側(cmdSwap)からも呼べるように切り出す。案内側で条件を書き写すと、
+// 片方だけ直したときに「案内どおり打つと止まる」が復活する(このファイルで繰り返し起きた事故)。
+// prevSlot は呼び出し元が既に読んだ .current。cmdSwap は読み直しを避けるために渡し、saveInto は
+// 省略して自分で読む(saveCurrent の経路では、そこへ来るまでに .current が書き換わりうる)。
+function overwriteGate(cur, name, prevSlot) {
+  const file = accountFile(name);
+  const exists = fs.existsSync(file);
+  const old = exists ? readCredsOrNull(file) : null;
+  const identical = !!(old && sameCreds(cur.json, old.json));
+  // 来歴が一致しても素通しにはしない。/login や書き込みの中断で来歴は古くなりうるので、
+  // 「別アカウントだと証明できる」場合は来歴より証明を優先して止める。
+  const slot = prevSlot !== undefined ? prevSlot : readCurrentSlot();
+  const provenance = slot === name;
+  const different = old ? planDiffers(cur.json, old.json) : false;
+  return {
+    old, prevSlot: slot, provenance, different,
+    blocked: exists && !identical && (!provenance || different),
+  };
+}
+
 function failOverwrite(name, old, provenance, different) {
   const theirs = old ? subscriptionTypeOf(old.json) : null;
   fail('退避先 ' + name + ' には現在と違う認証情報が入っています'
@@ -625,28 +646,18 @@ function writeSlot(name, cur, old) {
 // トークンを更新すると、退避したつもりの中身が別物になる)。
 // 戻り値は、この退避で古くなりうる他スロットの一覧(書き換えはしない)。
 function saveInto(cur, name, forceOverwrite) {
-  const file = accountFile(name);
-  const exists = fs.existsSync(file);
-  const old = exists ? readCredsOrNull(file) : null;
-  const oldToken = old ? refreshTokenOf(old.json) : null;
-  const identical = !!(old && sameCreds(cur.json, old.json));
-  // 来歴が一致しても素通しにはしない。/login や書き込みの中断で来歴は古くなりうるので、
-  // 「別アカウントだと証明できる」場合は来歴より証明を優先して止める。
-  const prevSlot = readCurrentSlot();
-  const provenance = prevSlot === name;
-  const different = old ? planDiffers(cur.json, old.json) : false;
+  const g = overwriteGate(cur, name);
+  const oldToken = g.old ? refreshTokenOf(g.old.json) : null;
 
-  if (exists && !identical && !forceOverwrite && (!provenance || different)) {
-    failOverwrite(name, old, provenance, different);
-  }
+  if (g.blocked && !forceOverwrite) failOverwrite(name, g.old, g.provenance, g.different);
 
   // 他スロットの状態は書き込みの前に見る(書いたあとでは、退けた旧内容がどこに複製として
   // 残っているかも、来歴が元は何を指していたかも分からなくなる)。
   const stale = staleSlots(cur, name, oldToken);
-  const drifted = driftedProvenance(cur, name, prevSlot);
+  const drifted = driftedProvenance(cur, name, g.prevSlot);
   // 上で読んだ old をそのまま渡す。writeSlot に読み直させると、同じファイルを 1 回の退避で
   // 二度読むうえ、identical(上書きの可否)と控えの要否が別々の読み込み結果で決まる。
-  writeSlot(name, cur, old);
+  writeSlot(name, cur, g.old);
   // 退避そのものは済んでいる。来歴だけ書けずに生の例外で終わると、退避できたのかどうかが
   // 読めず、やり直して同じスロットをもう一度上書きさせることになる。中止はするが(来歴の
   // 無い状態で切り替えまで進めない)、何が済んだかは必ず伝える。
@@ -742,7 +753,13 @@ function reportOtherSlots(saved, returnCmd) {
     console.log(indent + '    ' + returnCmd
       + '   (先に戻さないと、いま復元したアカウントの内容で上書きされます)');
   }
-  console.log(indent + '    swap save ' + names[0] + ' --force');
+  // 名前は挙がっている全部に出す。先頭 1 つだけを出していた頃は、同じアカウントを複数の名前で
+  // 退避している人(この関数がまさに想定している状況)が案内どおり打っても残りが取り残され、
+  // 後でそちらを復元した時点でローテート前のトークンに戻っていた。防ごうとしている事象を
+  // 案内の側で作っていたことになる。
+  for (const n of names) {
+    console.log(indent + '    swap save ' + n + ' --force');
+  }
 }
 
 // 退避したあとトークンが更新されると、そのスロットは復元してもローテート前に戻るだけになるが、
@@ -993,14 +1010,25 @@ function cmdSwap(target, force) {
   // saveCurrent が来歴/subscriptionType から決めるので、ここでは決め打ちできない)。
   const saveCmd = 'swap save' + (planned ? ' --force' : '');
 
-  // --force を案内する前に、その --force が下の「退避先が復元元と同じ名前になる」判定で
-  // 止まらないかを見る。そこは --force では解けず、別名での退避でしか抜けられないので、
-  // 素の `swap <target> --force` だけを出すと案内どおり打っても必ず中止される
-  // (失効済み・refreshToken 欠け・subscriptionType 欠けの 3 経路すべてで再現した)。
-  const forceHint = (cur && curSlotOf === target)
+  // 案内する --force が、そのあとの退避まで通るかどうか。素の `swap <target> --force` が
+  // 途中で止まる理由は 2 つあり、どちらも --force では解けず、別名で退避すれば抜けられる。
+  //   a) 退避先が復元元と同じ名前になる(下の判定。--force でも復元元を上書きするだけ)
+  //   b) 退避先に別の認証情報が入っている(ここでの --force は復元側の判断で、
+  //      saveCurrent へは overwrite: false で渡すため、saveInto の上書きガードに当たる)
+  // b を見ていなかった頃は、来歴の指すスロットがプラン変更前の内容だと(このツールが
+  // driftedProvenance として明示的に扱う状態)、案内どおり打った人が退避の段で二度目の
+  // 中止に当たっていた。判定は saveInto と同じ overwriteGate に通し、条件を書き写さない。
+  // 退避名は saveCurrent が来歴/subscriptionType から決めるので curSlotOf と同じ。
+  const saveBlocked = !!(cur && curSlotOf && overwriteGate(cur, curSlotOf, curSlot).blocked);
+  const needsAliasSave = !!cur && (curSlotOf === target || saveBlocked);
+  const forceHint = needsAliasSave
     ? '\n  現在のログインはそのままです。先に別名で退避してから、承知のうえで復元してください:'
       + '\n    swap save <別名>'
       + '\n    swap ' + target + ' --force'
+      + (saveBlocked && curSlotOf !== target
+        ? '\n  (退避先 ' + curSlotOf + ' には現在と違う認証情報が入っているため、'
+          + '名前を分けないと --force を付けても退避の段で止まります)'
+        : '')
     : '\n  現在のログインはそのままです。承知のうえで復元するなら: swap ' + target + ' --force';
 
   // 失効済みの復元先は切り替える前に止める。上書きしてから気づいてもマシン全体が
@@ -1092,25 +1120,33 @@ function cmdSwap(target, force) {
   // (この時点で現在のログインは退避済みなので、元に戻す手は必ず残っている)。
   if (cur && !force && !planned) {
     const type = subscriptionTypeOf(cur.json);
-    // --force を案内する前に、その --force が退避の段で止まらないかを見る。退避名は来歴か
-    // subscriptionType から決まるので、どちらも無いと saveCurrent が「退避名を決められません」で
-    // 中止し、案内どおり打った人が二重に止まる(案内していないのと同じになる)。
+    // --force を案内する前に、その --force が退避の段で止まらないかを見る。止まる理由は 2 つ。
+    //   needsName   … 退避名は来歴か subscriptionType から決まるので、どちらも無いと
+    //                 saveCurrent が「退避名を決められません」で中止する
+    //   saveBlocked … 退避先に別の認証情報が入っている(上の forceHint と同じ判定)
+    // どちらも「先に名前を明示して退避する」で解けるので、その 1 行を案内に足す。
     const needsName = !curSlotOf;
+    const saveFirst = needsName || saveBlocked;
     fail(target + ' が現在のログインとは別のアカウントだと確認できません'
       + (type ? '(どちらも ' + type + ')' : '(プラン種別を読めないため比較できません)')
       + '\n  同じアカウントの古い退避だった場合、復元するとローテート前のトークンに戻り、'
       + '認証が通らなくなることがあります'
       + '\n  現在のログインはそのままです'
       + '\n  別のアカウントだと分かっているなら(現在のログインは退避してから切り替えます):'
-      + (needsName
-        ? '\n    swap save <name>'
+      + (saveFirst
+        ? '\n    swap save ' + (needsName ? '<name>' : '<別名>')
           + '\n    swap ' + target + ' --force'
-          + '\n  (現在のログインは退避名を決められない状態です'
-            + '(subscriptionType が読めず、来歴も記録されていません)。'
-            + '先に名前を明示して退避しないと、--force を付けても退避の段で止まります)'
+          + (needsName
+            ? '\n  (現在のログインは退避名を決められない状態です'
+              + '(subscriptionType が読めず、来歴も記録されていません)。'
+              + '先に名前を明示して退避しないと、--force を付けても退避の段で止まります)'
+            : '\n  (退避先 ' + curSlotOf + ' には現在と違う認証情報が入っているため、'
+              + '名前を分けないと --force を付けても退避の段で止まります)')
         : '\n    swap ' + target + ' --force')
       + '\n  同じアカウントなら、復元ではなく退避を最新にするだけで済みます:'
-      + '\n    swap save' + (needsName ? ' <name>' : ''));
+      // saveBlocked のときは素の `swap save` も同じ上書きガードで止まる。ここは「同じ
+      // アカウントなら」という前提の下の案内なので、上書きを承知する --force を添えてよい。
+      + '\n    swap save' + (needsName ? ' <name>' : '') + (saveBlocked ? ' --force' : ''));
   }
 
   // 現在を退避してから差し替える。この退避が唯一のバックアップなので、失敗したら進まない。
@@ -1122,8 +1158,17 @@ function cmdSwap(target, force) {
   if (!saved) {
     console.log('現在ログインしていないため、退避はしません');
   } else if (saved.degraded) {
-    console.log('現在の credentials は復元に使える形ではないため、退避しませんでした');
+    // degraded は「読めなかった」であって「中身が無価値」ではない。権限・他プロセスのロック・
+    // 書き込み途中でも degraded になるのに「復元に使える形ではない」と断定していた頃は、
+    // 未退避のアカウントの唯一のコピーが .replaced に控えとして残っているのに、それを
+    // 無価値だと言い切っていた(unreadableReason も credentialsState も、まさにその断定を
+    // 避けるために作ってある)。cmdSave と同じく理由を読み直して添える。
+    const why = unreadableReason(CREDENTIALS);
+    console.log('現在の credentials を読めなかったため、退避しませんでした(' + why.label + ')');
     console.log('  中身の控え: ' + saved.kept);
+    console.log(why.retryable
+      ? '  中身は健全なまま読めなかっただけのことがあります。この控えは消さないでください'
+      : '  この控えは復元には使えません(accessToken を取り出せない中身です)');
   } else {
     console.log('退避: ' + saved.name);
   }
