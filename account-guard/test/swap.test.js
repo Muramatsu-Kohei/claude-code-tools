@@ -942,6 +942,26 @@ console.log('swap');
     /上書きで退けた旧内容: 1 件/.test(r.out), r.out + r.err);
 }
 {
+  // 修正2: accessToken が無くても refreshToken が残っている控え(hasRecoverableToken)は、
+  // 「復元に使えない・消して構いません」の unusable 側に混ぜてはいけない。refreshToken は
+  // 交換すればまた使えるので、そう案内すると救えたはずの資格情報を消させることになる。
+  const home = sandbox('replaced-counts-stale-token', { current: creds('pro') });
+  fs.mkdirSync(replacedDir(home), { recursive: true });
+  fs.writeFileSync(path.join(replacedDir(home), '.unreadable-current-1.json'), JSON.stringify({
+    claudeAiOauth: {
+      subscriptionType: 'pro',
+      refreshToken: 'refresh-still-good',
+      refreshTokenExpiresAt: Date.now() + 30 * DAY,
+    },
+  }), 'utf8');
+  const r = runSwap(home, []);
+  check('refreshToken だけの控えは「復元に使えない控え」に数えない',
+    !/^復元に使えない控え/m.test(r.out), r.out + r.err);
+  check('refreshToken だけの控えは別項目で件数を出す',
+    /refreshToken が残っている控え: 1 件/.test(r.out), r.out + r.err);
+  check('消さないでほしいことを明示する', /消さないでください/.test(r.out), r.out + r.err);
+}
+{
   const home = sandbox('bad-name', { current: creds('pro') });
   const r = runSwap(home, ['../evil']);
   check('パス区切りを含む名前は拒否する(ファイル名になるため)', r.code === 1, r.out + r.err);
@@ -1179,6 +1199,30 @@ console.log('swap');
     r.out.split('\n').some(l => /^\s+team\s+\[残り \d+ 日\]$/.test(l)), r.out);
   check('2 つの可能性を並べて、断定はしない',
     /トークンが更新された/.test(r.out) && /\/login した/.test(r.out), r.out);
+}
+{
+  // 修正5: 来歴が指すスロットの内容が現在のログインと一致すると、以前はそこで即座に空集合を
+  // 返していた。同じアカウントを複数の名前で退避していた場合、押し出された旧トークンを
+  // 持つ側にはこれで永久に印が付かなかった(README は「swap の一覧にも印が残る」と書いている
+  // のに、実装がまさにこのケースだけ抜けていた)。
+  const home = sandbox('outdated-same-name-duplicate', {
+    current: creds('pro', { token: 'old' }),
+    accounts: {
+      pro: creds('pro', { token: 'old' }),
+      mirror: creds('pro', { token: 'old' }),
+    },
+    slot: 'pro',
+  });
+  // pro を新しいトークンへ更新する。押し出された old は .replaced/pro-*.json へ控えられ、
+  // mirror だけがそれと同じ旧トークンを持ったまま取り残される。
+  fs.writeFileSync(credPath(home), JSON.stringify(creds('pro', { token: 'new' })), 'utf8');
+  const s = runSwap(home, ['save', 'pro', '--force']);
+  check('退避が成功する(前提条件)', s.code === 0, s.out + s.err);
+  const r = runSwap(home, []);
+  check('来歴のスロットは現在と一致するので印が付かない',
+    r.out.split('\n').some(l => /^\*\s*pro\s+\[残り \d+ 日\]$/.test(l)), r.out);
+  check('別名で退避していた側には、押し出された旧内容と一致することを根拠に印が付く',
+    /mirror\s+\[残り \d+ 日\]\s+\[現在のログインと内容が違います\]/.test(r.out), r.out + r.err);
 }
 
 // --- サブコマンドと同じ名前のスロットは作らせない ---
@@ -1435,6 +1479,30 @@ console.log('swap');
     /`\/login` してから/.test(r.out + r.err), r.out + r.err);
   check('待っても直らない壊れ方では時間をおいての案内は出さない',
     !/時間をおいて/.test(r.out + r.err), r.out + r.err);
+}
+{
+  // 修正3: accessToken が無くても refreshToken が残っている(stale)場合は、unusable と
+  // 同じ「/login してから」を案内してはいけない。refreshToken は交換すればまた使えるので、
+  // /login で上書きさせると救えたはずの資格情報を失わせる(account-guard.js の 'stale' 分岐と
+  // 同じ判断)。
+  const home = sandbox('save-degraded-stale-refresh-token', {
+    current: {
+      claudeAiOauth: {
+        subscriptionType: 'pro',
+        refreshToken: 'refresh-stale',
+        refreshTokenExpiresAt: Date.now() + 30 * DAY,
+      },
+    },
+  });
+  const r = runSwap(home, ['save', '--force']);
+  check('refreshToken が残る壊れ方では成功終了しない', r.code !== 0, r.out + r.err);
+  check('refreshToken が残る壊れ方では /login を勧めない',
+    !/`\/login` してから/.test(r.out + r.err), r.out + r.err);
+  check('refreshToken が残っていることを理由として示す',
+    /refreshToken は残っています/.test(r.out + r.err), r.out + r.err);
+  check('/login すると失われることを伝える', /失われる/.test(r.out + r.err), r.out + r.err);
+  check('中身の控えは残す(手掛かりとしての価値)', replacedFiles(home).length === 1,
+    r.out + r.err + replacedFiles(home).join(','));
 }
 {
   // keepAside(控えのコピー失敗): fs.copyFileSync 自体が失敗すると、以前は生の Node 例外
@@ -1730,6 +1798,38 @@ console.log('swap');
 }
 
 {
+  // 修正4: ACCOUNTS_DIR が手違いでファイルとして存在すると、savedAccounts() の生の readdirSync が
+  // ENOTDIR で落ち、原因も対処も示されないまま全サブコマンドが死んでいた。listReplaced()
+  // (340-345 付近)は既にこのパターンへ対策済みなので、そこに揃える。
+  const home = sandbox('accounts-dir-unusable', { current: creds('pro', { token: 'now' }) });
+  const accountsDir = path.join(home, '.claude', 'accounts');
+  fs.rmSync(accountsDir, { recursive: true, force: true });
+  fs.writeFileSync(accountsDir, 'not a directory', 'utf8');
+  const r = runSwap(home, []);
+  check('スロット一覧を読めない環境では生の例外にならない', r.code !== 0, r.out + r.err);
+  check('原因(e.code)を添える', /ENOTDIR|EEXIST|EACCES|EPERM/.test(r.err), r.out + r.err);
+  check('対処を添える', /権限を確認/.test(r.err), r.out + r.err);
+  check('生の Node スタックトレースを出さない', !/at Object\.|at Module\.|node:internal/.test(r.err), r.err);
+}
+
+{
+  // 修正6: writeAtomic の mkdirSync が ENOTDIR / EEXIST(置き場所が同名のファイルになっている)で
+  // 落ちた場合、以前は EPERM/EBUSY 向けの「ファイルを掴んでいる別プロセスを終了…」しか出さず、
+  // 的外れだった。初回の `swap save` はまだ何も退避していない(oldToken が無い)ので staleSlots が
+  // savedAccounts を呼ばずに素通しし、savedAccountsOrFail(修正4)より先に writeAtomic へ到達する
+  // (実機で確認済み)。ACCOUNTS_DIR をファイルとして置いて再現する。
+  const home = sandbox('accounts-dir-is-file-on-save', { current: creds('pro', { token: 'now' }) });
+  const accountsDir = path.join(home, '.claude', 'accounts');
+  fs.rmSync(accountsDir, { recursive: true, force: true });
+  fs.writeFileSync(accountsDir, 'not a directory', 'utf8');
+  const r = runSwap(home, ['save', '--force']);
+  check('置き場所がファイルの環境では書き込みへ進まない', r.code !== 0, r.out + r.err);
+  check('原因(e.code)を添える', /EEXIST|ENOTDIR/.test(r.err), r.err);
+  check('ENOTDIR/EEXIST 向けの「同名のファイル」の案内を添える',
+    /同名のファイルになっていないか確認してください/.test(r.err), r.err);
+}
+
+{
   // 名前を省いた退避は、来歴か subscriptionType から名前が決まる。この経路は validateName を
   // 通っていなかったため、subscriptionType が予約語(サブコマンドと同じ名前)になると、
   // `swap <name>` では復元できないスロットが静かに作られる。名前が確定したところで検証する。
@@ -1758,7 +1858,9 @@ console.log('swap');
 
 {
   // 対照: JSON としては読めるのに accessToken が無い復元先は、待っても直らない(手で編集した・
-  // 別バージョンが書いた・将来の構造変更)。従来どおり入れ直しを案内してよい。
+  // 別バージョンが書いた・将来の構造変更)。従来どおり入れ直しを案内してよいが、いまログイン中の
+  // pro/now はまだどこにも退避されていない(accounts にあるのは team だけ)ので、修正1により
+  // /login より先に `swap save` を案内しないと、案内どおり打った時点で pro/now が永久に失われる。
   const home = sandbox('restore-target-no-token', {
     current: creds('pro', { token: 'now' }),
     accounts: { team: { claudeAiOauth: { subscriptionType: 'team' } } },
@@ -1766,6 +1868,44 @@ console.log('swap');
   const r = runSwap(home, ['team']);
   check('待っても直らない復元先では入れ直しを案内する',
     /`\/login` し直して/.test(r.err), r.out + r.err);
+  check('現在のアカウントが未退避なら /login より先に swap save を案内する',
+    /swap save[^\n]*\n[\s\S]*`\/login` し直して/.test(r.err), r.err);
+}
+{
+  // 修正1の核心: 現在ログイン中のアカウントがまだどのスロットにも退避されていない状態で、
+  // 復元先が壊れている(accessToken が無い)swap を打つと、以前は現在の状態を一度も確認せずに
+  // いきなり「そのアカウントで /login し直してください」と案内していた。案内どおり打つと、
+  // 一度も swap save していない現在の credentials が /login の時点で永久に失われる
+  // (このツールで最も高い代償を払う失敗、swap.js 冒頭コメント参照)。
+  const home = sandbox('swap-save-first-when-current-unsaved', {
+    current: creds('pro', { token: 'unsaved-now' }),
+    accounts: { team: { claudeAiOauth: { subscriptionType: 'team' } } },
+  });
+  const r = runSwap(home, ['team']);
+  check('復元先が壊れていて上書きを中止する', r.code !== 0, r.out + r.err);
+  check('/login より先に swap save <name> を案内する',
+    /swap save pro/.test(r.err), r.err);
+  check('swap save の案内が /login より前に出る',
+    r.err.indexOf('swap save pro') < r.err.indexOf('`/login` し直して'), r.err);
+  check('現在のログインには何も触れていない', tokenOf(credPath(home)) === 'unsaved-now', r.out + r.err);
+}
+{
+  // 対照: 現在ログイン中のアカウントが既に別のスロットへ退避済み(refreshToken の一致で証明できる)
+  // なら、/login しても失うものが無いので、従来どおりの案内のままでよい(swap save の一手を
+  // 余分に挟ませない)。
+  const home = sandbox('no-swap-save-first-when-already-saved', {
+    current: creds('pro', { token: 'already-saved' }),
+    accounts: {
+      pro: creds('pro', { token: 'already-saved' }),
+      team: { claudeAiOauth: { subscriptionType: 'team' } },
+    },
+    slot: 'pro',
+  });
+  const r = runSwap(home, ['team']);
+  check('復元先が壊れていて上書きを中止する', r.code !== 0, r.out + r.err);
+  check('既に退避済みなら swap save <name> の追加案内は出さない',
+    !/先に `swap save/.test(r.err), r.err);
+  check('従来どおり入れ直しを案内する', /`\/login` し直して/.test(r.err), r.err);
 }
 
 {

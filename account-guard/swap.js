@@ -81,14 +81,17 @@ if (
   || typeof credentials.readCredentials !== 'function'
   || typeof credentials.subscriptionTypeOf !== 'function'
   || typeof credentials.hasUsableCredentials !== 'function'
+  || typeof credentials.hasRecoverableToken !== 'function'
 ) {
   fail('swap.js の隣にある credentials.js の形式が想定と違います'
     + '\n  (' + path.join(__dirname, 'credentials.js') + ')'
-    + '\n  HOME / CREDENTIALS / readCredentials / subscriptionTypeOf / hasUsableCredentials のいずれかが'
-    + '欠けているか、期待する型ではありません'
+    + '\n  HOME / CREDENTIALS / readCredentials / subscriptionTypeOf / hasUsableCredentials / '
+    + 'hasRecoverableToken のいずれかが欠けているか、期待する型ではありません'
     + '\n  swap.js と対応する版の credentials.js を同じディレクトリへ置き直してください');
 }
-const { HOME, CREDENTIALS, readCredentials, subscriptionTypeOf, hasUsableCredentials } = credentials;
+const {
+  HOME, CREDENTIALS, readCredentials, subscriptionTypeOf, hasUsableCredentials, hasRecoverableToken,
+} = credentials;
 
 // 退避先を ~/.claude 配下に置くのは、元の credentials と同じ ACL を継承させるため。
 // 平文トークンの本数は増えるが、保護レベルは変わらない(§6.1 の「残るリスク」)。
@@ -225,6 +228,20 @@ function unreadableReason(file) {
     return { label: '壊れているか、他のプロセスが書き込み中', retryable: true };
   }
   if (!hasUsableCredentials(json)) {
+    // accessToken が無くても refreshToken が残っていることがある(書き込み途中が典型)。
+    // refreshToken は交換すればまた使える資格情報なので、accessToken だけが欠けた状態を
+    // 「失って困るものは無い」側の unusable と同じに扱ってはいけない。account-guard.js の
+    // credentialsState() は同じ状況を stale として分けており、swap 側だけが粗いままだと、
+    // ガードは /login を勧めないのに swap は勧める、という食い違いが起きて refreshToken を失う
+    // (呼び出し元の cmdSave / cmdSwap は staleRefreshToken を見て /login 一択の案内をやめる)。
+    if (hasRecoverableToken(json)) {
+      return {
+        label: 'claudeAiOauth.accessToken がありません(形式が想定と違います)。'
+          + 'ただし refreshToken は残っています(交換すればまた使えます)',
+        retryable: false,
+        staleRefreshToken: true,
+      };
+    }
     return { label: 'claudeAiOauth.accessToken がありません(形式が想定と違います)', retryable: false };
   }
   // ここへ来る = 読み直した時点では健全に読める。cmdSave は --force を挟んでから改めて
@@ -275,7 +292,17 @@ function accountNameOf(json) {
 // mode は効かない(mode は作成時のみ)ため、書き込み後に明示的に落とす。
 // Windows では ACL 継承が支配的で chmod はほぼ no-op だが、WSL や他環境でも同じ強度を保つ。
 function writeAtomic(file, data) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+  } catch (e) {
+    // ENOTDIR / EEXIST は「置き場所が同名のファイルになっている」ことが原因で、掴んでいる
+    // 別プロセスを終了しても直らない。呼び出し元(退避先・来歴・CREDENTIALS 本体の 3 箇所)は
+    // どれも EPERM/EBUSY 向けの「別プロセスを終了…」を案内していたため、この原因だと的外れになる
+    // (keepAside の replacedFail が同種の原因を先に切り分けているのと同じ着眼)。ここで印を
+    // 付けておき、呼び出し元がメッセージを選び分けられるようにする。
+    if (e.code === 'ENOTDIR' || e.code === 'EEXIST') e.dirIsFile = true;
+    throw e;
+  }
   const tmp = file + '.tmp';
   let renamed = false;
   try {
@@ -290,6 +317,15 @@ function writeAtomic(file, data) {
     // 一覧は `.json` しか拾わないので、残しても誰も気づけないまま溜まっていく。
     if (!renamed) { try { fs.unlinkSync(tmp); } catch {} }
   }
+}
+
+// writeAtomic が付けた e.dirIsFile を見て、ENOTDIR / EEXIST 用の一文を添える。他の書き込み
+// 失敗(EPERM/EBUSY など、掴んでいる別プロセスが原因)と同じ文言を使い回すと、「終了してください」
+// と言われた側に該当プロセスが無く、案内どおり動いても直らない行き止まりになる。
+function dirIsFileHint(e, dir) {
+  return e.dirIsFile
+    ? '\n  ' + dir + ' が同名のファイルになっていないか確認してください'
+    : '';
 }
 
 // refreshToken には有効期限があり、切れていると復元しても /login のやり直しになる。
@@ -316,13 +352,36 @@ function expiryNote(json) {
   return days <= 1 ? '  [まもなく失効]' : `  [残り ${days} 日]`;
 }
 
+// existsSync だけを盾に readdirSync していた頃は、ACCOUNTS_DIR が手違いでファイルとして
+// 存在すると ENOTDIR の生例外が main() まで抜け、原因も対処も示されないまま全サブコマンドが
+// 死んでいた。同じファイルの listReplaced() (340-345 付近)と同じパターンに揃え、
+// エラーを戻り値に入れて呼び出し元に判断を返す。
 function savedAccounts() {
-  if (!fs.existsSync(ACCOUNTS_DIR)) return [];
-  return fs.readdirSync(ACCOUNTS_DIR)
-    .filter(f => f.endsWith('.json'))
-    .map(f => f.slice(0, -5))
-    .filter(n => NAME_RE.test(n))
-    .sort();
+  if (!fs.existsSync(ACCOUNTS_DIR)) return { names: [], error: null };
+  try {
+    return {
+      names: fs.readdirSync(ACCOUNTS_DIR)
+        .filter(f => f.endsWith('.json'))
+        .map(f => f.slice(0, -5))
+        .filter(n => NAME_RE.test(n))
+        .sort(),
+      error: null,
+    };
+  } catch (e) {
+    return { names: [], error: e.code || e.message };
+  }
+}
+
+// savedAccounts() の呼び出し元(retryable な余地が無い)はどこも、一覧が読めなければ
+// 「本当に 0 件なのか、読めていないだけなのか」を区別できず先へ進めない。listReplaced と違って
+// 部分的に進める余地が無いので、ここで一括して原因と対処を添えて止める。
+function savedAccountsOrFail() {
+  const { names, error } = savedAccounts();
+  if (error) {
+    fail('退避済みアカウントの一覧を読めません(' + error + ': ' + ACCOUNTS_DIR + ')'
+      + '\n  同じ名前のファイルが置かれていないか、ディレクトリの権限を確認してください');
+  }
+  return names;
 }
 
 function accountFile(name) {
@@ -524,16 +583,29 @@ function keepAside(file, base) {
 // 一覧そのものを読めなかった場合は 0 件と区別する。0 件として黙って表示すると、実際には
 // 控えが残っているのに「控えは無い」と読めてしまい、上書きの取り違えから戻す手立てを
 // 見落とさせる(status は状況確認の唯一の入り口なので、ここでの取り違えは重い)。
+// 「復元に使えない控え」に refreshToken だけの控えを混ぜていた頃は、cmdStatus がそれを
+// 「原因を調べ終えたら消して構いません」と案内していた。refreshToken は交換すればまた使える
+// ので、accessToken 欠け(hasUsableCredentials 基準で false)と、失って困るものが無い状態
+// (hasRecoverableToken 基準でも false)は同じではない。3 分類にして、真ん中(staleToken)は
+// 「消してよい」側には決して混ぜない。
 function replacedCounts() {
   const { files, error } = listReplaced();
-  if (error) return { overwritten: 0, unreadable: 0, error };
+  if (error) return { overwritten: 0, staleToken: 0, unreadable: 0, error };
   let overwritten = 0;
+  let staleToken = 0;
   let unreadable = 0;
   for (const f of files.filter(f => f.endsWith('.json'))) {
-    if (readCredsOrNull(path.join(REPLACED_DIR, f))) overwritten++;
+    const full = path.join(REPLACED_DIR, f);
+    if (readCredsOrNull(full)) { overwritten++; continue; }
+    // readCredsOrNull が null ということは hasUsableCredentials が false(か読めない)。
+    // refreshToken の有無まで見るには accessToken を問わない readCredentials を直接使う
+    // (readCreds は accessToken 必須なのでここでは使えない)。
+    let recoverable = false;
+    try { recoverable = hasRecoverableToken(readCredentials(full).json); } catch { /* 読めない・壊れている */ }
+    if (recoverable) staleToken++;
     else unreadable++;
   }
-  return { overwritten, unreadable, error: null };
+  return { overwritten, staleToken, unreadable, error: null };
 }
 
 // --- 来歴(.current) ---
@@ -565,6 +637,7 @@ function dropCurrentSlot(e) {
   try { fs.unlinkSync(CURRENT_FILE); } catch {}
   return '来歴を記録できませんでした(' + (e.code || e.message) + ': ' + CURRENT_FILE + ')'
     + '\n  このファイルを掴んでいるプロセスを終えるか、読み取り専用属性を外してください'
+    + dirIsFileHint(e, path.dirname(CURRENT_FILE))
     + '\n  以後の退避は `swap save <name>` と名前を明示してください'
     + '(省くと別のスロットを上書きすることがあります)';
 }
@@ -582,7 +655,7 @@ function currentSlotOf(cur) {
 // 見る必要があり、除外を足すと「複製が他にある」の証人を取りこぼして、pruneReplaced が
 // 消してはいけない唯一の控えを落としうる。
 function slotsHolding(token) {
-  return savedAccounts().filter(n => {
+  return savedAccountsOrFail().filter(n => {
     const c = readCredsOrNull(accountFile(n));
     return c && refreshTokenOf(c.json) === token;
   });
@@ -615,7 +688,7 @@ function staleSlots(cur, name, oldToken) {
   // (c の refreshToken は既に oldToken だと確定しているので、sameCreds が見ていたのは
   //  実質「現在のログインの refreshToken が oldToken か」だけだった)。
   if (refreshTokenOf(cur.json) === oldToken) return [];
-  return savedAccounts().filter(n => n !== name).filter(n => {
+  return savedAccountsOrFail().filter(n => n !== name).filter(n => {
     const c = readCredsOrNull(accountFile(n));
     return c && refreshTokenOf(c.json) === oldToken;
   }).sort();
@@ -709,6 +782,7 @@ function writeSlot(name, cur, old) {
     fail('退避先へ書き込めませんでした(' + (e.code || e.message) + ')'
       + '\n  ' + file + ' を書き換えられません。このファイルを掴んでいる別プロセス'
       + '(ウイルス対策・バックアップツールなど)を終了するか、読み取り専用属性を外してください'
+      + dirIsFileHint(e, path.dirname(file))
       + '\n  退避は完了していません。現在のログインはそのままです');
   }
 }
@@ -856,16 +930,60 @@ function reportOtherSlots(saved, returnCmd) {
 // キャッシュ。以前はここで accountFile(curSlot) を読み直し、さらに slotsHolding が
 // 全 accounts/*.json をもう一度読んでいた。cmdStatus 側の表示ループも同じファイル群を
 // 読むため、1 回の `swap`(status)実行で各スロットを複数回読むことになっていた。
+// 押し出された旧内容(.replaced)の refreshToken を集める。ベース名(スロット名や
+// UNREADABLE_BASE)を問わず全部見るのは、どの名前で退避したときに押し出されたかに関わらず、
+// 「その中身が実在した」という証明には使えるため。読めない控えは証明に使えないので飛ばす
+// (一覧そのものを読めなかった場合は何も返さない。判定材料が無ければ安全側に倒す考え方は
+// pruneReplaced と同じ)。
+function replacedTokens() {
+  const { files, error } = listReplaced();
+  if (error) return [];
+  const tokens = [];
+  for (const f of files.filter(x => x.endsWith('.json'))) {
+    try {
+      const t = refreshTokenOf(readCredentials(path.join(REPLACED_DIR, f)).json);
+      if (t) tokens.push(t);
+    } catch {
+      // 読めない・壊れている控えは判定に使えない
+    }
+  }
+  return tokens;
+}
+
 function outdatedSlots(cur, curSlot, savedCreds) {
-  if (!cur || !curSlot) return new Set();
-  const c = savedCreds.get(curSlot);
-  if (!c || sameCreds(cur.json, c.json)) return new Set();
-  const token = refreshTokenOf(c.json);
-  if (!token) return new Set([curSlot]);
-  const holding = [...savedCreds.entries()]
-    .filter(([n, cc]) => n !== curSlot && cc && refreshTokenOf(cc.json) === token)
-    .map(([n]) => n);
-  return new Set([curSlot, ...holding]);
+  if (!cur) return new Set();
+  const result = new Set();
+
+  if (curSlot) {
+    const c = savedCreds.get(curSlot);
+    if (c && !sameCreds(cur.json, c.json)) {
+      result.add(curSlot);
+      const token = refreshTokenOf(c.json);
+      if (token) {
+        for (const [n, cc] of savedCreds) {
+          if (n !== curSlot && cc && refreshTokenOf(cc.json) === token) result.add(n);
+        }
+      }
+    }
+  }
+
+  // 上のブロックは「来歴が指すスロットの内容が現在と違う」ことを起点にするので、一致していれば
+  // (=今のスロット名でも同じアカウントを持っている)何も追加しない。しかし同じアカウントを
+  // 別名でも退避していた場合、押し出された旧トークンを持つ側にはこれだけでは印が付かない
+  // (README が「swap の一覧にも印が残る」と書く信号のうち、このケースだけ実装から抜けていた)。
+  // .replaced にある控えの refreshToken と一致するスロットは「押し出された内容そのものを
+  // 持っている」ことが証明できるので、上のコメントが警戒する「別アカウントの新鮮な退避を誤って
+  // 古いと決めつける」問題は起きない。現在のログインと同じ refreshToken を持つスロットだけは
+  // 当然 stale ではないので除外する。
+  const curToken = refreshTokenOf(cur.json);
+  for (const token of replacedTokens()) {
+    if (curToken && token === curToken) continue;
+    for (const [n, cc] of savedCreds) {
+      if (cc && refreshTokenOf(cc.json) === token) result.add(n);
+    }
+  }
+
+  return result;
 }
 
 function cmdStatus() {
@@ -891,7 +1009,7 @@ function cmdStatus() {
       + ' ですが、現在の内容を読めないため一致は確認できません)');
   }
 
-  const saved = savedAccounts();
+  const saved = savedAccountsOrFail();
   // 各スロットの中身はここで 1 回だけ読み、outdatedSlots の判定と下の表示ループの両方で
   // 使い回す(前は判定と表示で別々に全スロットを読んでいた)。
   const savedCreds = new Map(saved.map(n => [n, readCredsOrNull(accountFile(n))]));
@@ -948,6 +1066,15 @@ function cmdStatus() {
     console.log('\n上書きで退けた旧内容: ' + replaced.overwritten + ' 件 (' + REPLACED_DIR + ')');
     console.log('  取り違えて上書きしたときは、ここから accounts/<name>.json へ戻せます');
   }
+  if (replaced.staleToken > 0) {
+    // accessToken が無いので accounts/<name>.json へ戻してもそのままでは復元できないが、
+    // refreshToken は交換すればまた使える。「復元に使えない控え」に混ぜて「消して構いません」
+    // と案内すると、救えたはずの資格情報をその案内どおり消させることになる。
+    console.log('\n復元には使えないが refreshToken が残っている控え: ' + replaced.staleToken
+      + ' 件 (' + REPLACED_DIR + ')');
+    console.log('  accessToken が無いため accounts/<name>.json へ戻してもそのままでは復元できませんが、'
+      + 'refreshToken は交換すればまた使えます。消さないでください');
+  }
   if (replaced.unreadable > 0) {
     // 復元先には使えない中身なので、上と同じ「戻せます」の案内に混ぜない。
     // 読めなかった現在の credentials だけでなく、退けた時点で既に壊れていた旧内容も
@@ -991,7 +1118,13 @@ function cmdSave(name, force) {
         ? '\n  時間をおいて `swap save` をやり直してください'
           + '\n  /login はまだ試さないでください(中身が健全なまま読めないだけのことが多く、'
           + 'やり直すと未退避のアカウントには戻れなくなります)'
-        : '\n  控えの中身を確認したうえで、`/login` してから `swap save` をやり直してください'));
+        : why.staleRefreshToken
+          // refreshToken は交換すればまた使えるので /login では上書きさせない
+          // (account-guard.js の 'stale' 案内・credentialsState() と同じ判断)。
+          ? '\n  refreshToken は残っています(交換すればまた使えます)。/login すると、まだ'
+            + '退避していないアカウントはその時点で失われるため、いま試さないでください'
+            + '\n  退避済みの別アカウントへ切り替えるなら: swap <name> --force'
+          : '\n  控えの中身を確認したうえで、`/login` してから `swap save` をやり直してください'));
   }
   console.log('退避しました: ' + saved.name + ' -> ' + accountFile(saved.name));
   reportOtherSlots(saved, null);
@@ -1006,7 +1139,7 @@ function cmdSwap(target, force) {
 
   const file = accountFile(target);
   if (!fs.existsSync(file)) {
-    const saved = savedAccounts();
+    const saved = savedAccountsOrFail();
     if (saved.length > 0) {
       fail('退避されていません: ' + target
         + '\n  利用可能: ' + saved.join(', ')
@@ -1029,13 +1162,29 @@ function cmdSwap(target, force) {
     // ときにも同じ案内を出しており、そのとおり打つと、まだ退避していない現在のアカウントの
     // refreshToken が /login で消えていた(現在の credentials 側では既に避けている経路)。
     const why = unreadableReason(file);
+    // retryable false のときだけ、この先で /login を案内する。案内どおり打つと、いま
+    // ログイン中の credentials は問答無用で上書きされる。それがまだどのスロットにも
+    // 退避されていなければ、「このツールで最も高い代償を払う失敗」(冒頭コメント参照)を
+    // そのまま踏ませることになる。/login より先に、必ず現在の状態を確認してから案内する
+    // (判定は slotsHolding に揃える。同じ判定を書き起こすと基準がずれる)。
+    let saveFirst = '';
+    if (!why.retryable) {
+      const curForMsg = readCredsOrNull(CREDENTIALS);
+      const curToken = curForMsg ? refreshTokenOf(curForMsg.json) : null;
+      const curSaved = !!(curToken && slotsHolding(curToken).length > 0);
+      if (curForMsg && !curSaved) {
+        saveFirst = '\n  先に `swap save ' + (currentSlotOf(curForMsg) || '<name>')
+          + '` でいまログイン中のアカウントを退避してから、次へ進んでください';
+      }
+    }
     fail(target + ' を復元できません(' + why.label + ')。上書きを中止しました'
       + '\n  ファイル: ' + file
       + (why.retryable
         ? '\n  時間をおいて同じコマンドをやり直してください'
           + '\n  /login はまだ試さないでください(中身が健全なまま読めないだけのことが多く、'
           + 'やり直すと未退避のアカウントには戻れなくなります)'
-        : '\n  そのアカウントで `/login` し直してから `swap save ' + target + ' --force` で入れ直してください')
+        : saveFirst
+          + '\n  そのアカウントで `/login` し直してから `swap save ' + target + ' --force` で入れ直してください')
       + '\n  上書きで失われた旧内容の控えが残っていれば ' + REPLACED_DIR + ' から戻せることがあります');
   }
 
@@ -1287,6 +1436,7 @@ function cmdSwap(target, force) {
     fail('認証情報の差し替えに失敗しました(' + (e.code || e.message) + ')'
       + '\n  ' + CREDENTIALS + ' を書き換えられません。稼働中の Claude Code など、このファイルを'
       + '掴んでいるプロセスを終了するか、読み取り専用属性を外してください'
+      + dirIsFileHint(e, path.dirname(CREDENTIALS))
       + '\n  認証は切り替わっていません'
       + (saved && saved.name
         ? '(現在のログインは ' + saved.name + ' へ退避済みで、失われたものはありません)'
