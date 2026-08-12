@@ -331,16 +331,31 @@ function accountFile(name) {
 
 // --- 退けた旧内容(.replaced) ---
 
+// .replaced の一覧。読めなかったときに取るべき態度は呼び出し元ごとに違う(控えを作る側は
+// 進めない、消す側は消さない、数える側は「数えられない」と伝える)ので、判断はここではせず
+// error を添えて返す。生の readdirSync を各所で呼んでいた頃は、.replaced が手違いでファイルと
+// して置かれている環境で status が出力の途中から `ENOTDIR` の生の例外に落ち、その直前に
+// 自分で案内した対処コマンドも同じ形で死ぬ、という行き止まりになっていた。
+function listReplaced() {
+  if (!fs.existsSync(REPLACED_DIR)) return { files: [], error: null };
+  try {
+    return { files: fs.readdirSync(REPLACED_DIR), error: null };
+  } catch (e) {
+    return { files: [], error: e.code || e.message };
+  }
+}
+
 function replacedEntries(base) {
-  if (!fs.existsSync(REPLACED_DIR)) return [];
+  const { files, error } = listReplaced();
   // base はスロット名(NAME_RE 済み)か UNREADABLE_BASE。後者は先頭に `.` を持つので、
   // 素通しにすると正規表現の任意 1 文字として効いて別のベースの控えまで拾う。
   const re = new RegExp('^' + base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '-(\\d+)\\.json$');
-  return fs.readdirSync(REPLACED_DIR)
+  const list = files
     .map(f => ({ f, m: re.exec(f) }))
     .filter(x => x.m)
     .map(x => ({ file: path.join(REPLACED_DIR, x.f), n: Number(x.m[1]) }))
     .sort((a, b) => a.n - b.n);
+  return { list, error };
 }
 
 // その資格情報が他にも残っているか。スロット・他の控え・現在のログインをすべて見る。
@@ -350,8 +365,9 @@ function hasCopyElsewhere(token, selfFile) {
   if (slotsHolding(token).length > 0) return true;
   const cur = readCredsOrNull(CREDENTIALS);
   if (cur && refreshTokenOf(cur.json) === token) return true;
-  if (!fs.existsSync(REPLACED_DIR)) return false;
-  return fs.readdirSync(REPLACED_DIR)
+  // .replaced を読めなければ「他にもある」と証明できないので、複製は無い側に倒す
+  // (偽を返すぶんには控えが 1 本残るだけで、消してよいものを消さない安全側に外れる)。
+  return listReplaced().files
     .filter(f => f.endsWith('.json'))
     .map(f => path.join(REPLACED_DIR, f))
     .some(f => {
@@ -388,7 +404,11 @@ function pruneReplaced(base, protect) {
   // 中身は最初に 1 度だけ読む。控えの内容はこのループの中では変わらない(変えるのは
   // unlink だけで、消したものは candidates からも外す)ので、反復ごとに読み直すのは
   // 同じ結果を得るためだけのディスク I/O になる。控えが増えるほど二乗で効いてくる。
-  const candidates = replacedEntries(base)
+  const { list, error } = replacedEntries(base);
+  // 一覧を読めなければ、何本あるのかも、どれが唯一の 1 本なのかも分からない。数を守るために
+  // 消す判断は「消してよいと証明できる」ことが前提なので、証明の材料が無い以上は何もしない。
+  if (error) return;
+  const candidates = list
     .filter(e => e.file !== protect)
     .map(e => ({ ...e, creds: readCredsOrNull(e.file) }));
   let excess = candidates.length + 1 - REPLACED_KEEP; // +1 は protect の分
@@ -416,8 +436,24 @@ function pruneReplaced(base, protect) {
 // 元のファイルが手つかずで残るようにするため。控えが取れなければ上書きへは進まない
 // (切り替えられないのは後から取り返せるが、消えた資格情報は取り返せない)。
 function keepAside(file, base) {
-  fs.mkdirSync(REPLACED_DIR, { recursive: true });
-  const list = replacedEntries(base);
+  // 置き場所を作れない・読めないのも「控えを取れなかった」の一種なので、copyFileSync と
+  // 同じように理由と対処を添えて止める。素通しにしていた頃は、.replaced が手違いでファイルと
+  // して置かれている環境で `EEXIST: file already exists, mkdir ...` という生の Node 例外だけが
+  // 出て、上書きが起きたのかどうかも、どう直せばよいのかも伝わらなかった。
+  const replacedFail = (what, e) => fail(
+    '上書きで失われる内容の控えを' + what + '(' + (e.code || e.message) + ')'
+    + '\n  ' + REPLACED_DIR + ' を扱えません。同じ名前のファイルが置かれていないか、'
+    + 'ディレクトリの権限を確認してください'
+    + '\n  控えを残せない以上、上書きは行っていません(元のファイルは手つかずです)');
+  try {
+    fs.mkdirSync(REPLACED_DIR, { recursive: true });
+  } catch (e) {
+    replacedFail('置く場所を作れませんでした', e);
+  }
+  // 一覧を読めないまま番号を決めると、既にある控えと同じ名前を選んで上書きしかねない
+  // (控えを残すための処理そのものが別の控えを消す)。読めなければ進まない。
+  const { list, error } = replacedEntries(base);
+  if (error) replacedFail('数えられませんでした', { code: error });
   const n = list.length ? list[list.length - 1].n + 1 : 1;
   const dest = path.join(REPLACED_DIR, base + '-' + n + '.json');
   try {
@@ -457,16 +493,19 @@ function keepAside(file, base) {
 // つもりで付ける名前だが、readCredsOrNull が書き込み途中を掴んで失敗した直後に copyFileSync
 // が書き終わったファイルをコピーすると、中身は有効なまま残る。名前で unreadable に数えると、
 // 未退避アカウントの唯一の控えを「復元に使えない・消して構わない」と案内することになる。
+// 一覧そのものを読めなかった場合は 0 件と区別する。0 件として黙って表示すると、実際には
+// 控えが残っているのに「控えは無い」と読めてしまい、上書きの取り違えから戻す手立てを
+// 見落とさせる(status は状況確認の唯一の入り口なので、ここでの取り違えは重い)。
 function replacedCounts() {
-  if (!fs.existsSync(REPLACED_DIR)) return { overwritten: 0, unreadable: 0 };
-  const files = fs.readdirSync(REPLACED_DIR).filter(f => f.endsWith('.json'));
+  const { files, error } = listReplaced();
+  if (error) return { overwritten: 0, unreadable: 0, error };
   let overwritten = 0;
   let unreadable = 0;
-  for (const f of files) {
+  for (const f of files.filter(f => f.endsWith('.json'))) {
     if (readCredsOrNull(path.join(REPLACED_DIR, f))) overwritten++;
     else unreadable++;
   }
-  return { overwritten, unreadable };
+  return { overwritten, unreadable, error: null };
 }
 
 // --- 来歴(.current) ---
@@ -715,6 +754,11 @@ function saveCurrent(explicitName, force, forceCmd, pre, afterCmd) {
       + '\n  `swap save <name>` で名前を明示してください。以後その名前が来歴として記録され、'
       + '名前を省略しても退避できるようになります');
   }
+  // 明示された名前は呼び出し元(cmdSave)が既に検証しているが、省略されたときの名前は
+  // 来歴か subscriptionType から決まるので、そこを通っていない。検証を 1 箇所に集める以上、
+  // 名前が確定したここでも通す(subscriptionType が将来 `save` や `warmup` になれば、
+  // 復元する手段の無いスロットがこの経路から静かに作られる)。二重に呼んでも副作用はない。
+  validateName(name);
   const { stale, drifted } = saveInto(cur, name, force.overwrite, afterCmd);
   return { name, stale, drifted };
 }
@@ -864,6 +908,14 @@ function cmdStatus() {
       + '名前です。実装された時点で復元できなくなるので、いまのうちに改名してください');
   }
   const replaced = replacedCounts();
+  if (replaced.error) {
+    // 数えられないことを黙って 0 件として出すと、控えが残っているのに「無い」と読める。
+    // status を最後まで出しきったうえで、直し方まで添える(ここで例外にすると、この下の
+    // 表示だけでなく、直前に出した対処コマンドの根拠まで画面から消える)。
+    console.log('\n退けた旧内容の控えを数えられません(' + replaced.error + ': ' + REPLACED_DIR + ')');
+    console.log('  同じ名前のファイルが置かれていないか、ディレクトリの権限を確認してください。'
+      + 'この状態では、上書きが起きる操作(退避・切り替え)は控えを残せないため中止されます');
+  }
   if (replaced.overwritten > 0) {
     console.log('\n上書きで退けた旧内容: ' + replaced.overwritten + ' 件 (' + REPLACED_DIR + ')');
     console.log('  取り違えて上書きしたときは、ここから accounts/<name>.json へ戻せます');

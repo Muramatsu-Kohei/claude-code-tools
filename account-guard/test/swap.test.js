@@ -1704,4 +1704,40 @@ console.log('swap');
   check('切り替え後の内容は復元先のもの', typeOf(credPath(home)) === 'team', f.out + f.err);
 }
 
+{
+  // .replaced を扱えない環境(手違いで同名のファイルが置かれている、権限が無い)。控えの
+  // 置き場所を作る mkdirSync と一覧の readdirSync は keepAside の try の外にあったため、
+  // 生の `EEXIST: file already exists, mkdir ...` / `ENOTDIR: not a directory, scandir ...`
+  // だけが出て、何が中止されたのかも直し方も伝わらない行き止まりになっていた。
+  // ファイルを置いて再現する(実機では権限や ACL でも同じことが起きる)。
+  const home = sandbox('replaced-dir-unusable', {
+    current: creds('pro', { token: 'now' }),
+    accounts: { pro: creds('pro', { token: 'older' }) },
+  });
+  fs.writeFileSync(replacedDir(home), 'not a directory', 'utf8');
+  const r = runSwap(home, ['save', 'pro', '--force']);
+  check('控えを置けない環境では上書きへ進まない', r.code !== 0, r.out + r.err);
+  check('控えを置けない理由を添える', /控えを/.test(r.err) && /EEXIST|ENOTDIR|EACCES|EPERM/.test(r.err),
+    r.out + r.err);
+  check('元のファイルが手つかずだと伝える', /元のファイルは手つかずです/.test(r.err), r.out + r.err);
+  check('スロットは実際に上書きされていない', tokenOf(acctPath(home, 'pro')) === 'older',
+    r.out + r.err);
+  const s = runSwap(home, []);
+  check('status は途中で死なずに最後まで出す', /退避済み|accounts/.test(s.out) && s.code === 0,
+    s.out + s.err);
+  check('status は控えを数えられないことを伝える',
+    /控えを数えられません/.test(s.out), s.out + s.err);
+}
+
+{
+  // 名前を省いた退避は、来歴か subscriptionType から名前が決まる。この経路は validateName を
+  // 通っていなかったため、subscriptionType が予約語(サブコマンドと同じ名前)になると、
+  // `swap <name>` では復元できないスロットが静かに作られる。名前が確定したところで検証する。
+  const home = sandbox('implicit-name-reserved', { current: creds('save', { token: 'now' }) });
+  const r = runSwap(home, ['save']);
+  check('暗黙の退避名でも予約語なら中止する', r.code !== 0, r.out + r.err);
+  check('予約語だと分かる理由を出す', /サブコマンドと同じ/.test(r.err), r.out + r.err);
+  check('復元できないスロットを作らない', !fs.existsSync(acctPath(home, 'save')), r.out + r.err);
+}
+
 report();
