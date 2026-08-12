@@ -855,27 +855,27 @@ console.log('swap');
 }
 {
   // 読めない理由が権限やシステムエラーなら「時間をおいて再実行」は永久に効かない。
-  // 待てば直る話だと言い切ると、原因が権限だと気づけないまま繰り返させることになる。
-  // ディレクトリを置いて EISDIR を作り、err.code が案内に出ることを見る。
+  // 待てば直る話だと言い切ると、原因に気づけないまま繰り返させることになる。
+  // ディレクトリを置いて EISDIR を作り、err.code と原因に応じた対処が案内に出ることを見る。
   const home = sandbox('status-unreadable', {});
   fs.mkdirSync(credPath(home), { recursive: true });
   const r = runSwap(home, []);
   check('status は読めない理由に err.code を添える', /EISDIR/.test(r.out), r.out + r.err);
-  check('権限で読めない場合は権限の確認を案内する', /権限/.test(r.out), r.out);
+  check('読めない理由に応じた対処を案内する', /ディレクトリ/.test(r.out), r.out);
 }
 {
-  // 読み取り自体に失敗した場合(権限・他プロセスのロック・EBUSY)は、中身が健全なまま
-  // ファイルに手が届いていないだけのことがある。account-guard.js の credentialsState() も
-  // 同じ状況を「中身の価値は判断できない」側に分類し、掴んでいるプロセスを終えてからの
-  // 再実行を案内している。swap だけ「待っても直らない」と扱うと 2 ツールで対処が食い違い、
-  // /login へ誘導して未退避アカウントの refreshToken を捨てさせる。ここでも待てば直りうる側の
-  // 案内になることを見る(EISDIR はディレクトリを置いて作る)。
+  // 読み取り自体に失敗した場合でも、原因によって「待てば直るか」は違う。EBUSY や EACCES は
+  // 中身が健全なままファイルに手が届いていないだけのことがあるが、EISDIR(同じ名前の
+  // ディレクトリが置かれている)は待っても永久に直らない。ここを一律 retryable に倒していた
+  // 頃は、この状態で「時間をおいてやり直してください」だけが出て、案内どおり打ち続けても
+  // 一歩も進まなかった。原因に応じた対処と、先へ進む手段が出ることを見る
+  // (待てば直る側の案内は別ブロック「待てば直る壊れ方では時間をおいて〜」で見ている)。
   const home = sandbox('swap-unreadable-retryable', { accounts: { team: creds('team') } });
   fs.mkdirSync(credPath(home), { recursive: true });
   const r = runSwap(home, ['team']);
-  check('読み取りに失敗した場合は時間をおいての再実行を案内する',
-    /時間をおいて/.test(r.err), r.out + r.err);
-  check('読み取りに失敗した場合は待つ以外の対処も添える', /権限/.test(r.err), r.out + r.err);
+  check('待っても直らない読み取り失敗では再実行を案内しない',
+    !/時間をおいて/.test(r.err), r.out + r.err);
+  check('読み取りに失敗した理由に応じた対処を添える', /ディレクトリ/.test(r.err), r.out + r.err);
   check('読み取りに失敗した場合も先へ進む手段は示す', /--force/.test(r.err), r.err);
 }
 {
@@ -958,6 +958,26 @@ console.log('swap');
   check('refreshToken だけの控えは「復元に使えない控え」に数えない',
     !/^復元に使えない控え/m.test(r.out), r.out + r.err);
   check('refreshToken だけの控えは別項目で件数を出す',
+    /refreshToken が残っている控え: 1 件/.test(r.out), r.out + r.err);
+  check('消さないでほしいことを明示する', /消さないでください/.test(r.out), r.out + r.err);
+}
+{
+  // 上のテストは JSON として読める(accessToken だけ欠ける)場合の hasRecoverableToken 経路を
+  // 見ている。replacedCounts() には JSON.parse そのものが失敗する別経路(swap.js:682-693)があり、
+  // 書き込みの途中で切り詰められた控えはこちらを通る。JSON としては壊れているが、切れた位置
+  // より手前に refreshToken の文字列は残っている。ここを一律 unreadable に数えていた頃は、
+  // cmdStatus が「原因を調べ終えたら消して構いません」と案内し、案内どおり消すと未退避
+  // アカウントの唯一のコピーを失っていた。
+  const home = sandbox('replaced-counts-truncated-token', { current: creds('pro') });
+  fs.mkdirSync(replacedDir(home), { recursive: true });
+  fs.writeFileSync(path.join(replacedDir(home), '.unreadable-current-1.json'),
+    '{"claudeAiOauth":{"accessToken":"AT-A","refreshToken":"RT-ONLY-COPY"', 'utf8');
+  const r = runSwap(home, []);
+  check('JSON 構文エラーで読めなくても refreshToken が残る控えは「復元に使えない控え」に数えない',
+    !/^復元に使えない控え/m.test(r.out), r.out + r.err);
+  check('「上書きで退けた旧内容」にも数えない(JSON としては読めていない)',
+    !/上書きで退けた旧内容/.test(r.out), r.out + r.err);
+  check('refreshToken が残っている控えとして別項目で件数を出す',
     /refreshToken が残っている控え: 1 件/.test(r.out), r.out + r.err);
   check('消さないでほしいことを明示する', /消さないでください/.test(r.out), r.out + r.err);
 }
@@ -1861,8 +1881,12 @@ console.log('swap');
   check('読めない復元先では上書きしない', r.code !== 0, r.out + r.err);
   check('読み取り失敗を「壊れている」と断定しない', !/壊れているか/.test(r.err), r.out + r.err);
   check('読めない理由を添える', /EISDIR/.test(r.err), r.out + r.err);
-  check('読めないだけの復元先で /login を勧めない',
-    !/`\/login` し直して/.test(r.err), r.out + r.err);
+  // EISDIR は待っても直らないので、抜ける手順(/login し直して入れ直す)は案内してよい。
+  // ただし現在の pro/now はまだどこにも退避されていないため、/login より先に必ず退避を
+  // 案内する。順序が逆になると、案内どおり打った時点で現在のアカウントが永久に失われる。
+  check('/login より先に現在のログインの退避を案内する',
+    r.err.indexOf('swap save pro') >= 0
+    && r.err.indexOf('swap save pro') < r.err.indexOf('`/login` し直して'), r.out + r.err);
   check('現在のログインはそのまま', tokenOf(credPath(home)) === 'now', r.out + r.err);
 }
 
@@ -1977,10 +2001,14 @@ console.log('swap');
   });
   const r = runSwap(home, ['team']);
   check('復元先が壊れていて上書きを中止する', r.code !== 0, r.out + r.err);
-  check('stale な現在の credentials でも先に swap save を案内する',
-    /先に `swap save pro`/.test(r.err), r.err);
-  check('swap save の案内が /login より前に出る',
-    r.err.indexOf('swap save pro') < r.err.indexOf('`/login` し直して'), r.err);
+  // accessToken を欠く現在の credentials はスロットへは退避できない(読めない中身を入れると
+  // そこにある有効な退避を潰す)。案内できるのは「控えだけ残す」ところまでなので、素の
+  // `swap save pro` ではなく、名前を伴わない `swap save --force` を出す。ここで名前入りの
+  // コマンドや `<name>` を案内していた頃は、そのとおり打っても退避できず行き止まりになった。
+  check('stale な現在の credentials でも先に控えを残す手を案内する',
+    /先に `swap save --force`/.test(r.err), r.err);
+  check('控えを残す案内が /login より前に出る',
+    r.err.indexOf('swap save --force') < r.err.indexOf('`/login` し直して'), r.err);
 }
 
 // --- 修正C: cmdSwap の degraded 表示が staleRefreshToken を見ていなかった ---
@@ -2077,6 +2105,36 @@ console.log('swap');
   check('中身が変われば控えを増やす',
     replacedFiles(home, '.unreadable-current').length === 2,
     replacedFiles(home, '.unreadable-current').join(', '));
+}
+
+// --- スロット名の大小を無視するファイルシステムでの同一視 ---
+// canonicalSlotName(swap.js:719)の回帰。大小を無視するファイルシステム(Windows/macOS の
+// 既定)では accounts/pro.json と accounts/Pro.json が同じファイルを指すが、target の比較は
+// 文字列そのもので行われる。cmdSwap が canonicalSlotName を通さずに target を使っていた頃は、
+// `swap pro --force` は「退避先が復元元と同じ」ガード(swap.js:1540)で正しく中止されるのに、
+// `swap Pro --force` だとファイルは同じものが開かれるのに文字列だけが食い違ってガードが
+// 1 つも発火せず、退避で新しい内容を書いた直後、読み込み済みの古い内容を credentials へ
+// 書き戻していた(マシン全体の認証がローテート前に巻き戻る。実機で再現済み)。
+// 区別する FS ではこの食い違いがそもそも起きない(`swap Pro --force` は accounts/Pro.json が
+// 無いので「退避されていません」で止まるだけ)ので、まず実測して分岐する。
+{
+  const probeDir = path.join(BASE, '.case-probe');
+  fs.mkdirSync(probeDir, { recursive: true });
+  fs.writeFileSync(path.join(probeDir, 'probe.tmp'), 'x', 'utf8');
+  const isCaseInsensitiveFs = fs.existsSync(path.join(probeDir, 'PROBE.tmp'));
+  if (isCaseInsensitiveFs) {
+    const home = sandbox('canonical-slot-name-case', {
+      current: creds('pro', { token: 'pro-new' }),
+      accounts: { pro: creds('pro', { token: 'pro-old' }) },
+      slot: 'pro',
+    });
+    const r = runSwap(home, ['Pro', '--force']);
+    check('大文字始まりでも同一視ガードで中止する(大小無視 FS)', r.code !== 0, r.out + r.err);
+    check('中止したので credentials は古いトークンへ巻き戻らない',
+      tokenOf(credPath(home)) === 'pro-new', tokenOf(credPath(home)));
+  }
+  // else: このマシンのファイルシステムが大小を区別する場合、上のガードはそもそも試せない
+  // (target='Pro' は accounts/pro.json に一致しないため)。check() を出さずに抜ける。
 }
 
 report();

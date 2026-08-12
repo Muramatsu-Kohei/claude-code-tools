@@ -468,12 +468,18 @@ function credentialsState() {
   try {
     json = credentials.readCredentials(credentials.CREDENTIALS).json;
   } catch (e) {
-    // JSON として壊れている(0 バイト含む)のは「読めたが使えない」側。中身を実際に見た
-    // うえでの判定なので、失って困るものが無いと言い切れる。ファイルに手が届かない
-    // (権限・他プロセスのロック・EBUSY)のは意味が違い、中身が健全なまま読めないだけの
-    // ことがある。そこまで「失われる認証情報はない」と断言すると、まだ退避していない
+    // ファイルに手が届かない(権限・他プロセスのロック・EBUSY)のは、中身が健全なまま
+    // 読めないだけのことがある。「失われる認証情報はない」と断言すると、まだ退避していない
     // アカウントに /login させて refreshToken を消す。
-    return e instanceof SyntaxError ? 'unusable' : 'unreadable';
+    if (!(e instanceof SyntaxError)) return 'unreadable';
+    // JSON として壊れているだけを根拠に unusable(失って困るものは無い)へ倒してはいけない。
+    // Claude Code がこのファイルを書き換えている最中に読むと、切り詰められた中身が
+    // JSON.parse に失敗する一方、切れた位置より手前には refreshToken がそのまま残っている。
+    // そこで /login を勧めると、未退避アカウントの唯一のコピーを上書きさせることになる
+    // (swap.js の unreadableReason は同じ状況を「/login はまだ試さないでください」と案内
+    //  しており、生きた credentials を見るガード側だけが逆を言っていた)。
+    // 判定は credentials.js の rawHasRecoverableToken に合流させ、ここでは書き起こさない。
+    return credentials.rawHasRecoverableToken(e.raw) ? 'stale' : 'unusable';
   }
   try {
     if (credentials.hasUsableCredentials(json)) return 'usable';
@@ -608,7 +614,10 @@ function denyMessage(hit, account) {
   // どちらの手にも --force が要る(付けずに案内すると必ず中止される)。
   if (state === 'stale') {
     return head.concat([
-      '認証情報のファイルは読めますが、復元に使える中身ではありません(accessToken がありません)。',
+      // 「読めますが」と断定しない。この分岐には、accessToken だけが欠けた健全な JSON と、
+      // 書き込みの途中で切り詰められて JSON としては壊れている中身の両方が来る(後者を
+      // unusable に落として /login を勧めていたのが、資格情報を失う経路だった)。
+      '認証情報のファイルはありますが、復元に使える中身として読み取れませんでした。',
       'ただし refreshToken は残っています。これは交換すればまた使えるため、先に `/login` すると、',
       'まだ退避していないアカウントはその時点で失われます(復旧はブラウザ OAuth のやり直しです)。',
       '',
@@ -664,6 +673,15 @@ function denyMessage(hit, account) {
     '  swap save <name>   … 現在のアカウントを先に退避する(まだ退避していない場合)',
     '  swap <name>        … 退避済みの別アカウントへ切り替える',
     '先に `/login` すると、まだ退避していないアカウントの認証情報はその時点で消えます。',
+    // 切り替え先をまだ一度も退避していないと、上の 2 手だけでは `swap <name>` が
+    // 「退避されていません」で止まり、そこから先へ進む道が文面のどこにも無くなる
+    // (直前で /login を否定しているため、案内だけを頼りに動くと堂々巡りになる)。
+    // /login 自体は禁止ではなく「退避より先に打つと失う」という順序の問題なので、
+    // 安全な順序(退避 → /login → 退避)を README の初回手順どおりに書いておく。
+    '切り替え先のアカウントをまだ一度も退避していない場合は、この順で進めてください。',
+    '  1. swap save <name>      … いまのアカウントを退避する(ここまで済めば失うものはありません)',
+    '  2. /login                … 切り替え先のアカウントでログインし直す',
+    '  3. swap save <別名>      … 切り替え先も退避する(以後は swap <name> だけで往復できます)',
     ...swapCwdNote(hit),
     ...SWAP_MISSING_NOTE,
     '回避しようとせず、ユーザーにアカウントの切り替えが必要であることを伝えてください。',

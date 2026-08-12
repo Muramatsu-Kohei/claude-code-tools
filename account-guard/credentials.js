@@ -44,7 +44,15 @@ const ACCOUNT_UNKNOWN = 'unknown';
 // そのまま書き戻すため(フィールド順や表記の揺れを持ち込まない)。
 function readCredentials(file) {
   const raw = fs.readFileSync(file, 'utf8');
-  return { raw, json: JSON.parse(raw) };
+  try {
+    return { raw, json: JSON.parse(raw) };
+  } catch (e) {
+    // パースに失敗しても、読めたバイト列そのものは呼び出し側の判断材料になる(切り詰められた
+    // credentials には refreshToken が残っていることがある)。ここで捨てると、呼び出し側は
+    // 同じファイルを読み直すしかなく、その隙に書き換われば判定と実体がずれる。
+    e.raw = raw;
+    throw e;
+  }
 }
 
 // 「復元に使える中身か」の判定。JSON として読めることと、認証に使えることは別で、
@@ -64,6 +72,19 @@ function hasUsableCredentials(json) {
 function hasRecoverableToken(json) {
   const o = json && json.claudeAiOauth;
   return Boolean(o && (o.accessToken || o.refreshToken));
+}
+
+// JSON として読めないバイト列に、失って困る資格情報が残っているか。書き込みの途中で
+// 切り詰められた credentials は JSON.parse に失敗するが、切れた位置より手前のバイト列には
+// refreshToken がそのまま残っていることがある。パースできないことを根拠に「失って困るものは
+// 無い」と断言すると、まだ退避していないアカウントの唯一のコピーを、/login の案内や
+// 「この控えは消して構いません」の案内で捨てさせることになる(ガード側・status 側の
+// 両方で実際にそうなっていた)。パースを通らない中身について言えるのは「トークンらしき
+// 文字列が残っているか」までなので、判定もそこまでにとどめ、残っていれば消させない側に倒す。
+// 値の 1 文字目まで見るのは、`"refreshToken":"` で切れた残骸だけを根拠に残さないため。
+const RAW_TOKEN_RE = /"(?:refreshToken|accessToken)"\s*:\s*"[^"]/;
+function rawHasRecoverableToken(raw) {
+  return RAW_TOKEN_RE.test(typeof raw === 'string' ? raw : String(raw));
 }
 
 // credentials に uuid やメールアドレスのような identity フィールドは存在しないため、
@@ -90,6 +111,7 @@ module.exports = {
   readCredentials,
   hasUsableCredentials,
   hasRecoverableToken,
+  rawHasRecoverableToken,
   subscriptionTypeOf,
   currentAccount,
 };

@@ -1140,4 +1140,51 @@ console.log('account-guard');
     /swap save <name> --force/.test(reason) && reason.includes('swap <name> --force'), reason);
 }
 
+// credentialsState() の SyntaxError 分岐(account-guard.js:474-482)。上の creds-refresh-only は
+// JSON として読める(accessToken だけ欠ける)場合の hasRecoverableToken 経路を、creds-empty は
+// raw='' で rawHasRecoverableToken も false になる unusable 側を見ており、どちらも
+// 「JSON.parse が例外を投げ、かつ切れた位置より手前に refreshToken の文字列が残っている」
+// 組み合わせは通らない。書き込みの途中で切り詰められた credentials がまさにこの形で、
+// 以前はここを無条件に unusable(失うものは無い)へ倒し、「失われる認証情報はない」と
+// 断言して /login を勧めていた。
+{
+  const home = sandbox('creds-truncated-syntax-error', {
+    rules: ORG,
+    raw: '{"claudeAiOauth":{"accessToken":"AT-A","refreshToken":"RT-ONLY-COPY"',
+  });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:\\org-tree\\proj',
+    tool_name: 'Read', tool_input: { file_path: 'src/main.py' },
+  });
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('JSON 構文エラーで読めなくても保護ツリーは拒否する', decision(res) === 'deny', JSON.stringify(res));
+  check('JSON 構文エラーを理由に「失われる認証情報はない」と断言しない',
+    !/失われる認証情報はない/.test(reason), reason);
+  check('未ログイン側の文言(消える退避はありません)も流用しない',
+    !/消える退避はありません/.test(reason), reason);
+  check('refreshToken が残っていることを理由として示す', /refreshToken/.test(reason), reason);
+  check('先に /login すると失われることを伝える', /`\/login` すると/.test(reason), reason);
+}
+
+// denyMessage の通常経路(account-guard.js:663-688、credentials は健全な usable)。まだ一度も
+// swap で退避していない切り替え先へ向かう最初の1回。以前はこの経路に /login が一切出ず、
+// 「swap save <name> → swap <name>」の2手だけを案内していた。切り替え先を一度も退避して
+// いなければ `swap <name>` は「退避されていません」で必ず止まるため、案内どおり打つと
+// 堂々巡りになっていた(README の初回手順は「退避 → /login → 退避」の順で /login を挟む)。
+{
+  const home = sandbox('deny-first-time-no-backups', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read',
+    tool_input: { file_path: 'src/main.py' },
+  });
+  check('健全な credentials でも保護ツリーは拒否する(前提)', decision(res) === 'deny', JSON.stringify(res));
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('通常の切り替え手順(save→swap)を出す(前提)',
+    /swap save <name>/.test(reason) && /swap <name>/.test(reason), reason);
+  check('切り替え先を一度も退避していない場合の初回手順を出す',
+    /まだ一度も退避していない場合は、この順で進めてください/.test(reason), reason);
+  check('初回手順は退避のあとに /login する順序で出ている(先に /login ではない)',
+    /1\.\s*swap save <name>[\s\S]*2\.\s*\/login[\s\S]*3\.\s*swap save <別名>/.test(reason), reason);
+}
+
 report();
