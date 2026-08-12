@@ -79,15 +79,31 @@ function sandbox(name, { current, accounts = {}, slot } = {}) {
   return home;
 }
 
-// 非ゼロ終了でも中止の理由を確かめたいので、例外から stdout / stderr を拾って返す
-function runSwap(home, argv = []) {
-  const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+// 子プロセスの起動を 1 箇所に集約する。以前は runSwap のほかに、credentials.js を
+// 意図的に置かない配置や os.homedir() まで壊れた環境を再現する箇所ごとに同じ組み立てが
+// 複写されていた(account-guard.test.js は execGuardScript() / homeEnv() に一本化済みなので
+// 同じ形に揃える)。swap は非ゼロ終了でも中止の理由を確かめたいので、例外から
+// stdout / stderr を拾って返す(hook である account-guard 側とはここが異なる)。
+function execSwapScript(script, argv = [], { cwd, env } = {}) {
+  const opts = { encoding: 'utf8' };
+  if (cwd !== undefined) opts.cwd = cwd;
+  opts.env = env || { ...process.env, NO_COLOR: '1' };
   try {
-    const out = execFileSync(process.execPath, [SWAP, ...argv], { env, encoding: 'utf8' });
+    const out = execFileSync(process.execPath, [script, ...argv], opts);
     return { code: 0, out, err: '' };
   } catch (e) {
     return { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
   }
+}
+
+// USERPROFILE/HOME を home に差し替えた環境変数の組み立て。ほとんどの呼び出しがこの形を
+// 必要とするのでここに寄せる(account-guard.test.js の homeEnv() と同じ形)。
+function homeEnv(home) {
+  return { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+}
+
+function runSwap(home, argv = []) {
+  return execSwapScript(SWAP, argv, { env: homeEnv(home) });
 }
 
 // 中止の不変条件を確かめるため、home 配下の .claude ツリーを丸ごと比較できる形にする。
@@ -986,13 +1002,7 @@ console.log('swap');
   const dir = path.join(BASE, 'lone-swap');
   fs.mkdirSync(dir, { recursive: true });
   fs.copyFileSync(SWAP, path.join(dir, 'swap.js')); // credentials.js は意図的に置かない
-  let r;
-  try {
-    r = { code: 0, out: execFileSync(process.execPath, [path.join(dir, 'swap.js')], {
-      env: { ...process.env, USERPROFILE: dir, HOME: dir, NO_COLOR: '1' }, encoding: 'utf8' }), err: '' };
-  } catch (e) {
-    r = { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
-  }
+  const r = execSwapScript(path.join(dir, 'swap.js'), [], { env: homeEnv(dir) });
   check('credentials.js が無いときは真因と置き場所を示して止まる',
     r.code === 1 && /credentials\.js/.test(r.err) && /同じディレクトリ/.test(r.err), r.out + r.err);
   check('スタックトレースを投げっぱなしにしない', !/ {4}at /.test(r.err), r.err);
@@ -1006,13 +1016,7 @@ console.log('swap');
   fs.mkdirSync(dir, { recursive: true });
   fs.copyFileSync(SWAP, path.join(dir, 'swap.js'));
   fs.writeFileSync(path.join(dir, 'credentials.js'), 'module.exports = {};', 'utf8');
-  let r;
-  try {
-    r = { code: 0, out: execFileSync(process.execPath, [path.join(dir, 'swap.js')], {
-      env: { ...process.env, USERPROFILE: dir, HOME: dir, NO_COLOR: '1' }, encoding: 'utf8' }), err: '' };
-  } catch (e) {
-    r = { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
-  }
+  const r = execSwapScript(path.join(dir, 'swap.js'), [], { env: homeEnv(dir) });
   check('credentials.js の形式が不正なときは真因を示して止まる',
     r.code === 1 && /形式が想定と違います/.test(r.err), r.out + r.err);
   check('スタックトレースを投げっぱなしにしない', !/ {4}at /.test(r.err), r.err);
@@ -1067,16 +1071,10 @@ console.log('swap');
       `require('os').homedir = () => ${JSON.stringify(value)};`,
       "require('./swap.js');",
     ].join('\n'), 'utf8');
-    let r;
-    try {
-      r = { code: 0, out: execFileSync(process.execPath, [runner], {
-        cwd: dir,
-        env: { ...process.env, USERPROFILE: value, HOME: value, NO_COLOR: '1' },
-        encoding: 'utf8',
-      }), err: '' };
-    } catch (e) {
-      r = { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
-    }
+    const r = execSwapScript(runner, [], {
+      cwd: dir,
+      env: { ...process.env, USERPROFILE: value, HOME: value, NO_COLOR: '1' },
+    });
     // 要点は「退避なし」と表示して成功終了しないこと。cwd 配下へ逃げた状態と見分けるため、
     // 終了コードと真因(HOME)の両方を見る。
     check(`HOME が全滅(${label})なら成功終了しない`, r.code !== 0, `code=${r.code} ` + r.out + r.err);

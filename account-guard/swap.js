@@ -688,7 +688,10 @@ function saveCurrent(explicitName, force, forceCmd, pre) {
 // スロット名ではなくコマンドを丸ごと受け取るのは、--force の要否が呼び出し側にしか分からず、
 // ここで名前から組み立て直すと判定が二重になるため(それが実際にずれて、案内どおり打つと
 // 中止される事故になっていた。cmdSwap の restoreCmd 参照)。
-function reportOtherSlots(saved, indent, returnCmd) {
+// インデントは呼び出し元 2 箇所とも '  ' 固定なので引数にはせず定数にする。
+const REPORT_INDENT = '  ';
+function reportOtherSlots(saved, returnCmd) {
+  const indent = REPORT_INDENT;
   const stale = saved.stale || [];
   const drifted = saved.drifted || null;
   const names = [...new Set([...stale, ...(drifted ? [drifted] : [])])];
@@ -858,7 +861,7 @@ function cmdSave(name, force) {
         : '\n  控えの中身を確認したうえで、`/login` してから `swap save` をやり直してください'));
   }
   console.log('退避しました: ' + saved.name + ' -> ' + accountFile(saved.name));
-  reportOtherSlots(saved, '  ', null);
+  reportOtherSlots(saved, null);
 }
 
 function cmdSwap(target, force) {
@@ -896,6 +899,17 @@ function cmdSwap(target, force) {
 
   const cur = readCredsOrNull(CREDENTIALS);
 
+  // .current は cmdSwap の中で読み直すたびにディスク I/O が増えるだけでなく、同じ実行の中で
+  // 何度も同じ値を評価する取り違え事故(下の forceHint と復元ガードが完全に同一の式
+  // `cur && currentSlotOf(cur) === target` を別々に評価していて、片方だけ直す事故につながった)
+  // の元にもなる。ここで 1 回だけ読み、以降はこの定数を使い回す。
+  // 書き換わる経路(この関数の下にある短絡の writeCurrentSlot、末尾の切り替え仕上げの
+  // writeCurrentSlot、および saveCurrent 内部の writeCurrentSlot)はすべてこのキャッシュより
+  // 後にあるので、キャッシュした値を使ってよいのはそれより前の評価に限る
+  // (curSlot 自身も readCurrentSlot、curSlotOf も currentSlotOf と同じ計算式)。
+  const curSlot = readCurrentSlot();
+  const curSlotOf = curSlot || (cur && cur.json ? accountNameOf(cur.json) : null);
+
   // 中身が同じなら復元しても認証は何も変わらないので、credentials には触らず来歴だけ合わせる。
   // 「credentials は書けたが .current の書き込みで落ちた」中断状態も、再実行がここに来て
   // 自動的に直る(来歴が古いまま退避へ進むと、別アカウントのスロットを上書きしかねない)。
@@ -910,7 +924,7 @@ function cmdSwap(target, force) {
     // 同じで、何も壊れていない。中止すると「同じ内容でログイン済み」という結論のほうが
     // 伝わらなくなる。
     let noteError = null;
-    if (readCurrentSlot() !== target) {
+    if (curSlot !== target) {
       try {
         writeCurrentSlot(target);
       } catch (e) {
@@ -947,13 +961,15 @@ function cmdSwap(target, force) {
     + (needsForceToRestore(cur ? cur.json : null, next.json) ? ' --force' : '');
   const restoreBackCmd = (name) => 'swap ' + name
     + (needsForceToRestore(next.json, cur ? cur.json : null) ? ' --force' : '');
-  const saveCmd = (name) => 'swap save' + (name ? ' ' + name : '') + (planned ? ' --force' : '');
+  // 唯一の呼び出し元(下の「すでに復元済み」案内)は常に名前を省いて呼ぶ(退避名は
+  // saveCurrent が来歴/subscriptionType から決めるので、ここでは決め打ちできない)。
+  const saveCmd = 'swap save' + (planned ? ' --force' : '');
 
   // --force を案内する前に、その --force が下の「退避先が復元元と同じ名前になる」判定で
   // 止まらないかを見る。そこは --force では解けず、別名での退避でしか抜けられないので、
   // 素の `swap <target> --force` だけを出すと案内どおり打っても必ず中止される
   // (失効済み・refreshToken 欠け・subscriptionType 欠けの 3 経路すべてで再現した)。
-  const forceHint = (cur && currentSlotOf(cur) === target)
+  const forceHint = (cur && curSlotOf === target)
     ? '\n  現在のログインはそのままです。先に別名で退避してから、承知のうえで復元してください:'
       + '\n    swap save <別名>'
       + '\n    swap ' + target + ' --force'
@@ -984,7 +1000,7 @@ function cmdSwap(target, force) {
       + forceHint);
   }
 
-  const provenance = readCurrentSlot();
+  const provenance = curSlot;
   // cur が無い(未ログイン・読めない)ときは「すでに復元済み」とは言えない。来歴だけを見て
   // ここで止めると、credentials を失った人が退避を復元できない行き止まりになる。
   if (cur && provenance === target && !force) {
@@ -1001,7 +1017,7 @@ function cmdSwap(target, force) {
     console.log('  ただし現在の内容は ' + target + ' の退避と一致しません。退避のあとトークンが'
       + '更新されたか、このツールを通さずに /login した可能性があります');
     console.log('  現在のログインのほうが新しいなら、退避を最新にします:');
-    console.log('    ' + saveCmd(null));
+    console.log('    ' + saveCmd);
     console.log('  ' + target + ' の退避に戻したいなら、先に現在を別名へ退避してから復元します:');
     console.log('    swap save <別名>');
     console.log('    ' + restoreCmd);
@@ -1016,7 +1032,7 @@ function cmdSwap(target, force) {
   // 「復元元を上書きしてから、その上書きした内容を復元する」か「来歴が実体と食い違う」かの
   // どちらかにしかならない。別名で退避すれば何も壊さずに切り替えられるので、その手順を出す。
   // 次の同一性の判定より先に置くのは、そちらの案内(--force)がこの状況では効かないため。
-  if (cur && currentSlotOf(cur) === target) {
+  if (cur && curSlotOf === target) {
     fail('現在のログインの退避先が復元元(' + target + ')と同じ名前になります'
       // 「別のアカウント」とまでは証明できない(同じアカウントの古い退避かもしれない)。
       // 確かなのは現在と違う認証情報が入っていることなので、そこまでしか言わない。
@@ -1047,7 +1063,7 @@ function cmdSwap(target, force) {
     // --force を案内する前に、その --force が退避の段で止まらないかを見る。退避名は来歴か
     // subscriptionType から決まるので、どちらも無いと saveCurrent が「退避名を決められません」で
     // 中止し、案内どおり打った人が二重に止まる(案内していないのと同じになる)。
-    const needsName = !currentSlotOf(cur);
+    const needsName = !curSlotOf;
     fail(target + ' が現在のログインとは別のアカウントだと確認できません'
       + (type ? '(どちらも ' + type + ')' : '(プラン種別を読めないため比較できません)')
       + '\n  同じアカウントの古い退避だった場合、復元するとローテート前のトークンに戻り、'
@@ -1118,13 +1134,16 @@ function cmdSwap(target, force) {
   // --force の要否は切り替え前と同じ(planDiffers は向きを問わない)。素の名前だけを出して
   // いたため、同一プラン同士の切り替え(--force でしか通れない)のあとに案内どおり打つと
   // 「別のアカウントだと確認できません」で必ず中止されていた。
-  if (saved && saved.name) {
-    console.log('  元に戻すには: ' + restoreBackCmd(saved.name));
+  // saved.name が同じである限り restoreBackCmd(saved.name) は同じ文字列を返すので、
+  // 案内 2 箇所(直後の「元に戻すには」と reportOtherSlots への引き渡し)で 1 回だけ評価する。
+  const backCmd = saved && saved.name ? restoreBackCmd(saved.name) : null;
+  if (backCmd) {
+    console.log('  元に戻すには: ' + backCmd);
   }
 
   // 取り残された他スロットの案内は切り替えの「あと」に出す。切り替え前に出していた頃は
   // 案内の意味が反対になっていた(reportOtherSlots のコメント参照)。戻る手順を添えて渡す。
-  if (saved && saved.name) reportOtherSlots(saved, '  ', restoreBackCmd(saved.name));
+  if (saved && saved.name) reportOtherSlots(saved, backCmd);
 }
 
 function usage() {

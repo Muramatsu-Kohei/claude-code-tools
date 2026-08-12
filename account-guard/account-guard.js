@@ -372,6 +372,18 @@ function isHookDisable(input) {
   return Boolean(abs) && /[\\/]\.claude[\\/]settings(\.local)?\.json$/.test(normalize(abs));
 }
 
+// 設定が壊れていても通す逃げ道。判定は violation()(通常経路)と reportCrash()(ガード自身が
+// 例外で落ちた経路)の両方が必要とするので、ここ 1 箇所にまとめる。
+//
+// 以前は両関数がそれぞれ同じ条件を別の書き方(!isConfigRepair(...) && !(...) / isConfigRepair(...)
+// || (...))で持っていて、HOME 未解決とガード自身の異常終了が重なった場合だけドリフトが表面化した。
+// main() 側(violation)には settings.json の逃げ道があるのに reportCrash 側だけ isConfigRepair
+// しか見ておらず、その組み合わせでだけ「Claude Code の中から復旧する手段が 1 つも無い」状態が
+// 残っていた(CONFIG が HOME 未解決時のダミー相対パスになるため isConfigRepair は決して成立しない)。
+function isEscapeHatch(input, config) {
+  return isConfigRepair(input) || (config.homeUnresolved && isHookDisable(input));
+}
+
 // このツール呼び出しが保護ツリーに触れるか判定し、触れるなら拒否理由を返す。
 // 触れない、または現在のアカウントが許可されているなら null。
 function violation(input, account, config) {
@@ -381,8 +393,7 @@ function violation(input, account, config) {
   // 保護が丸ごと外れるので、修復操作を除いて拒否する。HOME 未解決もこの扱いに合流するが、
   // そのときは CONFIG がダミー値で isConfigRepair が成立しないため、代わりに
   // フック解除(settings.json の編集)を逃げ道にする。
-  if (config.broken && !isConfigRepair(input)
-      && !(config.homeUnresolved && isHookDisable(input))) {
+  if (config.broken && !isEscapeHatch(input, config)) {
     return {
       broken: true,
       tree: CONFIG,
@@ -446,7 +457,6 @@ function violation(input, account, config) {
 //   'unusable'   … 読めたが復元に使えない(accessToken が無い)。失って困るものは無い
 //   'unreadable' … 読み取れなかった。中身に価値があるかは判断できない
 function credentialsState() {
-  if (!credentials) return 'unreadable';
   let json;
   try {
     json = credentials.readCredentials(credentials.CREDENTIALS).json;
@@ -794,13 +804,10 @@ function reportCrash(e) {
   const cwd = input.cwd || process.cwd();
 
   // 設定が壊れているなら、この経路でも main と同じく拒否側に倒す(修復操作だけは通す)。
-  // 逃げ道の判定も main(violation)と揃える。HOME 未解決のときは CONFIG がダミー値なので
-  // isConfigRepair は決して成立せず、isConfigRepair だけを見ていると「HOME 未解決 + ガードが
-  // 例外で落ちた」組み合わせで settings.json の編集まで拒否される。この関数がまさに避けた
-  // はずの全停止(Claude Code の外から git で戻すしかない状態)がそこだけ残っていた。
+  // 逃げ道の判定は isEscapeHatch に集約してあり、main(violation)と揃う(過去にここだけ
+  // isConfigRepair しか見ずにドリフトした経緯は isEscapeHatch のコメント参照)。
   // 保護ルール未設定なら find が何も返さず、何も拒否しない。
-  const repairable = isConfigRepair(input)
-    || (config.homeUnresolved && isHookDisable(input));
+  const repairable = isEscapeHatch(input, config);
   const hit = config.broken
     ? repairable
       ? null
