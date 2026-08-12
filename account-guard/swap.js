@@ -132,8 +132,20 @@ const RESERVED_ONLY_NAMES = new Set(['warmup']);
 const RESERVED_NAMES = new Set([...DISPATCHED_NAMES, ...RESERVED_ONLY_NAMES]);
 const DAY_MS = 86400000;
 
+// fail は「戻らない」前提で各所から呼ばれているので、exitCode を立てて return する形には
+// できない(呼び出し元がそのまま先へ進んでしまう)。そのぶん出力側で取りこぼしを防ぐ:
+// Windows では出力先がパイプ(`swap team 2>&1 | tee log` など)だと書き込みが非同期になり、
+// console.error の直後に process.exit すると理由の文面が途中で切れて届かない。fs.writeSync は
+// 書き終わってから戻るので、直後に exit しても最後まで残る。
 function fail(msg) {
-  console.error('エラー: ' + msg);
+  const line = 'エラー: ' + msg + '\n';
+  try {
+    fs.writeSync(2, line);
+  } catch {
+    // fd が非ブロッキングで EAGAIN になる等、writeSync が使えない環境では従来どおりに出す
+    // (切れる可能性は残るが、何も出ないよりはよい)
+    process.stderr.write(line);
+  }
   process.exit(1);
 }
 
@@ -182,16 +194,28 @@ function readCredsOrNull(file) {
 // 読めない理由を案内に反映するために、もう一度だけ読んで原因を切り分ける。ここを
 // 「破損しているか書き込み中」と決め打ちすると、権限で読めない環境の人に
 // 「時間をおいて再実行」という永久に効かない対処を繰り返させることになる。
-// 返り値の retryable は「待てば直りうるか」で、案内の文面を分ける。待てば直るのは
-// 「書き込みの途中を読んだ」場合だけなので、JSON として読めたのに形が違うもの
-// (手で編集した、別バージョンが書いた、将来の構造変更)は retryable にしない。
+// 返り値の retryable は「待てば直りうるか」で、案内の文面を分ける。retryable false は
+// 「中身を見たうえで、待っても直らないと言い切れる」ときだけに限る。呼び出し元はこれを根拠に
+// /login を勧めるので、判断がつかないものまで false に倒すと、まだ退避していないアカウントの
+// refreshToken を捨てさせることになる。false にしてよいのは、ファイルが無い場合と、JSON として
+// 読めたのに形が違う場合(手で編集した、別バージョンが書いた、将来の構造変更)の 2 つだけ。
 function unreadableReason(file) {
   let raw;
   try {
     raw = fs.readFileSync(file, 'utf8');
   } catch (e) {
     if (e.code === 'ENOENT') return { label: 'ファイルがありません', retryable: false };
-    return { label: '読み取りに失敗しました(' + e.code + ')。権限を確認してください', retryable: false };
+    // ENOENT 以外の読み取り失敗(EBUSY・EPERM・EACCES など)は、中身が健全なままファイルに
+    // 手が届いていないだけのことがある。ウイルス対策やバックアップツールが一時的に掴んでいる、
+    // ACL が一時的に変わっている、といった一過性の要因が典型で、account-guard.js の
+    // credentialsState() は同じ状況を 'unreadable'(中身の価値は判断できない)に分類し、
+    // 掴んでいるプロセスを終えてから再実行するよう案内している。ここだけ retryable false に
+    // していたため、同じ状況に対して 2 ツールの案内が食い違い、swap 側は /login を勧めていた。
+    // 恒久的な権限問題なら待つだけでは直らないので、待つ以外の対処も文面に添える。
+    return {
+      label: '読み取りに失敗しました(' + e.code + ')。掴んでいるプロセスを終えるか、権限を確認してください',
+      retryable: true,
+    };
   }
   let json;
   try {
@@ -203,8 +227,12 @@ function unreadableReason(file) {
   if (!hasUsableCredentials(json)) {
     return { label: 'claudeAiOauth.accessToken がありません(形式が想定と違います)', retryable: false };
   }
-  // readCreds が落ちたのにここへ来る = 上の条件で拾えていない理由。決め打ちで案内しない
-  return { label: '内容を解釈できません', retryable: false };
+  // ここへ来る = 読み直した時点では健全に読める。cmdSave は --force を挟んでから改めて
+  // この関数を呼ぶ設計なので、その間にロック(や書き込み)が解けていれば必ずここに落ちる。
+  // つまり「原因不明」ではなく「もう読める」ことのほうが多い。retryable false にしていた
+  // 頃は、健全な credentials を前に /login を案内していた(未退避アカウントの refreshToken を
+  // 失う経路)。理由を特定できない以上、待てば直りうる側に倒す。
+  return { label: '読めない理由を特定できません(今は読める状態かもしれません)', retryable: true };
 }
 
 // 同一性の判断材料 1。値そのものは比較にしか使わず、出力にもログにも出さない。
@@ -1025,7 +1053,11 @@ function cmdSwap(target, force) {
       console.log('  (同じプランなので別アカウントだと確認できません。--force はそれを承知で'
         + '復元するという意味です)');
     }
-    process.exit(1);
+    // process.exit だと、Windows でパイプへ流している場合に直前の console.log がまだ書き終わって
+    // おらず、肝心の次の一手が切れて届かないことがある。exitCode を立てて自然に抜ければ、
+    // 出力を出し切ってから同じ終了コードで終わる。
+    process.exitCode = 1;
+    return;
   }
 
   // 退避先が復元元と同じファイルになる場合は、名前を分けてもらう。--force で押し切っても

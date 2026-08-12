@@ -20,9 +20,13 @@ function makeHarness() {
 
   // 全テストの最後に呼ぶ。件数を表示し、1 件でも FAIL があれば終了コードを非 0 にする
   // (CI やラッパースクリプトが exit code だけで失敗を検知できるようにするため)。
+  // 終了は process.exit ではなく exitCode で行う。Windows では出力先がパイプ(CI のログ収集や
+  // `node test/swap.test.js | tee log`)だと書き込みが非同期になり、exit を即座に呼ぶと最後の
+  // 集計行や直前の FAIL 明細が切れて届かない。report はテストファイルの最終行なので、
+  // 立てるだけで自然に同じ終了コードで終わる。
   function report() {
     console.log(`\n  ${state.pass} PASS / ${state.fail} FAIL`);
-    process.exit(state.fail ? 1 : 0);
+    process.exitCode = state.fail ? 1 : 0;
   }
 
   return { state, check, report };

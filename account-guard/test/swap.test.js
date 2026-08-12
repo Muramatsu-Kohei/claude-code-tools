@@ -864,6 +864,21 @@ console.log('swap');
   check('権限で読めない場合は権限の確認を案内する', /権限/.test(r.out), r.out);
 }
 {
+  // 読み取り自体に失敗した場合(権限・他プロセスのロック・EBUSY)は、中身が健全なまま
+  // ファイルに手が届いていないだけのことがある。account-guard.js の credentialsState() も
+  // 同じ状況を「中身の価値は判断できない」側に分類し、掴んでいるプロセスを終えてからの
+  // 再実行を案内している。swap だけ「待っても直らない」と扱うと 2 ツールで対処が食い違い、
+  // /login へ誘導して未退避アカウントの refreshToken を捨てさせる。ここでも待てば直りうる側の
+  // 案内になることを見る(EISDIR はディレクトリを置いて作る)。
+  const home = sandbox('swap-unreadable-retryable', { accounts: { team: creds('team') } });
+  fs.mkdirSync(credPath(home), { recursive: true });
+  const r = runSwap(home, ['team']);
+  check('読み取りに失敗した場合は時間をおいての再実行を案内する',
+    /時間をおいて/.test(r.err), r.out + r.err);
+  check('読み取りに失敗した場合は待つ以外の対処も添える', /権限/.test(r.err), r.out + r.err);
+  check('読み取りに失敗した場合も先へ進む手段は示す', /--force/.test(r.err), r.err);
+}
+{
   const home = sandbox('status-empty', {});
   const r = runSwap(home, []);
   check('status はファイルが無いときだけ未ログインと言う', /未ログイン/.test(r.out), r.out + r.err);
