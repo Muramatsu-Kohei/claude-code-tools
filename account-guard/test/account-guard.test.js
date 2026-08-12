@@ -38,14 +38,35 @@ function sandbox(name, { subscriptionType, rules, raw, rawRules } = {}) {
 
 const configPath = (home) => path.join(home, '.claude', 'account-guard', 'config.json');
 
+// child_process 起動の共通下地。account-guard.js 本体を叩く経路(run())だけでなく、
+// 異常系を再現するための別スクリプト(CRASH / ALONE / BADSHAPE_GUARD / NOREAD_GUARD /
+// HOME 導出を壊す RUNNER 系)を起動するテストが多数あり、以前はそれぞれが execFileSync の
+// 呼び出しをコピーしていた。cwd の有無・env の作り方・追加の argv・stdin の有無だけが
+// 違う同じ形なので起動処理はここに一本化する。timeout を足す・空出力の扱いを変える、
+// といった変更を全経路に効かせたいときはここ 1 箇所を直せばよい。
+function execGuardScript(scriptPath, { argv = [], env, cwd, input } = {}) {
+  const opts = { env, encoding: 'utf8' };
+  if (cwd !== undefined) opts.cwd = cwd;
+  if (input !== undefined) opts.input = JSON.stringify(input);
+  return execFileSync(process.execPath, [scriptPath, ...argv], opts);
+}
+
+// execGuardScript の生の stdout を、フックの JSON 出力として解釈する。空出力は
+// 「通常フローに委ねる(何も拒否しない)」を表す null として扱う。
+function toResult(out) {
+  return out.trim() ? JSON.parse(out) : null;
+}
+
+// USERPROFILE/HOME を home に差し替えた環境変数の組み立て。ほとんどの呼び出しがこの形を
+// 必要とするのでここに寄せる(NO_COLOR は ANSI エスケープが reason の正規表現照合を
+// 壊すのを防ぐため)。HOME 導出そのものを壊すテストは homeEnv を使わず env を個別に組む。
+function homeEnv(home) {
+  return { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+}
+
 // フックとして呼び出し、stdout の JSON を返す。出力なし(= 通常フローに委ねる)は null。
 function run(home, input, argv = []) {
-  const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
-  const out = execFileSync(process.execPath, [GUARD, ...argv], {
-    env, input: JSON.stringify(input), encoding: 'utf8',
-  });
-  if (!out.trim()) return null;
-  return JSON.parse(out);
+  return toResult(execGuardScript(GUARD, { argv, env: homeEnv(home), input }));
 }
 
 const decision = (res) => res?.hookSpecificOutput?.permissionDecision ?? null;
@@ -668,13 +689,7 @@ console.log('account-guard');
       .replace('function main() {', "function main() {\n  throw new Error('boom');"),
     'utf8'
   );
-  const runCrash = (home, input) => {
-    const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
-    const out = execFileSync(process.execPath, [CRASH], {
-      env, input: JSON.stringify(input), encoding: 'utf8',
-    });
-    return out.trim() ? JSON.parse(out) : null;
-  };
+  const runCrash = (home, input) => toResult(execGuardScript(CRASH, { env: homeEnv(home), input }));
 
   const home = sandbox('crash', { subscriptionType: 'pro', rules: ORG });
   let res = runCrash(home, {
@@ -713,13 +728,7 @@ console.log('account-guard');
   fs.mkdirSync(path.dirname(ALONE), { recursive: true });
   fs.copyFileSync(GUARD, ALONE); // credentials.js は意図的に置かない
 
-  const runAlone = (home, input) => {
-    const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
-    const out = execFileSync(process.execPath, [ALONE], {
-      env, input: JSON.stringify(input), encoding: 'utf8',
-    });
-    return out.trim() ? JSON.parse(out) : null;
-  };
+  const runAlone = (home, input) => toResult(execGuardScript(ALONE, { env: homeEnv(home), input }));
 
   // 許可されたアカウント(team)で入っている。credentials.js があれば通る操作なので、
   // ここで deny が出れば「読めないから拒否側に倒した」ことがはっきりする。
@@ -743,9 +752,7 @@ console.log('account-guard');
 
   // 確認用の入り口(status)でも真因を出す。'アカウント: unknown' だけでは未ログインと
   // 区別が付かず、deny 側でわざわざ塞いだ袋小路(/login の繰り返し)をここで踏む。
-  const statusOut = execFileSync(process.execPath, [ALONE, 'status'], {
-    env: { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' }, encoding: 'utf8',
-  });
+  const statusOut = execGuardScript(ALONE, { argv: ['status'], env: homeEnv(home) });
   check('status も credentials.js が読めないことを言う',
     /credentials\.js/.test(statusOut) && /`\/login` では直りません/.test(statusOut), statusOut);
 
@@ -775,13 +782,7 @@ console.log('account-guard');
     'utf8'
   );
 
-  const runBadShape = (home, input) => {
-    const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
-    const out = execFileSync(process.execPath, [BADSHAPE_GUARD], {
-      env, input: JSON.stringify(input), encoding: 'utf8',
-    });
-    return out.trim() ? JSON.parse(out) : null;
-  };
+  const runBadShape = (home, input) => toResult(execGuardScript(BADSHAPE_GUARD, { env: homeEnv(home), input }));
 
   const home = sandbox('badshape-home', { subscriptionType: 'team', rules: ORG });
   const res = runBadShape(home, {
@@ -810,18 +811,13 @@ console.log('account-guard');
     'utf8'
   );
   const noreadHome = sandbox('noread-home', { subscriptionType: 'team', rules: ORG });
-  const noreadRes = (() => {
-    const env = { ...process.env, USERPROFILE: noreadHome, HOME: noreadHome, NO_COLOR: '1' };
-    const out = execFileSync(process.execPath, [NOREAD_GUARD], {
-      env,
-      input: JSON.stringify({
-        hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read',
-        tool_input: { file_path: 'a.py' },
-      }),
-      encoding: 'utf8',
-    });
-    return out.trim() ? JSON.parse(out) : null;
-  })();
+  const noreadRes = toResult(execGuardScript(NOREAD_GUARD, {
+    env: homeEnv(noreadHome),
+    input: {
+      hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read',
+      tool_input: { file_path: 'a.py' },
+    },
+  }));
   check('readCredentials を欠く credentials.js でも保護ツリーは拒否する',
     decision(noreadRes) === 'deny', JSON.stringify(noreadRes));
   const noreadReason = noreadRes?.hookSpecificOutput?.permissionDecisionReason || '';
@@ -870,15 +866,11 @@ console.log('account-guard');
 
   const env = { ...process.env, NO_COLOR: '1', USERPROFILE: '', HOME: '' };
 
-  const out = execFileSync(process.execPath, [RUNNER], {
+  const res = toResult(execGuardScript(RUNNER, {
     cwd: home, // プロセスの実際の cwd。HOME='.' のバグがあればここが CONFIG の基準になる
     env,
-    input: JSON.stringify({
-      hook_event_name: 'PreToolUse', cwd: TARGET, tool_name: 'Read', tool_input: { file_path: 'x' },
-    }),
-    encoding: 'utf8',
-  });
-  const res = out.trim() ? JSON.parse(out) : null;
+    input: { hook_event_name: 'PreToolUse', cwd: TARGET, tool_name: 'Read', tool_input: { file_path: 'x' } },
+  }));
   check('HOME が無い環境でも設定をカレントディレクトリから読まない', res === null, JSON.stringify(res));
 }
 
@@ -910,16 +902,14 @@ console.log('account-guard');
   const home2 = sandbox('emptyhome-cwd', { rules: [{ tree: TARGET2, allow: [] }] });
 
   const env2 = { ...process.env, NO_COLOR: '1', USERPROFILE: '', HOME: '' };
-  const out2 = execFileSync(process.execPath, [RUNNER2], {
+  const res2 = toResult(execGuardScript(RUNNER2, {
     cwd: home2,
     env: env2,
-    input: JSON.stringify({
+    input: {
       hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
       tool_input: { command: 'echo hello' },
-    }),
-    encoding: 'utf8',
-  });
-  const res2 = out2.trim() ? JSON.parse(out2) : null;
+    },
+  }));
   // 無言で fail-open していない(素通し = res===null)ことが要点。保護対象と無関係な
   // Bash 呼び出しでも、HOME を特定できない間は安全側に倒して拒否する。
   check('credentials.js が正しく揃っていても HOME が全滅なら無言で通さない', res2 !== null, JSON.stringify(res2));
@@ -939,16 +929,14 @@ console.log('account-guard');
     "require('./account-guard.js');",
   ].join('\n'), 'utf8');
 
-  const out3 = execFileSync(process.execPath, [RUNNER3], {
+  const res3 = toResult(execGuardScript(RUNNER3, {
     cwd: home2,
     env: { ...process.env, NO_COLOR: '1', USERPROFILE: '   ', HOME: '   ' },
-    input: JSON.stringify({
+    input: {
       hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
       tool_input: { command: 'echo hello' },
-    }),
-    encoding: 'utf8',
-  });
-  const res3 = out3.trim() ? JSON.parse(out3) : null;
+    },
+  }));
   check('空白のみの HOME でも無言で通さない', res3 !== null, JSON.stringify(res3));
   check('空白のみの HOME でも拒否する', decision(res3) === 'deny', JSON.stringify(res3));
   check('空白のみの HOME でも理由が HOME を特定できないことを言う',
@@ -963,28 +951,23 @@ console.log('account-guard');
   // 保護ツリーも特定できておらず、そもそも何も保護できていない。
   const settingsTarget = path.join(home2, '.claude', 'settings.json');
   for (const tool of ['Read', 'Edit', 'Write']) {
-    const out4 = execFileSync(process.execPath, [RUNNER2], {
+    const out4 = execGuardScript(RUNNER2, {
       cwd: home2,
       env: env2,
-      input: JSON.stringify({
-        hook_event_name: 'PreToolUse', cwd: home2, tool_name: tool,
-        tool_input: { file_path: settingsTarget },
-      }),
-      encoding: 'utf8',
+      input: { hook_event_name: 'PreToolUse', cwd: home2, tool_name: tool, tool_input: { file_path: settingsTarget } },
     });
     check(`HOME 未解決でも settings.json の ${tool} は通す(復旧経路を残す)`,
       out4.trim() === '', out4);
   }
   // 逃げ道は settings.json だけ。無関係なファイルまで通すと、HOME 未解決を騙る形で
   // 保護が外れる余地が広がる。
-  const out5 = execFileSync(process.execPath, [RUNNER2], {
+  const out5 = execGuardScript(RUNNER2, {
     cwd: home2,
     env: env2,
-    input: JSON.stringify({
+    input: {
       hook_event_name: 'PreToolUse', cwd: home2, tool_name: 'Edit',
       tool_input: { file_path: path.join(home2, 'notes.txt') },
-    }),
-    encoding: 'utf8',
+    },
   });
   check('HOME 未解決でも settings.json 以外は通さない', out5.trim() !== '', out5);
   check('逃げ道は拒否メッセージにも書いてある(書かないと気づけない)',
@@ -1017,13 +1000,10 @@ console.log('account-guard');
 
   const crashHome = sandbox('crash-cwd', { rules: [{ tree: path.join(BASE, 'crash-target'), allow: [] }] });
   const crashEnv = { ...process.env, NO_COLOR: '1', USERPROFILE: '', HOME: '' };
-  const runCrash = (toolName, filePath) => execFileSync(process.execPath, [RUNNER4], {
+  const runCrash = (toolName, filePath) => execGuardScript(RUNNER4, {
     cwd: crashHome,
     env: crashEnv,
-    input: JSON.stringify({
-      hook_event_name: 'PreToolUse', cwd: crashHome, tool_name: toolName, tool_input: { file_path: filePath },
-    }),
-    encoding: 'utf8',
+    input: { hook_event_name: 'PreToolUse', cwd: crashHome, tool_name: toolName, tool_input: { file_path: filePath } },
   });
 
   const settingsTarget = path.join(crashHome, '.claude', 'settings.json');
