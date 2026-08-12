@@ -317,6 +317,21 @@ console.log('swap');
     /別アカウントの最新の退避/.test(r.out), r.out);
 }
 {
+  // 押し出した旧内容が現在のログインと同じ資格情報なら、それを持つ他スロットは古くない。
+  // staleSlots はこの条件がスロット名に依存しないことを使って、ループの外で 1 回だけ見る。
+  // 誤って落とすと、同じ内容の別名スロットに「内容が違う」と印を付け、--force での
+  // 上書きを勧めることになる(勧めた先で潰れるのは、現に有効なバックアップ)。
+  const home = sandbox('stale-slots-same-creds', {
+    current: creds('pro', { token: 'A' }),
+    accounts: { pro: creds('pro', { token: 'A' }), spare: creds('pro', { token: 'A' }) },
+    slot: 'pro',
+  });
+  const r = runSwap(home, ['save', 'pro']);
+  check('同じ内容での退避は成功する', r.code === 0, r.out + r.err);
+  check('現在と同じ資格情報を持つスロットは古い扱いにしない',
+    !/内容が違うスロットがあります/.test(r.out), r.out + r.err);
+}
+{
   // 切り替えに伴う退避でも同じ。ここでも揃えて書いていたので、swap 経由でも巻き添えが起きた。
   const home = sandbox('stale-slots-swap', {
     current: creds('pro', { token: 'pro-new' }),
@@ -1151,6 +1166,18 @@ console.log('swap');
     r.code === 1 && /サブコマンドと同じ/.test(r.err), r.out + r.err);
   check('中止したのでファイルも作らない', !fs.existsSync(acctPath(home, 'save')), r.err);
   check('復元できなくなることを理由として書く', /復元する手段がなくなります/.test(r.err), r.err);
+}
+{
+  // warmup はまだ実装していないが docs/account-separation.md §6.3 で仕様確定済み。
+  // 実装を待ってから予約すると、それまでに作られたスロットが実装した瞬間に復元不能になる
+  // (`swap warmup` がサブコマンドとして解釈され、復元する引数の形が消える)。
+  const home = sandbox('reserved-name-warmup', {
+    current: creds('pro', { token: 'tok' }),
+  });
+  const r = runSwap(home, ['save', 'warmup']);
+  check('未実装でも仕様確定済みのサブコマンド名は退避に使わせない',
+    r.code === 1 && /サブコマンドと同じ/.test(r.err), r.out + r.err);
+  check('warmup で中止したのでファイルも作らない', !fs.existsSync(acctPath(home, 'warmup')), r.err);
 }
 {
   // 予約語チェックより前に作られたスロットは、放置すると復元できないまま一覧に居座り、

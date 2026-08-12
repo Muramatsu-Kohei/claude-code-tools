@@ -117,7 +117,12 @@ const NAME_RE = /^[a-zA-Z0-9_-]+$/;
 // サブコマンドと同じ名前のスロットは作らせない。main() は第一引数を必ずサブコマンドとして
 // 読むので、`accounts/save.json` を作れてしまうと `swap save` は復元ではなく退避に走り、
 // そのスロットを復元する引数の形が存在しなくなる(手でファイルを動かすしかない行き止まり)。
-const RESERVED_NAMES = new Set(['save', 'help', '-h', '--help']);
+// warmup はまだ実装していないが、docs/account-separation.md §6.3 で仕様確定済みの
+// サブコマンド(両アカウントの窓を開ける)。実装前にスロット名として取られると、実装した
+// 瞬間に `swap warmup` がそのスロットの復元ではなくサブコマンドとして解釈され、復元する
+// 引数の形が失われる(save で実際に起きたのと同じ袋小路)。予約は 1 語ぶんの自由と引き換えに
+// それを塞ぐので、実装を待たずにここへ入れておく。
+const RESERVED_NAMES = new Set(['save', 'help', '-h', '--help', 'warmup']);
 const DAY_MS = 86400000;
 
 function fail(msg) {
@@ -484,9 +489,15 @@ function slotsHolding(token) {
 // slotsHolding は経由せずここで直接読む。
 function staleSlots(cur, name, oldToken) {
   if (!oldToken) return [];
+  // 押し出した旧内容が現在のログインと同じ資格情報なら、それを持つスロットは古くない。
+  // この条件はスロット名に依存しないので、ループの外で 1 回だけ見る。中で sameCreds を
+  // 呼んでいた頃は、oldToken に一致したスロットごとに同じ比較を繰り返していた
+  // (c の refreshToken は既に oldToken だと確定しているので、sameCreds が見ていたのは
+  //  実質「現在のログインの refreshToken が oldToken か」だけだった)。
+  if (refreshTokenOf(cur.json) === oldToken) return [];
   return savedAccounts().filter(n => n !== name).filter(n => {
     const c = readCredsOrNull(accountFile(n));
-    return c && refreshTokenOf(c.json) === oldToken && !sameCreds(cur.json, c.json);
+    return c && refreshTokenOf(c.json) === oldToken;
   }).sort();
 }
 
