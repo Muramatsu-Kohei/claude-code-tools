@@ -1201,11 +1201,14 @@ console.log('swap');
     /トークンが更新された/.test(r.out) && /\/login した/.test(r.out), r.out);
 }
 {
-  // 修正5: 来歴が指すスロットの内容が現在のログインと一致すると、以前はそこで即座に空集合を
-  // 返していた。同じアカウントを複数の名前で退避していた場合、押し出された旧トークンを
-  // 持つ側にはこれで永久に印が付かなかった(README は「swap の一覧にも印が残る」と書いている
-  // のに、実装がまさにこのケースだけ抜けていた)。
-  const home = sandbox('outdated-same-name-duplicate', {
+  // 修正A(撤回): 一時期「.replaced の控えの refreshToken と一致するスロットも stale とみなす」
+  // 照合を足したことがあるが、誤検知を生むため撤回した。.replaced が語れるのは「かつて押し出された
+  // 内容がこれだ」という履歴だけで、「いまそのスロットが古いか」ではない。取り違えて上書きした
+  // ときの復旧手順(.replaced から accounts/<name>.json へ戻す)を実行した直後のスロットは、
+  // 中身が控えと完全に一致する。つまり「押し出された古いもの」と「復旧されたばかりの正しいもの」
+  // が区別できず、後者にまで「swap save <name> --force」を添えた更新案内を出すと、
+  // 復旧したばかりの唯一の正しい退避を現在のログインで上書きして失いうる。
+  const home = sandbox('outdated-replaced-no-false-positive', {
     current: creds('pro', { token: 'old' }),
     accounts: {
       pro: creds('pro', { token: 'old' }),
@@ -1213,16 +1216,18 @@ console.log('swap');
     },
     slot: 'pro',
   });
-  // pro を新しいトークンへ更新する。押し出された old は .replaced/pro-*.json へ控えられ、
-  // mirror だけがそれと同じ旧トークンを持ったまま取り残される。
+  // pro を新しいトークンへ更新する。押し出された old は .replaced/pro-*.json へ控えられるが、
+  // mirror はそれと同じ旧トークンを持ったままでも stale 扱いにはしない(来歴は pro しか
+  // 指しておらず、mirror が古いのか別アカウントの新鮮な退避なのかはこのツールには分からない)。
   fs.writeFileSync(credPath(home), JSON.stringify(creds('pro', { token: 'new' })), 'utf8');
   const s = runSwap(home, ['save', 'pro', '--force']);
   check('退避が成功する(前提条件)', s.code === 0, s.out + s.err);
   const r = runSwap(home, []);
   check('来歴のスロットは現在と一致するので印が付かない',
     r.out.split('\n').some(l => /^\*\s*pro\s+\[残り \d+ 日\]$/.test(l)), r.out);
-  check('別名で退避していた側には、押し出された旧内容と一致することを根拠に印が付く',
-    /mirror\s+\[残り \d+ 日\]\s+\[現在のログインと内容が違います\]/.test(r.out), r.out + r.err);
+  check('.replaced の控えと一致するだけの別名スロットには印を付けない(誤検知の回帰防止)',
+    r.out.split('\n').some(l => /^\s+mirror\s+\[残り \d+ 日\]$/.test(l))
+    && !/mirror\s+\[残り \d+ 日\]\s+\[現在のログインと内容が違います\]/.test(r.out), r.out + r.err);
 }
 
 // --- サブコマンドと同じ名前のスロットは作らせない ---
@@ -1827,6 +1832,11 @@ console.log('swap');
   check('原因(e.code)を添える', /EEXIST|ENOTDIR/.test(r.err), r.err);
   check('ENOTDIR/EEXIST 向けの「同名のファイル」の案内を添える',
     /同名のファイルになっていないか確認してください/.test(r.err), r.err);
+  // 修正F: dirIsFileHint は差し替えであって追記ではない。的外れな EPERM 向け文言(該当プロセスが
+  // 無いのに終了を促す)が先頭に残ったまま「同名のファイル」の案内が追記されるだけだと、
+  // 利用者はまず存在しないプロセス探しから始めることになる。
+  check('的外れな EPERM 向け「別プロセスを終了」の文言は残らない(追記ではなく差し替え)',
+    !/掴んでいる別プロセス/.test(r.err), r.err);
 }
 
 {
@@ -1906,6 +1916,148 @@ console.log('swap');
   check('既に退避済みなら swap save <name> の追加案内は出さない',
     !/先に `swap save/.test(r.err), r.err);
   check('従来どおり入れ直しを案内する', /`\/login` し直して/.test(r.err), r.err);
+}
+
+// --- 修正B: 復元先を読めないときの「先に swap save」案内が、既存の上書きガードを迂回していた ---
+{
+  // B-1: 案内する退避先(curSlotOf)が既存のスロットと違う内容で埋まっている(overwriteGate が
+  // blocked)なら、素の名前ではなく <別名> を案内する。これを通さずに「swap save pro」と
+  // 決め打ちしていた頃は、案内どおり打つと「退避先 pro には現在と違う認証情報が入っています」で
+  // exit 1 になり、指示された一手が実行できなかった。
+  const home = sandbox('swap-save-first-routes-through-overwrite-gate', {
+    current: creds('pro', { token: 'now' }),
+    accounts: {
+      pro: creds('pro', { token: 'someone-elses-pro' }), // 同じプランの別アカウント(来歴は未記録)
+      team: { claudeAiOauth: { subscriptionType: 'team' } }, // 復元先: 壊れている(accessToken 無し)
+    },
+  });
+  const r = runSwap(home, ['team']);
+  check('復元先が壊れていて上書きを中止する', r.code !== 0, r.out + r.err);
+  check('ブロックされる退避先をそのまま案内しない(素の swap save pro を出さない)',
+    !/先に `swap save pro`/.test(r.err), r.err);
+  check('<別名> を案内し、上書きガードに当たる理由を添える',
+    /先に `swap save <別名>`/.test(r.err) && /退避先 pro には現在と違う認証情報が入っている/.test(r.err),
+    r.err);
+  // 案内どおり別名で退避すると実際に成功する(止まらない)ことまで確かめる
+  const s = runSwap(home, ['save', 'alias']);
+  check('案内どおり別名で退避すると実際に成功する', s.code === 0, s.out + s.err);
+  check('退避先 pro には触れていない(別アカウントの唯一のバックアップを守る)',
+    tokenOf(acctPath(home, 'pro')) === 'someone-elses-pro', s.out + s.err);
+}
+{
+  // B-2: 案内する退避先が、いま復元しようとしている target 自身になることがある(来歴が target を
+  // 指しているが target のファイル自体は壊れている)。これを通さずに案内していた頃は、
+  // 「swap save max」→(手で /login)→「swap save max --force」の 3 行目が、1 行目で
+  // 退避したばかりのアカウントを自分自身で潰していた。
+  const home = sandbox('swap-save-first-avoids-same-as-target', {
+    current: creds('team', { token: 'now' }),
+    accounts: { team: { claudeAiOauth: { subscriptionType: 'team' } } }, // 壊れている(target 自身)
+    slot: 'team', // 来歴が target(team) を指している
+  });
+  const r = runSwap(home, ['team']);
+  check('復元先が壊れていて上書きを中止する', r.code !== 0, r.out + r.err);
+  check('target 自身を退避先として案内しない',
+    !/先に `swap save team`/.test(r.err), r.err);
+  check('<別名> を案内する', /先に `swap save <別名>`/.test(r.err), r.err);
+}
+{
+  // B-3: 現在の credentials が accessToken 欠け・refreshToken だけ残る(staleRefreshToken)状態だと、
+  // 従来は readCredsOrNull(accessToken 必須)で null になり、「先に swap save」の案内が一切出ないまま
+  // 「/login し直してください」だけが出ていた。案内どおり /login すると、まだ退避していない
+  // refreshToken がその時点で失われる。
+  const home = sandbox('swap-save-first-detects-stale-refresh-token', {
+    current: {
+      claudeAiOauth: {
+        refreshToken: 'refresh-stale-now',
+        refreshTokenExpiresAt: Date.now() + 30 * DAY,
+        subscriptionType: 'pro',
+      },
+    }, // accessToken が無い(staleRefreshToken)
+    accounts: { team: { claudeAiOauth: { subscriptionType: 'team' } } }, // 壊れている(target)
+  });
+  const r = runSwap(home, ['team']);
+  check('復元先が壊れていて上書きを中止する', r.code !== 0, r.out + r.err);
+  check('stale な現在の credentials でも先に swap save を案内する',
+    /先に `swap save pro`/.test(r.err), r.err);
+  check('swap save の案内が /login より前に出る',
+    r.err.indexOf('swap save pro') < r.err.indexOf('`/login` し直して'), r.err);
+}
+
+// --- 修正C: cmdSwap の degraded 表示が staleRefreshToken を見ていなかった ---
+{
+  // cmdStatus / cmdSave は staleRefreshToken(accessToken 欠けだが refreshToken は残る)の控えを
+  // 「消さないでください」と案内するのに、実際に控えを作る cmdSwap の degraded 表示だけが
+  // 「この控えは復元には使えません」と断定していた。唯一の refreshToken の控えをその場で
+  // 消させかねないので、cmdStatus と同じ文面に揃える。
+  const home = sandbox('swap-degraded-display-stale-refresh-token', {
+    current: {
+      claudeAiOauth: {
+        refreshToken: 'refresh-stale',
+        refreshTokenExpiresAt: Date.now() + 30 * DAY,
+        subscriptionType: 'pro',
+      },
+    }, // accessToken が無い(staleRefreshToken)
+    accounts: { team: creds('team', { token: 'team-tok' }) }, // 健全な復元先
+  });
+  const r = runSwap(home, ['team', '--force']);
+  check('stale な現在の credentials の控えは消さないでくださいと案内する',
+    /消さないでください/.test(r.out) && /refreshToken/.test(r.out), r.out + r.err);
+  check('復元には使えないと断定しない(cmdStatus の staleToken 案内と食い違わない)',
+    !/この控えは復元には使えません/.test(r.out), r.out + r.err);
+}
+
+// --- 修正D: replacedCounts が一時的に読めないだけの控えを「消して構いません」側に分類していた ---
+{
+  // ウイルス対策やバックアップツールがファイルを掴んでいる(EBUSY/EACCES/EPERM)だけの控えが
+  // unreadable に落ち、cmdStatus が「原因を調べ終えたら消して構いません」と案内していた。
+  // pruneReplaced は同じ控えを「読めないことは復旧に使えないことの証明にならない」として
+  // 決して消さないので、自動削除の方針と表示の方針が逆を向いていた。
+  // 一時的な読み取り失敗はディレクトリで代用して EISDIR で再現する(既存の
+  // 「復元先スロットの読み取り失敗」テストと同じ技法)。
+  const home = sandbox('replaced-status-temporarily-unreadable', {
+    current: creds('pro', { token: 'now' }),
+    accounts: { pro: creds('pro', { token: 'older' }) },
+  });
+  const save1 = runSwap(home, ['save', 'pro', '--force']);
+  check('前提: 退避が成功する', save1.code === 0, save1.out + save1.err);
+  const files = replacedFiles(home, 'pro');
+  check('前提: 押し出された旧内容の控えができている', files.length === 1, files.join(', '));
+  const victim = path.join(replacedDir(home), files[0]);
+  fs.rmSync(victim);
+  fs.mkdirSync(victim); // ファイルをディレクトリに差し替えて EISDIR を起こす
+  const r = runSwap(home, []);
+  check('一時的に読み取れない控えを別項目で出す',
+    /一時的に読み取れない控え: 1 件/.test(r.out), r.out + r.err);
+  check('「消して構いません」には混ぜない',
+    !/一時的に読み取れない控え[\s\S]{0,300}消して構いません/.test(r.out), r.out);
+  check('消さないでくださいと案内する',
+    /一時的に読み取れない控え[\s\S]{0,300}消さないでください/.test(r.out), r.out);
+}
+
+// --- 修正E: 中止メッセージ組み立て中の slotsHolding が accounts 一覧を読めないと process を落とす ---
+{
+  // 修正Bの saveFirst 案内(先に swap save)は accounts の一覧を読んで「既に退避済みか」を
+  // 確かめる。この一覧読み取りに savedAccountsOrFail(= 読めなければ process.exit)を使うと、
+  // 「target を復元できません」という本来出るはずの中止メッセージが、組み立ての途中で
+  // 「一覧を読めません」という別の中止に差し替わって消える。accounts ディレクトリの
+  // 読み取り権限だけが落ちている環境(WSL など)で起きる。POSIX の権限ビット(読み取り不可・
+  // 実行可)で再現するので、chmod が効かない環境(Windows など)では自己診断でスキップする。
+  const home = sandbox('swap-abort-message-survives-unreadable-accounts-dir', {
+    current: creds('pro', { token: 'now' }),
+    accounts: { team: { claudeAiOauth: { subscriptionType: 'team' } } }, // 壊れている(target)
+  });
+  const accountsDir = path.join(home, '.claude', 'accounts');
+  fs.chmodSync(accountsDir, 0o311); // r-x を落とし --x だけにする(一覧はできないが個別の到達は可)
+  let reproduces = true;
+  try { fs.readdirSync(accountsDir); reproduces = false; } catch { /* この環境では期待どおり読めない */ }
+  if (reproduces) {
+    const r = runSwap(home, ['team']);
+    check('accounts 一覧を読めなくても target 読み込み失敗の中止メッセージを保つ',
+      /team を復元できません/.test(r.err), r.out + r.err);
+    check('無関係な「一覧を読めません」には差し替わらない',
+      !/退避済みアカウントの一覧を読めません/.test(r.err), r.out + r.err);
+  }
+  fs.chmodSync(accountsDir, 0o755); // 後始末(後続のクリーンアップが失敗しないように戻す)
 }
 
 {
