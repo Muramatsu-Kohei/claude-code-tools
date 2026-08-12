@@ -1662,4 +1662,46 @@ console.log('swap');
     r.out + r.err);
 }
 
+{
+  // forceHint(needsName): 退避名を決められない状態(subscriptionType が読めず、来歴も無い)
+  // では、素の `swap <target> --force` は退避の段で「退避名を決められません」に当たる。
+  // この判定は !planned の分岐だけが持っていたため、復元前の 3 つのガード(失効・refreshToken
+  // 欠け・subscriptionType 欠け)は行き止まりの案内を出していた。ここでは失効で再現する。
+  const home = sandbox('force-hint-needs-name', {
+    current: creds(null, { token: 'now' }),
+    accounts: { team: creds('team', { token: 'gone', expiresInDays: -1 }) },
+  });
+  const r = runSwap(home, ['team']);
+  check('失効した復元先は --force なしで中止する', r.code !== 0, r.out + r.err);
+  check('退避名を決められないなら名前を明示する save を先に案内する',
+    /swap save <name>/.test(r.err), r.out + r.err);
+  check('名前が要る理由も添える', /退避名を決められない状態/.test(r.err), r.out + r.err);
+  const s = runSwap(home, ['save', 'mine']);
+  check('案内どおり名前を明示すれば退避できる', s.code === 0, s.out + s.err);
+  const f = runSwap(home, ['team', '--force']);
+  check('案内どおり打てば切り替えられる(退避名の段で止まらない)', f.code === 0, f.out + f.err);
+}
+
+{
+  // failOverwrite(afterCmd): プラン種別が食い違う組み合わせでは復元前のガードが 1 つも
+  // 発火しない(planned が真なので !planned の分岐にも入らない)ため、上書きガードでの中止が
+  // その切り替えに対する唯一の案内になる。退避の手順だけを出すと、要求した切り替えを終える
+  // 最後の一手を人に推測させることになるので、続けて打つコマンドまで出す。
+  const home = sandbox('save-blocked-shows-next-step', {
+    current: creds('pro', { token: 'cur' }),
+    accounts: { pro: creds('pro', { token: 'other' }), team: creds('team') },
+  });
+  const r = runSwap(home, ['team']);
+  check('退避先に別の内容があれば切り替えを中止する', r.code !== 0, r.out + r.err);
+  check('退避の案内には続きの一手を添える',
+    /swap save <別名>\n\s+swap team/.test(r.err), r.out + r.err);
+  check('上書きを選ぶ場合にも続きの一手を添える',
+    /swap save pro --force\n\s+swap team/.test(r.err), r.out + r.err);
+  const s = runSwap(home, ['save', 'alias']);
+  check('案内どおり別名で退避できる', s.code === 0, s.out + s.err);
+  const f = runSwap(home, ['team']);
+  check('案内どおり続けて打てば切り替えられる', f.code === 0, f.out + f.err);
+  check('切り替え後の内容は復元先のもの', typeOf(credPath(home)) === 'team', f.out + f.err);
+}
+
 report();
