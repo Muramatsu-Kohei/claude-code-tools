@@ -831,6 +831,24 @@ console.log('account-guard');
   check('効かない対処(/login)を唯一の次の一手として案内しない',
     /`\/login` では直りません/.test(reason), reason);
 
+  // 起動時の形式検証と、実際に呼んでいるメンバーがドリフトしないことを機械で見る。
+  // rawHasRecoverableToken は credentialsState() が使うのに検証リストから漏れており、
+  // 欠ける版が隣にあると deny 経路が TypeError で落ち、reportCrash が無出力・exit 0 で
+  // 終わって保護ツリーへのアクセスが素通しになっていた(このブロックが防ぐはずの fail-open)。
+  // リストを人が同期させる限り同じ漏れが再発するので、ソースどうしを突き合わせて落とす。
+  {
+    const src = fs.readFileSync(GUARD, 'utf8');
+    const block = src.slice(src.indexOf('const loaded = require'), src.indexOf('credentials = loaded;'));
+    const verified = new Set([...block.matchAll(/loaded\.(\w+)/g)].map((m) => m[1]));
+    // 直前が . や英数字のものはパスの一部(.credentials.json)なので拾わない。
+    // 行頭や空白に続く credentials.js は残るため、その 'js' だけ名前で除く。
+    const used = [...new Set([...src.matchAll(/(?<![.\w])credentials\.(\w+)/g)].map((m) => m[1]))]
+      .filter((n) => n !== 'js');
+    const missing = used.filter((n) => !verified.has(n));
+    check('credentials.* の呼び出しがすべて起動時の形式検証に含まれている',
+      missing.length === 0, '検証漏れ: ' + missing.join(', '));
+  }
+
   // readCredentials だけを欠く形。他のエクスポートが揃っているため見逃されやすいが、
   // 検証を素通りすると readableCredentials() の catch が拾って「credentials が壊れている」
   // という別の案内に落ち、真因(隣の credentials.js)がどこにも出なくなる。

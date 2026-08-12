@@ -71,8 +71,15 @@ try {
     // hasRecoverableToken も同じ理由で必須。欠ける版が隣にあると credentialsState() の
     // catch が拾って「読み取れなかった」の案内に落ち、真因が出ないまま文面だけが変わる。
     || typeof loaded.hasRecoverableToken !== 'function'
+    // rawHasRecoverableToken は credentialsState() が生の中身を分類するのに使う。ここが
+    // 抜けていた頃は、欠ける版が隣にあると credentialsState() が TypeError で落ち、
+    // denyMessage を組み立てられないまま main() を抜けて reportCrash に到達していた。
+    // reportCrash は cwd しか見ないので、対象パス指定の違反は無出力(exit 0)で許可されていた
+    // ——このブロックが防ぐはずの無言 fail-open そのもの。swap.js は最初から検証しており、
+    // 二者のリストがドリフトしていた(下のテストで両者が呼ぶメンバーを機械的に照合する)。
+    || typeof loaded.rawHasRecoverableToken !== 'function'
   ) {
-    throw new Error('credentials.js の形式が不正です(HOME / CREDENTIALS / ACCOUNT_UNKNOWN / currentAccount / readCredentials / hasUsableCredentials / hasRecoverableToken のいずれかが欠けています)');
+    throw new Error('credentials.js の形式が不正です(HOME / CREDENTIALS / ACCOUNT_UNKNOWN / currentAccount / readCredentials / hasUsableCredentials / hasRecoverableToken / rawHasRecoverableToken のいずれかが欠けています)');
   }
   credentials = loaded;
 } catch (e) {
