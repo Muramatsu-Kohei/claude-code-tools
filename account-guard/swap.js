@@ -411,18 +411,10 @@ function savedAccounts() {
   }
 }
 
-// savedAccounts() の呼び出し元(retryable な余地が無い)はどこも、一覧が読めなければ
-// 「本当に 0 件なのか、読めていないだけなのか」を区別できず先へ進めない。listReplaced と違って
-// 部分的に進める余地が無いので、ここで一括して原因と対処を添えて止める。
-function savedAccountsOrFail() {
-  const { names, error } = savedAccounts();
-  if (error) {
-    fail('退避済みアカウントの一覧を読めません(' + error + ': ' + ACCOUNTS_DIR + ')'
-      + '\n  同じ名前のファイルが置かれていないか、ディレクトリの権限を確認してください');
-  }
-  return names;
-}
-
+// savedAccountsOrFail(一覧が読めなければ process.exit)は削除した。呼び出し 3 箇所すべてが
+// 「一覧は助言・表示のためだけに要る」場所で、止めると要求された操作を行わないまま無関係な
+// 理由に差し替わって終わっていた(適合ゼロ)。一覧の可否は呼び出し元が savedAccounts() の
+// error を見て決める。読めないことを「0 件」に倒さないこと。
 function accountFile(name) {
   return path.join(ACCOUNTS_DIR, name + '.json');
 }
@@ -820,7 +812,12 @@ function staleSlots(cur, name, oldToken) {
   // (c の refreshToken は既に oldToken だと確定しているので、sameCreds が見ていたのは
   //  実質「現在のログインの refreshToken が oldToken か」だけだった)。
   if (refreshTokenOf(cur.json) === oldToken) return [];
-  return savedAccountsOrFail().filter(n => n !== name).filter(n => {
+  // 戻り値は reportOtherSlots の助言表示にしか使わない。一覧が読めないだけで止めると、
+  // 呼び出し元(saveInto)はスロットへ書く手前なので、要求された退避も切り替えも行われないまま
+  // 「一覧を読めません」という無関係な理由に差し替わって終わる。読めなければ助言を省く。
+  const { names, error } = savedAccounts();
+  if (error) return [];
+  return names.filter(n => n !== name).filter(n => {
     const c = readCredsOrNull(accountFile(n));
     return c && refreshTokenOf(c.json) === oldToken;
   }).sort();
@@ -1109,7 +1106,10 @@ function cmdStatus() {
       + ' ですが、現在の内容を読めないため一致は確認できません)');
   }
 
-  const saved = savedAccountsOrFail();
+  // status は「いま何が残っているか」を確かめる唯一の入り口なので、一覧が読めなくても
+  // 最後まで出しきる。ここで止めると下の .replaced の復旧・保全の案内に到達せず、
+  // 控えが残っていること自体に気づけない(listReplaced が例外を戻り値に変えているのと同じ理由)。
+  const { names: saved, error: savedError } = savedAccounts();
   // 各スロットの中身はここで 1 回だけ読み、outdatedSlots の判定と下の表示ループの両方で
   // 使い回す(前は判定と表示で別々に全スロットを読んでいた)。
   const savedCreds = new Map(saved.map(n => [n, readCredsOrNull(accountFile(n))]));
@@ -1117,7 +1117,11 @@ function cmdStatus() {
   const unreachable = saved.filter(n => DISPATCHED_NAMES.has(n));
   const reservedOnly = saved.filter(n => RESERVED_ONLY_NAMES.has(n));
   console.log('\n退避済み (' + ACCOUNTS_DIR + '):');
-  if (saved.length === 0) {
+  if (savedError) {
+    // 「0 件」と書くと、控えがあるのに無いと誤認させる(読めない ≠ 無い)。
+    console.log('  一覧を読めません(' + savedError + ')');
+    console.log('  同じ名前のファイルが置かれていないか、ディレクトリの権限を確認してください');
+  } else if (saved.length === 0) {
     console.log('  なし。`swap save` で現在のアカウントを退避してください');
   } else {
     for (const name of saved) {
@@ -1294,8 +1298,16 @@ function cmdSwap(target, force) {
 
   const file = accountFile(target);
   if (!fs.existsSync(file)) {
-    const saved = savedAccountsOrFail();
-    if (saved.length > 0) {
+    // ここは中止メッセージを組み立てている最中なので、一覧の取得で止めない。止めると
+    // 「退避されていません: <名前>」という本当の理由が「一覧を読めません」に差し替わる
+    // (hasCopyElsewhere のコメントが禁じているのと同じ形)。読めなければ候補だけ省く。
+    const { names: saved, error: savedError } = savedAccounts();
+    if (savedError) {
+      fail('退避されていません: ' + target
+        + '\n  退避済みの一覧も読めませんでした(' + savedError + ': ' + ACCOUNTS_DIR + ')'
+        + '\n  同じ名前のファイルが置かれていないか、ディレクトリの権限を確認してください'
+        + '\n  一覧は `swap` で確認できます');
+    } else if (saved.length > 0) {
       fail('退避されていません: ' + target
         + '\n  利用可能: ' + saved.join(', ')
         + '\n  この中の名前で `swap <名前>` を実行してください');

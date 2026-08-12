@@ -1830,11 +1830,19 @@ console.log('swap');
   const accountsDir = path.join(home, '.claude', 'accounts');
   fs.rmSync(accountsDir, { recursive: true, force: true });
   fs.writeFileSync(accountsDir, 'not a directory', 'utf8');
+  //
+  // 第9ラウンドの監査で savedAccountsOrFail(一覧が読めなければ process.exit)は削除した。
+  // status は「いま何が残っているか」を確かめる唯一の入り口なので、一覧が読めなくても
+  // 最後まで出しきる。ここで止めると下の .replaced の復旧・保全の案内に到達せず、控えが
+  // 残っていること自体に気づけない。したがって期待は exit 0 で、原因と対処は stdout に出る。
   const r = runSwap(home, []);
-  check('スロット一覧を読めない環境では生の例外にならない', r.code !== 0, r.out + r.err);
-  check('原因(e.code)を添える', /ENOTDIR|EEXIST|EACCES|EPERM/.test(r.err), r.out + r.err);
-  check('対処を添える', /権限を確認/.test(r.err), r.out + r.err);
-  check('生の Node スタックトレースを出さない', !/at Object\.|at Module\.|node:internal/.test(r.err), r.err);
+  check('スロット一覧を読めない環境でも status は最後まで出す', r.code === 0, r.out + r.err);
+  check('原因(e.code)を添える', /ENOTDIR|EEXIST|EACCES|EPERM/.test(r.out), r.out + r.err);
+  check('対処を添える', /権限を確認/.test(r.out), r.out + r.err);
+  // 「読めない」を「0 件」に倒すと、控えがあるのに無いと誤認させる(規則1と同じ型)。
+  check('読めないことを 0 件と言い換えない', !/なし。`swap save`/.test(r.out), r.out + r.err);
+  check('生の Node スタックトレースを出さない',
+    !/at Object\.|at Module\.|node:internal/.test(r.out + r.err), r.out + r.err);
 }
 
 {
