@@ -88,7 +88,7 @@ if (
     + '欠けているか、期待する型ではありません'
     + '\n  swap.js と対応する版の credentials.js を同じディレクトリへ置き直してください');
 }
-const { HOME, CREDENTIALS, readCredentials, subscriptionTypeOf } = credentials;
+const { HOME, CREDENTIALS, readCredentials, subscriptionTypeOf, hasUsableCredentials } = credentials;
 
 // 退避先を ~/.claude 配下に置くのは、元の credentials と同じ ACL を継承させるため。
 // 平文トークンの本数は増えるが、保護レベルは変わらない(§6.1 の「残るリスク」)。
@@ -147,7 +147,12 @@ function validateName(name) {
 // そのまま書き戻すため(フィールド順や表記の揺れを持ち込まない)。
 function readCreds(file) {
   const c = readCredentials(file);
-  if (!c.json || !c.json.claudeAiOauth || !c.json.claudeAiOauth.accessToken) {
+  // 判定は credentials.js の hasUsableCredentials に通す。同じ条件をここに書き写していた頃は、
+  // 起動時の形式検証が hasUsableCredentials を必須にしているのに一度も呼ばない状態で、
+  // 「基準を 1 箇所に置く」という credentials.js の目的が達せられていなかった
+  // (定義を変えた瞬間にガードと swap の判定がずれ、過去にはそれが「ガードは正常と判定して
+  //  swap を案内するのに swap は必ず失敗する」袋小路を生んだ)。
+  if (!hasUsableCredentials(c.json)) {
     throw new Error('claudeAiOauth.accessToken が無い');
   }
   return c;
@@ -183,7 +188,7 @@ function unreadableReason(file) {
     // 途中まで書かれたファイルは JSON として壊れて見える。書き込み中なら待てば直る
     return { label: '壊れているか、他のプロセスが書き込み中', retryable: true };
   }
-  if (!json || !json.claudeAiOauth || !json.claudeAiOauth.accessToken) {
+  if (!hasUsableCredentials(json)) {
     return { label: 'claudeAiOauth.accessToken がありません(形式が想定と違います)', retryable: false };
   }
   // readCreds が落ちたのにここへ来る = 上の条件で拾えていない理由。決め打ちで案内しない
@@ -402,11 +407,22 @@ function keepAside(file, base) {
 // 「上書きで退けた旧内容」と「読めなかった現在の credentials の控え」は用途が違う。
 // 前者はスロットへ戻せば復旧できるが、後者は復元に使えない中身なので、戻す案内に混ぜると
 // 壊れたバイト列を有効なスロットへ書かせることになる。数える段階から分ける。
+// 分類を名前だけで決めないのは、writeSlot が「読めない旧内容」も退けるため。スロットの中身が
+// 壊れていた状態で上書きすると、その壊れたバイト列は UNREADABLE_BASE ではなくスロット名で
+// .replaced に入る。名前で数えていた頃はこれが「戻せる旧内容」に計上され、status が案内する
+// とおり accounts/<name>.json へ戻した利用者が、直前に取った正しい退避を自分で潰したうえで
+// 復元手段を失っていた(pruneReplaced は読めない控えを消さないので、この誤表示は自動でも
+// 消えない)。実際に読めるかどうかまで見て分ける。控えは高々数本なので読み直しは軽い。
 function replacedCounts() {
   if (!fs.existsSync(REPLACED_DIR)) return { overwritten: 0, unreadable: 0 };
   const files = fs.readdirSync(REPLACED_DIR).filter(f => f.endsWith('.json'));
-  const unreadable = files.filter(f => f.startsWith(UNREADABLE_BASE + '-')).length;
-  return { overwritten: files.length - unreadable, unreadable };
+  let overwritten = 0;
+  let unreadable = 0;
+  for (const f of files) {
+    if (f.startsWith(UNREADABLE_BASE + '-') || !readCredsOrNull(path.join(REPLACED_DIR, f))) unreadable++;
+    else overwritten++;
+  }
+  return { overwritten, unreadable };
 }
 
 // --- 来歴(.current) ---
@@ -724,10 +740,12 @@ function cmdStatus() {
     console.log('  取り違えて上書きしたときは、ここから accounts/<name>.json へ戻せます');
   }
   if (replaced.unreadable > 0) {
-    // 復元先には使えない中身なので、上と同じ「戻せます」の案内に混ぜない
-    console.log('\n読めなかった credentials の控え: ' + replaced.unreadable + ' 件 ('
-      + path.join(REPLACED_DIR, UNREADABLE_BASE + '-*.json') + ')');
-    console.log('  復元には使えません(accessToken を取り出せない中身です)。'
+    // 復元先には使えない中身なので、上と同じ「戻せます」の案内に混ぜない。
+    // 読めなかった現在の credentials だけでなく、退けた時点で既に壊れていた旧内容も
+    // ここに入るので、置き場所は UNREADABLE_BASE 固定ではなくディレクトリで示す。
+    console.log('\n復元に使えない控え: ' + replaced.unreadable + ' 件 (' + REPLACED_DIR + ')');
+    console.log('  読めなかった現在の credentials か、退けた時点で既に壊れていた旧内容です。'
+      + 'accounts/<name>.json へ戻しても復元できません(accessToken を取り出せない中身です)。'
       + '原因を調べ終えたら消して構いません');
   }
   if (!curSlot && cur && saved.length > 0) {
@@ -737,9 +755,12 @@ function cmdStatus() {
 
 function cmdSave(name, force) {
   if (name) validateName(name);
-  // save の --force は「このスロットを上書きしてよい」という明示なので、両方に効かせる
+  // save の --force は「このスロットを上書きしてよい」という明示なので、両方に効かせる。
+  // 名前が無いときに `<name>` を埋めた文字列を案内していた頃は、表示どおり打つと
+  // validateName が `<name>` を弾いて別のエラーで止まり、控えを残して先へ進む経路に
+  // 到達できなかった。名前を省いたまま打てる形をそのまま出す。
   const saved = saveCurrent(name, { unreadable: force, overwrite: force },
-    'swap save ' + (name || '<name>') + ' --force');
+    'swap save' + (name ? ' ' + name : '') + ' --force');
   if (!saved) {
     fail('現在 credentials がありません(未ログイン)'
       + '\n  Claude Code で `/login` してから、もう一度 `swap save` を実行してください');
@@ -810,11 +831,48 @@ function cmdSwap(target, force) {
     return;
   }
 
+  // 案内に出すコマンドが、その先のガードでそのまま通るかどうか。効くのは 2 種類あり、
+  // 向きが逆なので、案内する場所ごとに書いていると片方だけ直して他が古いままになる。実際
+  // この取り違えで「案内どおり打つと必ず中止される」事故が、復元の案内・退避の案内・
+  // 切り替え後の戻し方でそれぞれ再現した。値も文字列の組み立ても、ここ 1 箇所に集める。
+  //   復元側 … 同一プラン・失効済み・refreshToken 欠け・subscriptionType 欠けのどれかで止まる
+  //   退避側 … 来歴が一致していてもプラン種別が食い違えば止まる
+  const planned = cur ? planDiffers(cur.json, next.json) : false;
+
+  // そのスロットを `swap <name>` で復元するとき --force が要るか。復元の手前にあるガードは
+  // 4 つあり、どれか 1 つでも当たれば --force なしでは中止される。以前は同一プランだけを
+  // 見ていたため、失効した退避に対して `swap <name>` とだけ案内し、そのとおり打った人が
+  // 「失効しています」で二度目の中止に当たっていた。判定はこの関数だけが持つ。
+  const needsForceToRestore = (fromJson, slotJson) => {
+    if (!slotJson) return true;
+    if (isExpired(slotJson) || !refreshTokenOf(slotJson) || !subscriptionTypeOf(slotJson)) return true;
+    return fromJson ? !planDiffers(fromJson, slotJson) : false;
+  };
+  // 向きで判定が変わるので 2 つ持つ。読み込み済みの中身をそのまま渡すのは、target は next として
+  // 既に読んであり、戻す先は今の cur そのものだから(同じファイルを読み直しても結果は変わらない)。
+  //   restoreCmd     … いま target を復元する向き(現在は cur)
+  //   restoreBackCmd … 切り替えたあと元へ戻す向き(そのときの現在は next で、復元先は cur の内容)
+  const restoreCmd = 'swap ' + target
+    + (needsForceToRestore(cur ? cur.json : null, next.json) ? ' --force' : '');
+  const restoreBackCmd = (name) => 'swap ' + name
+    + (needsForceToRestore(next.json, cur ? cur.json : null) ? ' --force' : '');
+  const saveCmd = (name) => 'swap save' + (name ? ' ' + name : '') + (planned ? ' --force' : '');
+
+  // --force を案内する前に、その --force が下の「退避先が復元元と同じ名前になる」判定で
+  // 止まらないかを見る。そこは --force では解けず、別名での退避でしか抜けられないので、
+  // 素の `swap <target> --force` だけを出すと案内どおり打っても必ず中止される
+  // (失効済み・refreshToken 欠け・subscriptionType 欠けの 3 経路すべてで再現した)。
+  const forceHint = (cur && currentSlotOf(cur) === target)
+    ? '\n  現在のログインはそのままです。先に別名で退避してから、承知のうえで復元してください:'
+      + '\n    swap save <別名>'
+      + '\n    swap ' + target + ' --force'
+    : '\n  現在のログインはそのままです。承知のうえで復元するなら: swap ' + target + ' --force';
+
   // 失効済みの復元先は切り替える前に止める。上書きしてから気づいてもマシン全体が
   // 未ログインになっており、稼働中の別セッションも次のリクエストで認証エラーになる。
   if (isExpired(next.json) && !force) {
     fail(target + ' の refreshToken は失効しています。復元しても /login のやり直しになるため中止しました'
-      + '\n  現在のログインはそのままです。承知のうえで上書きするなら: swap ' + target + ' --force');
+      + forceHint);
   }
 
   // refreshToken が無い中身は復元しても認証を更新できない。readCreds は accessToken しか
@@ -823,7 +881,7 @@ function cmdSwap(target, force) {
   if (!refreshTokenOf(next.json) && !force) {
     fail(target + ' には refreshToken がありません。復元しても認証を更新できず、accessToken が'
       + '切れた時点で /login のやり直しになります'
-      + '\n  現在のログインはそのままです。承知のうえで復元するなら: swap ' + target + ' --force');
+      + forceHint);
   }
 
   // subscriptionType が無い中身を復元すると、account-guard は現在のアカウントを判別できず
@@ -832,20 +890,8 @@ function cmdSwap(target, force) {
   if (!subscriptionTypeOf(next.json) && !force) {
     fail(target + ' には subscriptionType がありません。復元すると account-guard がアカウントを'
       + '判別できなくなり、保護ツリーへの操作がすべて拒否されます'
-      + '\n  現在のログインはそのままです。承知のうえで復元するなら: swap ' + target + ' --force');
+      + forceHint);
   }
-
-  // 案内に出すコマンドが、その先のガードでそのまま通るかどうか。効くのは 2 つのガードで、
-  // どちらも同じ planDiffers の値で決まる:
-  //   復元側 … 別アカウントだと証明できない(プランが同じ)なら止まる → --force が要る
-  //   退避側 … 来歴が一致していてもプラン種別が食い違えば止まる     → --force が要る
-  // 向きが逆なので、案内する場所ごとに書いていると片方だけ直して他が古いままになる。実際
-  // この取り違えで「案内どおり打つと必ず中止される」事故が、復元の案内・退避の案内・
-  // 切り替え後の戻し方でそれぞれ再現した。値も文字列の組み立ても、ここ 1 箇所に集める。
-  const planned = cur ? planDiffers(cur.json, next.json) : false;
-  // 戻す向きでも planDiffers は対称なので、切り替え後の「元に戻すには」もこれで足りる。
-  const restoreCmd = (name) => 'swap ' + name + (planned ? '' : ' --force');
-  const saveCmd = (name) => 'swap save' + (name ? ' ' + name : '') + (planned ? ' --force' : '');
 
   const provenance = readCurrentSlot();
   // cur が無い(未ログイン・読めない)ときは「すでに復元済み」とは言えない。来歴だけを見て
@@ -867,7 +913,7 @@ function cmdSwap(target, force) {
     console.log('    ' + saveCmd(null));
     console.log('  ' + target + ' の退避に戻したいなら、先に現在を別名へ退避してから復元します:');
     console.log('    swap save <別名>');
-    console.log('    ' + restoreCmd(target));
+    console.log('    ' + restoreCmd);
     if (!planned) {
       console.log('  (同じプランなので別アカウントだと確認できません。--force はそれを承知で'
         + '復元するという意味です)');
@@ -887,7 +933,7 @@ function cmdSwap(target, force) {
       + '\n  先に別名で退避してください(既存のスロットには触りません):'
       + '\n    swap save <別名>'
       + '\n  そのあと切り替えられます:'
-      + '\n    ' + restoreCmd(target)
+      + '\n    ' + restoreCmd
       + (planned
         ? ''
         : '\n  (プラン種別が同じか読めないため別アカウントだと確認できません。'
@@ -943,7 +989,23 @@ function cmdSwap(target, force) {
     console.log('退避: ' + saved.name);
   }
 
-  writeAtomic(CREDENTIALS, next.raw);
+  // ここで落ちる原因は、たいてい Windows で移動先を他プロセスが掴んでいること
+  // (writeAtomic の rename が EPERM で落ちる。稼働中の Claude Code が典型)。捕まえないと、
+  // 直前に「退避: <name>」とだけ出したあと生の Node 例外で終わり、切り替わったのか退避だけ
+  // 済んだのかが文面から読み取れない。keepAside の copyFileSync には理由と対処を添えているのに、
+  // 最も EPERM を踏みやすいこの呼び出しだけが素通しになっていた。
+  try {
+    writeAtomic(CREDENTIALS, next.raw);
+  } catch (e) {
+    fail('認証情報の差し替えに失敗しました(' + (e.code || e.message) + ')'
+      + '\n  ' + CREDENTIALS + ' を書き換えられません。稼働中の Claude Code など、このファイルを'
+      + '掴んでいるプロセスを終了するか、読み取り専用属性を外してください'
+      + '\n  認証は切り替わっていません'
+      + (saved && saved.name
+        ? '(現在のログインは ' + saved.name + ' へ退避済みで、失われたものはありません)'
+        : '')
+      + '\n  原因を取り除いてから、もう一度 `swap ' + target + (force ? ' --force' : '') + '` を実行してください');
+  }
   writeCurrentSlot(target);
   console.log('切り替え: ' + ((saved && saved.name) || 'なし') + ' -> ' + target + expiryNote(next.json));
   console.log('注意: この変更はマシン全体に即座に効きます。稼働中の別セッションも切り替わります');
@@ -955,12 +1017,12 @@ function cmdSwap(target, force) {
   // いたため、同一プラン同士の切り替え(--force でしか通れない)のあとに案内どおり打つと
   // 「別のアカウントだと確認できません」で必ず中止されていた。
   if (saved && saved.name) {
-    console.log('  元に戻すには: ' + restoreCmd(saved.name));
+    console.log('  元に戻すには: ' + restoreBackCmd(saved.name));
   }
 
   // 取り残された他スロットの案内は切り替えの「あと」に出す。切り替え前に出していた頃は
   // 案内の意味が反対になっていた(reportOtherSlots のコメント参照)。戻る手順を添えて渡す。
-  if (saved && saved.name) reportOtherSlots(saved, '  ', restoreCmd(saved.name));
+  if (saved && saved.name) reportOtherSlots(saved, '  ', restoreBackCmd(saved.name));
 }
 
 function usage() {

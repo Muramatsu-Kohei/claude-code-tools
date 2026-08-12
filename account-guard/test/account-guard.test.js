@@ -992,4 +992,90 @@ console.log('account-guard');
     JSON.stringify(res2));
 }
 
+// HOME 未解決とガード自身の異常終了が重なった場合。main() 側には settings.json の逃げ道が
+// あるのに reportCrash 側だけ isConfigRepair しか見ていなかったため、この組み合わせでだけ
+// 「Claude Code の中から復旧する手段が 1 つも無い」状態が残っていた(CONFIG がダミーの
+// 相対パスになるので isConfigRepair は決して成立しない)。両方の経路で逃げ道が要る。
+{
+  const CRASH_DIR = path.join(BASE, 'crash-homeunresolved');
+  fs.mkdirSync(CRASH_DIR, { recursive: true });
+  // main() だけを確実に落とす。reportCrash の側を見たいので、注入は main の中に限る
+  // (トップレベルで投げると catch より先にプロセスが死に、別の経路の検証になってしまう)。
+  const original = fs.readFileSync(GUARD, 'utf8');
+  const injected = original.replace('function main() {', 'function main() {\n  throw new Error("injected for test");');
+  if (injected === original) throw new Error('main() への注入に失敗しました(テストの前提が崩れています)');
+  fs.writeFileSync(path.join(CRASH_DIR, 'account-guard.js'), injected, 'utf8');
+  fs.copyFileSync(path.join(__dirname, '..', 'credentials.js'), path.join(CRASH_DIR, 'credentials.js'));
+
+  // HOME が全滅した環境の作り方は上のテストと同じ(環境変数の空文字だけでは再現できない)。
+  const RUNNER4 = path.join(CRASH_DIR, 'run.js');
+  fs.writeFileSync(RUNNER4, [
+    "'use strict';",
+    "require('os').homedir = () => '';",
+    "require('./account-guard.js');",
+  ].join('\n'), 'utf8');
+
+  const crashHome = sandbox('crash-cwd', { rules: [{ tree: path.join(BASE, 'crash-target'), allow: [] }] });
+  const crashEnv = { ...process.env, NO_COLOR: '1', USERPROFILE: '', HOME: '' };
+  const runCrash = (toolName, filePath) => execFileSync(process.execPath, [RUNNER4], {
+    cwd: crashHome,
+    env: crashEnv,
+    input: JSON.stringify({
+      hook_event_name: 'PreToolUse', cwd: crashHome, tool_name: toolName, tool_input: { file_path: filePath },
+    }),
+    encoding: 'utf8',
+  });
+
+  const settingsTarget = path.join(crashHome, '.claude', 'settings.json');
+  for (const tool of ['Read', 'Edit', 'Write']) {
+    const out = runCrash(tool, settingsTarget);
+    check(`異常終了 + HOME 未解決でも settings.json の ${tool} は通す(全停止させない)`,
+      out.trim() === '', out);
+  }
+  // 逃げ道は settings.json だけ。ここを広げると、異常終了を装う形で保護が外れる。
+  const outOther = runCrash('Edit', path.join(crashHome, 'notes.txt'));
+  check('異常終了 + HOME 未解決でも settings.json 以外は通さない', outOther.trim() !== '', outOther);
+  const crashReason = (outOther.trim() ? JSON.parse(outOther) : null)
+    ?.hookSpecificOutput?.permissionDecisionReason || '';
+  // CONFIG はこの状態ではダミー値なので、そのパスを「読めない設定ファイル」として出すと
+  // 存在しない場所を直しに行かせることになる。
+  check('異常終了の文面がダミーの設定パスを直せと言わない',
+    !/home-unresolved/.test(crashReason), crashReason);
+  check('異常終了の文面でも逃げ道(settings.json)を案内する',
+    /settings\.json/.test(crashReason), crashReason);
+}
+
+// credentials を読み取れなかっただけの状態を「壊れている」と同一視しない。中身が健全なまま
+// 手が届いていないだけ(ウイルス対策のロック・ACL の一時変更・EBUSY)のことがあり、そこで
+// 「失われる認証情報はない」と断言して /login を勧めると、まだ退避していないアカウントの
+// refreshToken がその場で消える(復旧はブラウザ OAuth のやり直し)。
+// ディレクトリを置いて EISDIR を作るのは、権限操作なしで移植性のある形で読み取り失敗を
+// 再現できるため(0 バイト・JSON 破損は「中身を見たうえで使えない」側なので別扱いのまま)。
+{
+  const home = sandbox('creds-unreadable', { rules: ORG });
+  fs.mkdirSync(path.join(home, '.claude', '.credentials.json'), { recursive: true });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:\\org-tree\\proj',
+    tool_name: 'Read', tool_input: { file_path: 'src/main.py' },
+  });
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('読み取れないだけの場合は拒否する', decision(res) === 'deny', JSON.stringify(res));
+  check('読み取れないだけの場合は「失われる認証情報はない」と断言しない',
+    !/失われる認証情報はない/.test(reason), reason);
+  check('読み取れない場合は控えを残す手を先に案内する',
+    /swap save <name> --force/.test(reason), reason);
+  check('読み取れない場合も /login で消えることを伝える',
+    /`\/login` すると/.test(reason), reason);
+  // 破損(0 バイト)の側は従来どおり「失うものは無い」と言い切ってよい。取り違えると
+  // 今度は行き止まり(打つ手が 1 つも無い状態)に戻るので、両方を並べて固定する。
+  const broken = sandbox('creds-empty', { rules: ORG, raw: '' });
+  const resBroken = run(broken, {
+    hook_event_name: 'PreToolUse', cwd: 'C:\\org-tree\\proj',
+    tool_name: 'Read', tool_input: { file_path: 'src/main.py' },
+  });
+  check('0 バイトの credentials は従来どおり「失うものは無い」と案内する',
+    /失われる認証情報はない/.test(resBroken?.hookSpecificOutput?.permissionDecisionReason || ''),
+    JSON.stringify(resBroken));
+}
+
 report();

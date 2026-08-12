@@ -862,8 +862,23 @@ console.log('swap');
   const r = runSwap(home, []);
   check('読めない控えを「上書きで退けた旧内容」に数えない',
     !/上書きで退けた旧内容/.test(r.out), r.out + r.err);
-  check('読めない控えは別項目で出す', /読めなかった credentials の控え: 1 件/.test(r.out), r.out);
-  check('復元に使えないことを伝える', /復元には使えません/.test(r.out), r.out);
+  check('読めない控えは別項目で出す', /復元に使えない控え: 1 件/.test(r.out), r.out);
+  check('復元に使えないことを伝える', /復元できません/.test(r.out), r.out);
+}
+{
+  // 壊れたスロットを上書きすると、その旧内容は UNREADABLE_BASE ではなくスロット名で
+  // .replaced に入る。名前だけで分類していた頃は「戻せる旧内容」に数えられ、案内どおり
+  // accounts/<name>.json へ戻した人が、直前に取った正しい退避を自分で潰していた。
+  const home = sandbox('status-replaced-broken-slot', {
+    current: creds('pro'),
+    accounts: { team: '{ broken' },
+  });
+  runSwap(home, ['save', 'team', '--force']); // 壊れた旧内容が team-1.json として退けられる
+  const r = runSwap(home, []);
+  check('壊れていた旧内容を「戻せる旧内容」に数えない',
+    !/上書きで退けた旧内容/.test(r.out), r.out + r.err);
+  check('壊れていた旧内容は復元に使えない側で数える',
+    /復元に使えない控え: 1 件/.test(r.out), r.out + r.err);
 }
 {
   const home = sandbox('bad-name', { current: creds('pro') });
@@ -1387,6 +1402,59 @@ console.log('swap');
   check('README手順: 最初のアカウントへ戻れる(exit 0)', back.code === 0, back.out + back.err);
   check('README手順: 戻った内容は最初のアカウントのもの',
     tokenOf(credPath(home)) === 'acct-A', back.out + back.err);
+}
+
+// 失効した退避への案内は、そのまま打てば通ること。--force を要求するガードは 4 つあるのに
+// 判定が planDiffers しか見ておらず、しかも「退避先が復元元と同じ名前」の判定がそれらより
+// 後ろにあったため、案内どおり打つと別の理由で二度目の中止に当たっていた。
+{
+  const home = sandbox('expired-guidance', {
+    current: creds('pro'),
+    accounts: { team: creds('team', { expiresInDays: -1 }) },
+    slot: 'team',
+  });
+  const r1 = runSwap(home, ['team']);
+  check('失効した退避への切り替えは中止する', r1.code === 1, r1.out + r1.err);
+  // 来歴が target を指している状態では、素の `--force` はこの後の「退避先が復元元と同じ
+  // 名前になります」で必ず中止される。別名での退避から案内しないと抜け出せない。
+  check('失効の案内は別名での退避から示す', /swap save <別名>/.test(r1.err), r1.out + r1.err);
+  const r2 = runSwap(home, ['save', 'other']);
+  check('案内どおり別名で退避できる', r2.code === 0, r2.out + r2.err);
+  const r3 = runSwap(home, ['team', '--force']);
+  check('案内どおり打てば切り替えられる(二度目の中止に当たらない)', r3.code === 0, r3.out + r3.err);
+}
+
+// 切り替えたあとの「元に戻すには」も同じ判定を通すこと。戻す先(直前に退避した現在の
+// ログイン)が失効している場合、planDiffers だけを見ていると --force が落ちて、案内どおり
+// 打つと「失効しています」で中止される。復元先の状態はプラン種別とは独立に効く。
+{
+  const home = sandbox('restore-back-expired', {
+    current: creds('pro', { expiresInDays: -1 }),
+    accounts: { pro: creds('pro', { expiresInDays: -1 }), team: creds('team') },
+    slot: 'pro',
+  });
+  const r = runSwap(home, ['team']);
+  check('プランが違えば --force なしで切り替えられる', r.code === 0, r.out + r.err);
+  check('戻し方の案内は失効を見て --force を付ける',
+    /元に戻すには: swap pro --force/.test(r.out), r.out + r.err);
+  const back = runSwap(home, ['pro', '--force']);
+  check('案内どおり打てば元に戻せる', back.code === 0, back.out + back.err);
+  check('戻った内容は元のアカウントのもの', typeOf(credPath(home)) === 'pro', back.out + back.err);
+}
+
+// 名前を省いた save が案内する --force コマンドに、そのまま打てない文字列を混ぜないこと。
+// `swap save <name> --force` を印字していた頃は、表示どおり打つと validateName が `<name>` を
+// 弾いて別のエラーで止まり、控えを残して先へ進む経路に到達できなかった。
+{
+  const home = sandbox('save-forcecmd-placeholder', { current: '{ broken' });
+  const r1 = runSwap(home, ['save']);
+  check('読めない現在の save は中止する', r1.code === 1, r1.out + r1.err);
+  check('案内する --force にプレースホルダを混ぜない', !/<name>/.test(r1.err), r1.err);
+  const r2 = runSwap(home, ['save', '--force']);
+  check('案内どおり打てば名前の検証で弾かれない',
+    !/使えない文字/.test(r2.err), r2.out + r2.err);
+  check('案内どおり打てば控えが残る', replacedFiles(home, '.unreadable-current').length === 1,
+    r2.out + r2.err);
 }
 
 report();
