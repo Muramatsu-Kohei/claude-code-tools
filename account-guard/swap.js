@@ -307,7 +307,7 @@ function replacedEntries(base) {
 // refreshToken の一致は「同じ資格情報」の証明なので、ここで真を返せた控えは、消しても
 // 復旧の手立てが減らないと言い切れる。
 function hasCopyElsewhere(token, selfFile) {
-  if (slotsHolding(token, null).length > 0) return true;
+  if (slotsHolding(token).length > 0) return true;
   const cur = readCredsOrNull(CREDENTIALS);
   if (cur && refreshTokenOf(cur.json) === token) return true;
   if (!fs.existsSync(REPLACED_DIR)) return false;
@@ -451,10 +451,13 @@ function currentSlotOf(cur) {
   return readCurrentSlot() || (cur && cur.json ? accountNameOf(cur.json) : null);
 }
 
-// 指定した refreshToken を持つ他スロットを探す。一致は「同じ資格情報」の証明なので、
+// 指定した refreshToken を持つスロットを探す。一致は「同じ資格情報」の証明なので、
 // 退避で押し出した旧内容の複製がどこに残っているかを正確に言える。
-function slotsHolding(token, exclude) {
-  return savedAccounts().filter(n => n !== exclude).filter(n => {
+// 除外する名前を受け取る引数は持たない。唯一の呼び出し元(hasCopyElsewhere)は常に全件を
+// 見る必要があり、除外を足すと「複製が他にある」の証人を取りこぼして、pruneReplaced が
+// 消してはいけない唯一の控えを落としうる。
+function slotsHolding(token) {
+  return savedAccounts().filter(n => {
     const c = readCredsOrNull(accountFile(n));
     return c && refreshTokenOf(c.json) === token;
   });
@@ -528,11 +531,16 @@ function failOverwrite(name, old, provenance, different) {
 // 控えを 1 本も残さないまま上書きする。冒頭で構造の保証だと書いた以上、経路は 1 つにしておく。
 // 控えを省いてよいのは「同じ資格情報」だと証明できるときだけ(読めない旧内容は証明できない
 // ので必ず退ける)。
-function writeSlot(name, cur) {
+// old は呼び出し元が既に同じファイルを読んでいる場合だけ渡す。ここで読み直すと、上書きの
+// 可否を判断した内容と実際に退ける内容が別物になりうる(その隙に別の swap が書き込むと、
+// 「同じ資格情報だから控えは要らない」と判断した直後に、別の中身を控えなしで潰す)。
+// 省略時は自分で読む。控えを取る条件の判断はこの関数の中だけに残し、呼び出し側の記憶には
+// 任せない(任せた結果、かつての別名スロット同期が控えを 1 本も残さず上書きしていた)。
+function writeSlot(name, cur, old) {
   const file = accountFile(name);
   if (fs.existsSync(file)) {
-    const old = readCredsOrNull(file);
-    if (!(old && sameCreds(cur.json, old.json))) keepAside(file, name);
+    const prev = old !== undefined ? old : readCredsOrNull(file);
+    if (!(prev && sameCreds(cur.json, prev.json))) keepAside(file, name);
   }
   writeAtomic(file, cur.raw);
 }
@@ -561,7 +569,9 @@ function saveInto(cur, name, forceOverwrite) {
   // 残っているかも、来歴が元は何を指していたかも分からなくなる)。
   const stale = staleSlots(cur, name, oldToken);
   const drifted = driftedProvenance(cur, name, prevSlot);
-  writeSlot(name, cur);
+  // 上で読んだ old をそのまま渡す。writeSlot に読み直させると、同じファイルを 1 回の退避で
+  // 二度読むうえ、identical(上書きの可否)と控えの要否が別々の読み込み結果で決まる。
+  writeSlot(name, cur, old);
   writeCurrentSlot(name);
   return { stale, drifted };
 }
