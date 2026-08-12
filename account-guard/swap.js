@@ -418,14 +418,18 @@ function keepAside(file, base) {
 // とおり accounts/<name>.json へ戻した利用者が、直前に取った正しい退避を自分で潰したうえで
 // 復元手段を失っていた(pruneReplaced は読めない控えを消さないので、この誤表示は自動でも
 // 消えない)。実際に読めるかどうかまで見て分ける。控えは高々数本なので読み直しは軽い。
+// 逆向きの取りこぼしのほうが重い。UNREADABLE_BASE は「読めなかった現在の credentials」の
+// つもりで付ける名前だが、readCredsOrNull が書き込み途中を掴んで失敗した直後に copyFileSync
+// が書き終わったファイルをコピーすると、中身は有効なまま残る。名前で unreadable に数えると、
+// 未退避アカウントの唯一の控えを「復元に使えない・消して構わない」と案内することになる。
 function replacedCounts() {
   if (!fs.existsSync(REPLACED_DIR)) return { overwritten: 0, unreadable: 0 };
   const files = fs.readdirSync(REPLACED_DIR).filter(f => f.endsWith('.json'));
   let overwritten = 0;
   let unreadable = 0;
   for (const f of files) {
-    if (f.startsWith(UNREADABLE_BASE + '-') || !readCredsOrNull(path.join(REPLACED_DIR, f))) unreadable++;
-    else overwritten++;
+    if (readCredsOrNull(path.join(REPLACED_DIR, f))) overwritten++;
+    else unreadable++;
   }
   return { overwritten, unreadable };
 }
@@ -447,6 +451,20 @@ function readCurrentSlot() {
 
 function writeCurrentSlot(name) {
   writeAtomic(CURRENT_FILE, name + '\n');
+}
+
+// 来歴を書けなかったときの後始末と案内。書き込みは 3 経路(退避・来歴の自己修復・切り替えの
+// 仕上げ)にあり、そのどれでも Windows では rename が EPERM で落ちうる。共通なのは
+// 「古い来歴を残すほうが危険」という判断で、残すと次の名前を省いた `swap save` が来歴一致と
+// みなして別アカウントのスロットを狙う。消せば「未記録」に落ち、currentSlotOf が
+// subscriptionType 由来の名前で代用するので、少なくとも他人のスロットは指さない。
+// 認証がその時点でどうなっているかは経路ごとに違うので、それは呼び出し側が書く。
+function dropCurrentSlot(e) {
+  try { fs.unlinkSync(CURRENT_FILE); } catch {}
+  return '来歴を記録できませんでした(' + (e.code || e.message) + ': ' + CURRENT_FILE + ')'
+    + '\n  このファイルを掴んでいるプロセスを終えるか、読み取り専用属性を外してください'
+    + '\n  以後の退避は `swap save <name>` と名前を明示してください'
+    + '(省くと別のスロットを上書きすることがあります)';
 }
 
 // 現在のログインをどのスロットへ退避するか。来歴を第一の手掛かりにし、まだ記録が無いときだけ
@@ -553,7 +571,18 @@ function writeSlot(name, cur, old) {
     const prev = old !== undefined ? old : readCredsOrNull(file);
     if (!(prev && sameCreds(cur.json, prev.json))) keepAside(file, name);
   }
-  writeAtomic(file, cur.raw);
+  // 控えは取れたのにスロットへ書けないことがある(退避先を他プロセスが開いていると
+  // rename が EPERM)。keepAside の copyFileSync と CREDENTIALS の書き込みには理由と対処を
+  // 添えてあるのに、ここだけ素通しで生の Node 例外になっていた。何が済んで何が済んで
+  // いないのかが読めないと、直せる原因に気づかないまま再実行を繰り返し、控えだけが積み上がる。
+  try {
+    writeAtomic(file, cur.raw);
+  } catch (e) {
+    fail('退避先へ書き込めませんでした(' + (e.code || e.message) + ')'
+      + '\n  ' + file + ' を書き換えられません。このファイルを掴んでいる別プロセス'
+      + '(ウイルス対策・バックアップツールなど)を終了するか、読み取り専用属性を外してください'
+      + '\n  退避は完了していません。現在のログインはそのままです');
+  }
 }
 
 // 退避の実体。読み込み済みの cur をそのまま書くのは、CREDENTIALS を二度読むと
@@ -583,7 +612,15 @@ function saveInto(cur, name, forceOverwrite) {
   // 上で読んだ old をそのまま渡す。writeSlot に読み直させると、同じファイルを 1 回の退避で
   // 二度読むうえ、identical(上書きの可否)と控えの要否が別々の読み込み結果で決まる。
   writeSlot(name, cur, old);
-  writeCurrentSlot(name);
+  // 退避そのものは済んでいる。来歴だけ書けずに生の例外で終わると、退避できたのかどうかが
+  // 読めず、やり直して同じスロットをもう一度上書きさせることになる。中止はするが(来歴の
+  // 無い状態で切り替えまで進めない)、何が済んだかは必ず伝える。
+  try {
+    writeCurrentSlot(name);
+  } catch (e) {
+    fail('退避は済みましたが、' + dropCurrentSlot(e)
+      + '\n  退避先: ' + accountFile(name));
+  }
   return { stale, drifted };
 }
 
@@ -793,10 +830,17 @@ function cmdSave(name, force) {
     // 理由は unreadableReason で改めて確認する(--force を挟む間にファイルの状態が変わって
     // いることもあるため、saveCurrent の中で見た理由を使い回さない)。
     const why = unreadableReason(CREDENTIALS);
+    // /login を勧めてよいのは「待っても直らない」と分かっているときだけ。書き込み途中を
+    // 読んだだけなら中身は健全で、数百ミリ秒後には読める。そこで /login をやり直させると、
+    // まだスロットへ退避していないアカウントの refreshToken をその時点で捨てさせることに
+    // なる(ガード側の案内も同じ理由で /login を最後に置いている)。
     fail('現在の credentials を読めないため、退避しませんでした(' + why.label + ')'
-      + (why.retryable ? '\n  時間をおいて再実行してください。' : '\n  ')
-      + '中身の控えは残しました: ' + saved.kept
-      + '\n  控えの中身を確認したうえで、`/login` してから `swap save` をやり直してください');
+      + '\n  中身の控えは残しました: ' + saved.kept
+      + (why.retryable
+        ? '\n  時間をおいて `swap save` をやり直してください'
+          + '\n  /login はまだ試さないでください(中身が健全なまま読めないだけのことが多く、'
+          + 'やり直すと未退避のアカウントには戻れなくなります)'
+        : '\n  控えの中身を確認したうえで、`/login` してから `swap save` をやり直してください'));
   }
   console.log('退避しました: ' + saved.name + ' -> ' + accountFile(saved.name));
   reportOtherSlots(saved, '  ', null);
@@ -847,8 +891,19 @@ function cmdSwap(target, force) {
   // 「失効しています」で中止し、来歴の自己修復まで飛ばしてしまう。来歴が古いまま残ると、
   // 次の `swap save` が別のスロットを狙って、そこにある唯一の退避を上書きしかねない。
   if (cur && sameCreds(cur.json, next.json)) {
-    if (readCurrentSlot() !== target) writeCurrentSlot(target);
+    // ここでの来歴書き込みは自己修復なので、失敗しても中止しない。認証は既に target と
+    // 同じで、何も壊れていない。中止すると「同じ内容でログイン済み」という結論のほうが
+    // 伝わらなくなる。
+    let noteError = null;
+    if (readCurrentSlot() !== target) {
+      try {
+        writeCurrentSlot(target);
+      } catch (e) {
+        noteError = dropCurrentSlot(e);
+      }
+    }
     console.log('すでに ' + target + ' と同じ内容でログインしています。認証は変更しませんでした');
+    if (noteError) console.log('  ' + noteError);
     return;
   }
 
@@ -1027,9 +1082,20 @@ function cmdSwap(target, force) {
         : '')
       + '\n  原因を取り除いてから、もう一度 `swap ' + target + (force ? ' --force' : '') + '` を実行してください');
   }
-  writeCurrentSlot(target);
+  // ここから先は差し替えが済んでいる = 認証はもう切り替わっている。来歴を書けなかった
+  // からといって中止すると、生の例外だけを見た利用者が「切り替わらなかった」と読んで
+  // やり直し、今度は新しいアカウントを旧スロットへ退避してしまう。切り替えの事実は必ず出す。
+  let currentNote = null;
+  try {
+    writeCurrentSlot(target);
+  } catch (e) {
+    currentNote = dropCurrentSlot(e);
+  }
   console.log('切り替え: ' + ((saved && saved.name) || 'なし') + ' -> ' + target + expiryNote(next.json));
   console.log('注意: この変更はマシン全体に即座に効きます。稼働中の別セッションも切り替わります');
+  if (currentNote) {
+    console.log('  切り替え自体は済んでいます。ただし' + currentNote);
+  }
 
   // 戻し方は毎回出す。復元先が「同じアカウントのプラン変更前の退避」だった場合(planDiffers は
   // それを別アカウントと区別できない)、切り替えた瞬間に全セッションが認証エラーになるが、

@@ -23,14 +23,24 @@ fs.rmSync(BASE, { recursive: true, force: true });
 // 切り出してある(詳しい経緯はそちらのコメント参照)。
 const { check, report } = makeHarness();
 
-// subscriptionType だけを持つ最小の credentials を置く。raw / rawRules に文字列を渡すと
+// 正常にログインしている状態の credentials を置く。raw / rawRules に文字列を渡すと
 // 壊れたファイルを再現でき、「読めないときに拒否側へ倒れるか」を試せる。
+//
+// accessToken まで入れるのは、これが「正常なログイン」を代表するサンドボックスだから。
+// subscriptionType だけを書いていた頃は、判別はできるのに復元には使えない中身という
+// 実運用では起きにくい状態を全テストの既定にしていた。ガードが健全性を見るようになると
+// この既定が「失うものは無い」側の分岐へ落ち、通常の切り替え案内を検証しているつもりの
+// テストが別の文面を見ることになる。accessToken を欠く状態は raw で明示的に作る。
 function sandbox(name, { subscriptionType, rules, raw, rawRules } = {}) {
   const home = path.join(BASE, name);
   fs.mkdirSync(path.join(home, '.claude', 'account-guard'), { recursive: true });
   const cred = path.join(home, '.claude', '.credentials.json');
   if (raw !== undefined) fs.writeFileSync(cred, raw, 'utf8');
-  else if (subscriptionType) fs.writeFileSync(cred, JSON.stringify({ claudeAiOauth: { subscriptionType } }), 'utf8');
+  else if (subscriptionType) {
+    fs.writeFileSync(cred, JSON.stringify({
+      claudeAiOauth: { subscriptionType, accessToken: 'test-access-token' },
+    }), 'utf8');
+  }
   if (rawRules !== undefined) fs.writeFileSync(configPath(home), rawRules, 'utf8');
   else if (rules) fs.writeFileSync(configPath(home), JSON.stringify({ rules }), 'utf8');
   return home;
@@ -152,15 +162,19 @@ console.log('account-guard');
   // これは Bash ツール呼び出しになる。cwd が保護ツリー内なら violation() の cwd 判定が
   // 先に当たるため、案内どおりに打つと同じコマンドがまた同じ理由で deny され、
   // 同じ案内を繰り返す堂々巡りになっていた(コマンド文字列をパースして swap を特別扱いする
-  // 例外は作らず、案内文で「ツリーの外で実行すること」を明示する方針で直す)。
+  // 例外は作らず、案内文でセッション外から実行することを明示する方針で直す)。
   const home = sandbox('deny-cwd-loop', { subscriptionType: 'pro', rules: ORG });
   const res = run(home, {
     hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read', tool_input: { file_path: 'src/main.py' },
   });
   check('cwd が保護ツリー内なら拒否する(堂々巡りテストの前提)', decision(res) === 'deny', JSON.stringify(res));
   const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
-  check('swap はツリーの外で実行するよう案内する(堂々巡りにしない)',
-    /ツリーの外に cd してから実行/.test(reason), reason);
+  check('swap は別のターミナルで実行するよう案内する(堂々巡りにしない)',
+    /別のターミナル/.test(reason), reason);
+  // 「ツリーの外に cd してから実行」と書いていた頃は、そのとおり打っても堂々巡りが続いた。
+  // 判定に使う cwd は PreToolUse 入力(= セッションの作業ディレクトリ)なので、コマンド内の
+  // cd は届かない。効かない手を勧めないことまで含めて回帰対象にする。
+  check('cd では抜けられないことまで書く', /`cd` しても判定は変わりません/.test(reason), reason);
 }
 {
   // 対照: cwd がツリーの外で、引数のパスだけがツリー内を指す場合は、案内した swap は
@@ -173,8 +187,8 @@ console.log('account-guard');
   });
   check('cwd がツリー外なら拒否する(対照テストの前提)', decision(res) === 'deny', JSON.stringify(res));
   const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
-  check('cwd がツリー外なら swap の cd 注意書きは出さない',
-    !/ツリーの外に cd してから実行/.test(reason), reason);
+  check('cwd がツリー外なら swap の cwd 注意書きは出さない',
+    !/別のターミナル/.test(reason) && !/配下のままだと/.test(reason), reason);
   // swap は同梱の別ツールで、PATH に置く手動セットアップが要る。ガードだけを入れた構成では
   // 案内どおり打っても「'swap' は認識されていません」で終わり、文面は /login を抑止して
   // いるので実行できる手が 1 つも残らない。逃げ道まで書いてあることを確かめる。
@@ -192,10 +206,10 @@ console.log('account-guard');
   });
   check('別ツリーの対象を触っても拒否する(前提)', decision(res) === 'deny', JSON.stringify(res));
   const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
-  check('cwd が別の保護ツリー内なら cd 注記を出す', /ツリーの外に cd してから実行/.test(reason), reason);
+  check('cwd が別の保護ツリー内なら cwd 注記を出す', /別のターミナル/.test(reason), reason);
   // 注記が指すのは「今いるツリー」であって、当たったルールのツリーではない。取り違えると
-  // 案内どおり cd しても同じ場所に留まることになる。
-  check('cd 注記は cwd 側のツリーを指す', /D:[\\/]org-tree 配下のままだと/.test(reason), reason);
+  // どのツリーから出れば実行できるのかが伝わらない。
+  check('cwd 注記は cwd 側のツリーを指す', /D:[\\/]org-tree 配下のままだと/.test(reason), reason);
 }
 {
   // JSON としては妥当だが accessToken を欠く credentials。ガードが JSON.parse の成否だけを
@@ -215,6 +229,26 @@ console.log('account-guard');
     /^\s*\/login\s+…/m.test(reason), reason);
   check('accessToken 欠落では現在が生きている前提の警告を出さない',
     !/先に `\/login` すると/.test(reason), reason);
+}
+{
+  // アカウントは判別できる(subscriptionType が読める)が accessToken を欠く credentials。
+  // 以前はアカウントを判別できる場合だけ健全性判定を素通りして汎用文に落ちており、案内された
+  // swap save / swap は swap 側の accessToken 必須判定に弾かれて必ず失敗していた
+  // (denyMessage の state 判定は account では門番しない、というコメントの回帰確認)。
+  const home = sandbox('deny-accesstoken-known-account', { rules: ORG });
+  fs.writeFileSync(path.join(home, '.claude', '.credentials.json'),
+    '{"claudeAiOauth":{"subscriptionType":"pro"}}', 'utf8');
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read', tool_input: {},
+  });
+  check('アカウントを判別できても accessToken 欠落は拒否する', decision(res) === 'deny', JSON.stringify(res));
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('アカウントが判別できる場合も健全性判定を素通りしない(汎用文に落ちない)',
+    /現在ログイン中のアカウントは "pro"/.test(reason), reason);
+  check('この状態で失われる認証情報はないと伝える(通常の切り替え手順ではない)',
+    /失われる認証情報はない/.test(reason), reason);
+  check('案内する復元コマンドに --force が付いている(swap 側の accessToken 必須判定と噛み合う)',
+    /swap <name> --force/.test(reason), reason);
 }
 {
   // allow を書き損じたルールで保護が外れないこと。
@@ -1046,6 +1080,14 @@ console.log('account-guard');
     /swap save <name> --force/.test(reason), reason);
   check('読み取れない場合も /login で消えることを伝える',
     /`\/login` すると/.test(reason), reason);
+  // 2 手目の `swap <name>` にも --force が要る。CREDENTIALS 自体は読めないままなので、
+  // 付けずに案内すると swap 側の同じ判定で必ず中止され、案内どおり打つと止まる。
+  check('2 手目の swap にも --force が付いている(付いていないと swap 側が必ず中止する)',
+    reason.includes('swap <name> --force'), reason);
+  // 権限で読めない場合は swap のどの経路も控えを取れずに止まる。手で控えを取る逃げ道を
+  // 示さないと、案内どおり打った先が行き止まりになる。
+  check('「どちらも控えを取れませんでした」で止まる場合の逃げ道(手で別名コピーして /login)を案内する',
+    /どちらも「控えを取れませんでした」で止まるなら/.test(reason) && /手で別名コピーして/.test(reason), reason);
   // 破損(0 バイト)の側は従来どおり「失うものは無い」と言い切ってよい。取り違えると
   // 今度は行き止まり(打つ手が 1 つも無い状態)に戻るので、両方を並べて固定する。
   const broken = sandbox('creds-empty', { rules: ORG, raw: '' });

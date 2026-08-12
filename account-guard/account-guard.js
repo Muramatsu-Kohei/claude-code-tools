@@ -472,12 +472,18 @@ function credentialsState() {
 // (/login はスラッシュコマンドでフックを通らないため影響を受けない)。cwd の内外は
 // violation() が既に判定しているので、その結果をそのまま案内に使う
 // (コマンド文字列を見て swap を特別扱いする例外は作らない。パースは容易に迂回できるため)。
+// 逃げ道として `cd` を案内しないのは、コマンド文字列の中の cd がフックの判定に効かないため。
+// violation() が見るのは PreToolUse 入力の cwd(= セッションの作業ディレクトリ)なので、
+// `cd ~ && swap team` と書いても同じ deny が返る。セッション内から抜ける手は無く、ここを
+// 「cd してから実行」と書いていた頃は、Claude が何度打ち直しても同じ拒否に当たり続けた。
 function swapCwdNote(hit) {
   if (!hit.cwdTree) return [];
   return [
     '',
     `swap は Bash 経由の呼び出しのため、作業ディレクトリが ${hit.cwdTree} 配下のままだと同じ理由で`,
-    '拒否されます。ホームディレクトリなど、このツリーの外に cd してから実行してください。',
+    '拒否されます。コマンドの中で `cd` しても判定は変わりません(セッションの作業ディレクトリで',
+    '判定するため)。このセッションからは実行できないので、ツリーの外で開いた別のターミナルで',
+    '打つよう、ユーザーに依頼してください。',
   ];
 }
 
@@ -545,8 +551,10 @@ function denyMessage(hit, account) {
   // このとき swap だけを案内すると打つ手が 1 つも残らない: `swap save <name>` は
   // 「現在 credentials がありません」で、退避が 1 つも無ければ `swap <name>` も
   // 「退避されていません」で、どちらも必ず失敗する。/login を抑止したまま行き止まりになる。
+  // ここも account では門番しない(下の state と同じ理由)。打つ手を決めるのは
+  // 「失って困る認証情報が現にあるか」で、ファイルが無ければアカウントの判別結果によらない。
   const loggedOut = !!credentials && !fs.existsSync(credentials.CREDENTIALS);
-  if (account === ACCOUNT_UNKNOWN && loggedOut) {
+  if (loggedOut) {
     // ファイルが無い場合、swap は「現在なし」として素直に復元へ進むので --force は要らない。
     return noCredentialsAtStakeMessage(head, 'ログインしていません(認証情報のファイルがありません)。', hit, false);
   }
@@ -560,10 +568,16 @@ function denyMessage(hit, account) {
   // 「読めなかった」をこちらに混ぜないのが要点(credentialsState のコメント)。読めない
   // だけで中身が健全な場合まで「失われる認証情報はない」と断言すると、まだ退避していない
   // アカウントに /login させて refreshToken を消すことになる。
+  //
+  // 判定を account === ACCOUNT_UNKNOWN で門番しないのは、subscriptionType だけ読めて
+  // accessToken が無い中身(書き込み途中が典型)では account が "pro" などに判別でき、
+  // 門番があると下の汎用文へ落ちるため。汎用文が案内する swap save / swap は swap 側の
+  // hasUsableCredentials に弾かれて必ず止まり、ガードと swap で基準がずれた袋小路に戻る。
+  // 打つ手を決めるのは「中身が使えるか」であって「どのアカウントか」ではない。
   const state = !loggedOut && !!credentials && fs.existsSync(credentials.CREDENTIALS)
     ? credentialsState()
     : null;
-  if (account === ACCOUNT_UNKNOWN && state === 'unusable') {
+  if (state === 'unusable') {
     return noCredentialsAtStakeMessage(
       head, '認証情報のファイルはありますが、復元に使える中身ではありません(accessToken がありません)。', hit, true
     );
@@ -572,7 +586,7 @@ function denyMessage(hit, account) {
   // 読み取り自体に失敗した。中身が健全なまま手が届かないだけかもしれないので、
   // 「失うものは無い」とは言わない。/login を最後の手段として残しつつ、まず控えを
   // 取れる swap を先に案内する(swap 側は読めない現在も .replaced へ控えてから進む)。
-  if (account === ACCOUNT_UNKNOWN && state === 'unreadable') {
+  if (state === 'unreadable') {
     return head.concat([
       '認証情報のファイルを読み取れませんでした(権限・他プロセスによるロック・書き込みの途中など)。',
       '中身が健全なまま読めないだけの可能性があるため、失われるものが無いとは判断できません。',
@@ -581,7 +595,16 @@ function denyMessage(hit, account) {
       '別セッション)を終えてから、もう一度実行してください。それで読めるようになることがあります。',
       '読めないままでも切り替えるなら、次の順で打ってください。',
       '  swap save <name> --force … 読めない現在の控えを残したうえで退避を試みる',
-      '  swap <name>              … 退避済みの別アカウントへ切り替える(`swap` で一覧を確認できます)',
+      // 2 手目にも --force が要る。控えを取っても CREDENTIALS 自体は読めないままなので、
+      // 付けずに案内すると swap 側の同じ判定で必ず中止され、案内どおり打つと止まる。
+      '  swap <name> --force      … 退避済みの別アカウントへ切り替える(`swap` で一覧を確認できます)',
+      // 控えは copyFileSync で取るので、ファイルに手が届かない種類の「読めない」では
+      // どちらの手も「控えを取れませんでした」で止まる。swap は控えを取れない限り上書き
+      // しない設計なので、その場合は swap で進む道が無い。手で控えを取る逃げ道まで書く。
+      'どちらも「控えを取れませんでした」で止まるなら、ファイルに手が届いていません',
+      '(権限・読み取り専用属性・掴んだままのプロセス)。この場合 swap では進めないので、',
+      `${credentials ? credentials.CREDENTIALS : '認証情報のファイル'} を手で別名コピーして`,
+      '控えを取ってから、ユーザーに `/login` を依頼してください。',
       '先に `/login` すると、まだ退避していないアカウントの認証情報はその時点で消えます',
       '(このファイルが健全だった場合、復旧はブラウザ OAuth のやり直しになります)。',
       ...swapCwdNote(hit),

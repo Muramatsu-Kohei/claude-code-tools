@@ -896,6 +896,21 @@ console.log('swap');
     /復元に使えない控え: 1 件/.test(r.out), r.out + r.err);
 }
 {
+  // replacedCounts(swap.js:421 付近)の分類はファイル名ではなく中身が読めるかどうかで決まる。
+  // UNREADABLE_BASE の名前を持つファイルでも、中身が有効な credentials なら「復元に使えない」
+  // には数えない。この控えが未退避アカウントの唯一のバックアップであることがあり、
+  // 「復元に使えません、消して構いません」と案内すると refreshToken を失わせる。
+  const home = sandbox('replaced-counts-by-content', { current: creds('pro') });
+  fs.mkdirSync(replacedDir(home), { recursive: true });
+  fs.writeFileSync(path.join(replacedDir(home), '.unreadable-current-1.json'),
+    JSON.stringify(creds('pro', { token: 'still-live' })), 'utf8');
+  const r = runSwap(home, []);
+  check('中身が読める控えは UNREADABLE_BASE の名前でも「復元に使えない」に数えない',
+    !/復元に使えない控え/.test(r.out), r.out + r.err);
+  check('中身が読める控えは「上書きで退けた旧内容」に数える',
+    /上書きで退けた旧内容: 1 件/.test(r.out), r.out + r.err);
+}
+{
   const home = sandbox('bad-name', { current: creds('pro') });
   const r = runSwap(home, ['../evil']);
   check('パス区切りを含む名前は拒否する(ファイル名になるため)', r.code === 1, r.out + r.err);
@@ -1354,6 +1369,37 @@ console.log('swap');
     /\/login/.test(r.out + r.err) || /swap /.test(r.out + r.err), r.out + r.err);
 }
 {
+  // cmdSave(degraded 案内、swap.js:790 付近): 「待てば直る」壊れ方(JSON として壊れている
+  // = 書き込み途中を読んだ状態。unreadableReason が retryable: true を返す)では、中身は
+  // 健全なまま数百ミリ秒後には読めることが多い。そこで /login を勧めると、まだ退避していない
+  // アカウントの refreshToken をその場で消してしまうため、/login には触れず「時間をおいて」
+  // やり直す案内だけを出す。
+  const home = sandbox('save-degraded-retryable', { current: '{ broken' });
+  const r = runSwap(home, ['save', '--force']);
+  check('待てば直る壊れ方では成功終了しない', r.code !== 0, r.out + r.err);
+  // 「/login はまだ試さないでください」という抑止の一文自体には /login が出るので、
+  // 見るのは「/login してから」という勧める言い回しが無いことに絞る
+  check('待てば直る壊れ方では /login を勧めない', !/`\/login` してから/.test(r.out + r.err), r.out + r.err);
+  check('待てば直る壊れ方では /login をまだ試すなと明示する',
+    /\/login はまだ試さないでください/.test(r.out + r.err), r.out + r.err);
+  check('待てば直る壊れ方では時間をおいてやり直す案内を出す',
+    /時間をおいて `swap save` をやり直してください/.test(r.out + r.err), r.out + r.err);
+}
+{
+  // 対照: 待っても直らない壊れ方(JSON としては妥当だが accessToken が無い。手で編集した・
+  // 将来の構造変更を想定)では retryable: false になり、従来どおり控えの中身を確認したうえで
+  // /login する案内を出す。
+  const home = sandbox('save-degraded-not-retryable', {
+    current: { claudeAiOauth: { subscriptionType: 'pro' } },
+  });
+  const r = runSwap(home, ['save', '--force']);
+  check('待っても直らない壊れ方では成功終了しない', r.code !== 0, r.out + r.err);
+  check('待っても直らない壊れ方では /login を勧める',
+    /`\/login` してから/.test(r.out + r.err), r.out + r.err);
+  check('待っても直らない壊れ方では時間をおいての案内は出さない',
+    !/時間をおいて/.test(r.out + r.err), r.out + r.err);
+}
+{
   // keepAside(控えのコピー失敗): fs.copyFileSync 自体が失敗すると、以前は生の Node 例外
   // (EPERM 等)がそのまま main の catch を通って出て、案内された --force が行き止まりになって
   // いた。ディレクトリを退避先に置いて確実に EPERM を再現する(実機では権限や別プロセスの
@@ -1373,6 +1419,28 @@ console.log('swap');
   // 残っていないことを確認する。
   check('控えのコピー失敗で部分ファイルの残骸を残さない',
     replacedFiles(home, 'personal').length === 0, replacedFiles(home, 'personal').join(','));
+}
+{
+  // cmdSwap 末尾(writeCurrentSlot(target) を包む try/catch): credentials の差し替えは成功した
+  // あと、来歴(.current)の書き込みだけが失敗する状況。CURRENT_FILE をディレクトリにしておくと
+  // writeAtomic の rename が失敗する。以前は生の Node 例外だけを出して exit 1 だったため、
+  // 実際には切り替わっているのに「切り替わっていない」と読め、やり直すと新しいアカウントを
+  // 旧スロットへ退避してしまっていた。
+  // current を指定しない(未ログイン)のは、ログイン中だと saveCurrent が現在のアカウントを
+  // 退避する過程でも writeCurrentSlot を呼ぶため、cmdSwap 末尾のガードより前の、保護されて
+  // いない呼び出しで同じ EPERM に当たってしまい、確かめたい経路(末尾のガード)に届かないため。
+  const home = sandbox('current-write-fails', {
+    accounts: { team: creds('team', { token: 'team-tok' }) },
+  });
+  fs.mkdirSync(slotPath(home), { recursive: true }); // .current をディレクトリにして rename を失敗させる
+  const r = runSwap(home, ['team']);
+  check('来歴の書き込みが失敗しても切り替え自体は成功終了する', r.code === 0, r.out + r.err);
+  check('切り替えたことを伝える(実際には切り替わっているので失敗したとは読ませない)',
+    /切り替え:/.test(r.out), r.out + r.err);
+  check('来歴を記録できなかった旨と、次は名前を明示する案内を出す',
+    /来歴を記録できませんでした/.test(r.out) && /swap save <name>/.test(r.out), r.out + r.err);
+  check('credentials の差し替え自体は実際に成功している',
+    tokenOf(credPath(home)) === 'team-tok', r.out + r.err);
 }
 {
   // saveInto の上書きガード(cmdSwap の「来歴は一致するが中身が違う」経路): 来歴が一致していても
