@@ -706,6 +706,21 @@ function main() {
       console.log('  未ログインではなく、判別する手段が無い状態です。`/login` では直りません。');
       console.log('  account-guard.js の隣に credentials.js を置いてください。');
     }
+    // HOME が解決できないときの CONFIG はダミーの相対パスで、実在しない。共通の書式に
+    // 任せると「未作成 — 保護は無効」と出るが、実態は逆でこの状態は全操作を拒否している。
+    // しかも「設定ファイル自身の編集以外は拒否」と案内しても、実在しないパスでは
+    // isConfigRepair が成立しないので、そのファイルを直しても何も通らない。status は
+    // 「全部拒否される」原因を調べに来る入り口なので、ここで行き止まりに入れてしまうと、
+    // ガードを外す方向の回避しか残らない。逃げ道は homeUnresolvedMessage() と揃える。
+    if (config.homeUnresolved) {
+      console.log('設定: ホームディレクトリを特定できないため、場所を決められません');
+      console.log('  (USERPROFILE / HOME / os.homedir() のいずれも使える値を返していません)');
+      console.log('保護は無効ではありません — この状態ではすべての操作を拒否しています(安全側)。');
+      console.log('  USERPROFILE または HOME に実在するホームディレクトリを設定すれば直ります。');
+      console.log('  直せない場合は .claude/settings.json から account-guard のフック登録を'
+        + '外してください(保護は外れるので、直したあとに戻してください)。');
+      return;
+    }
     console.log(`設定: ${CONFIG}${fs.existsSync(CONFIG) ? '' : ' (未作成 — 保護は無効)'}`);
     if (config.broken) {
       console.log('設定を読めません — 修復するまで、設定ファイル自身の編集以外は拒否します。');

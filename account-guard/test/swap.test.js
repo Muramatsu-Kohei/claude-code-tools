@@ -1206,6 +1206,30 @@ console.log('swap');
     /復元できない名前の退避があります: save/.test(r.out), r.out + r.err);
   check('改名という実際に効く対処を出す', /改名してください/.test(r.out), r.out);
 }
+{
+  // RESERVED_ONLY_NAMES(warmup)は DISPATCHED_NAMES と違い main() がまだ横取りしていないので、
+  // 今のところ `swap warmup` で普通に復元できる。この違いを同じ「復元できません」で扱うと、
+  // 復元できるバックアップに対して不要な改名や、より危険な /login のやり直しへ誘導する
+  // (swap.js の RESERVED_ONLY_NAMES 周辺コメント参照)。validateName は warmup を新規スロット名
+  // として弾くので、accounts/warmup.json は sandbox() で直接ファイルとして置く(save 経由では作れない)。
+  const home = sandbox('reserved-only-name-warmup', {
+    current: creds('pro', { token: 'pro-tok' }),
+    accounts: { warmup: creds('team', { token: 'warmup-tok' }) },
+  });
+  const r = runSwap(home, []);
+  check('まだ復元できる warmup を「復元できない名前」とは言わない(事実と違う)',
+    !/復元できない名前の退避があります/.test(r.out), r.out + r.err);
+  check('代わりに「いずれ復元できなくなる」と案内する',
+    /いずれ復元できなくなる名前の退避があります: warmup/.test(r.out), r.out);
+  check('実装された時点で復元できなくなるといういまのうちの改名を促す',
+    /実装された時点で復元できなくなる/.test(r.out) && /いまのうちに改名してください/.test(r.out), r.out);
+
+  // 警告が事実と食い違わないことの裏取り。実際に `swap warmup` を実行すると復元できることを見る
+  // (別プランなので --force なしで通る。他のテストの basic 経路と同じ組み合わせ)。
+  const restored = runSwap(home, ['warmup']);
+  check('実際に `swap warmup` を実行すると復元できる',
+    restored.code === 0 && tokenOf(credPath(home)) === 'warmup-tok', restored.out + restored.err);
+}
 
 // --- 中止の不変条件 ---
 // swap.js の中止経路それぞれについて、「実行前スナップショットを取る → 中止させる →

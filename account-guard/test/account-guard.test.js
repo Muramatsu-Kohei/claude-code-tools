@@ -1007,6 +1007,21 @@ console.log('account-guard');
   check('逃げ道は拒否メッセージにも書いてある(書かないと気づけない)',
     /settings\.json/.test(res2?.hookSpecificOutput?.permissionDecisionReason || ''),
     JSON.stringify(res2));
+
+  // status も同じ状態を「保護は無効」と言わない。「全部拒否される」原因を調べに来る唯一の
+  // 入り口がここで、実態と逆の情報(保護が効いていない)を出したうえに実在しないダミーパスの
+  // config.json を直せと案内すると、行き止まりに入ってガードを外す方向の回避しか残らなくなる
+  // (main() の status 分岐は homeUnresolved を通常の「未作成 — 保護は無効」表示とは別扱いに
+  // している。ここはその回帰テスト)。
+  const statusOut2 = execGuardScript(RUNNER2, { argv: ['status'], cwd: home2, env: env2 });
+  check('status は HOME 未解決を通常の「未作成 — 保護は無効」の文言では言わない(事実と逆になる)',
+    !/未作成 — 保護は無効/.test(statusOut2), statusOut2);
+  check('status はすべての操作を拒否している旨を明言する',
+    /保護は無効ではありません/.test(statusOut2) && /すべての操作を拒否しています/.test(statusOut2),
+    statusOut2);
+  check('status でも settings.json からフック登録を外す逃げ道を案内する',
+    /settings\.json/.test(statusOut2) && /フック登録を[\s\S]*外してください/.test(statusOut2),
+    statusOut2);
 }
 
 // HOME 未解決とガード自身の異常終了が重なった場合。main() 側には settings.json の逃げ道が

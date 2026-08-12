@@ -117,12 +117,19 @@ const NAME_RE = /^[a-zA-Z0-9_-]+$/;
 // サブコマンドと同じ名前のスロットは作らせない。main() は第一引数を必ずサブコマンドとして
 // 読むので、`accounts/save.json` を作れてしまうと `swap save` は復元ではなく退避に走り、
 // そのスロットを復元する引数の形が存在しなくなる(手でファイルを動かすしかない行き止まり)。
+// main() が実際にサブコマンドとして横取りする名前。この名前のスロットは既に復元できない。
+const DISPATCHED_NAMES = new Set(['save', 'help', '-h', '--help']);
 // warmup はまだ実装していないが、docs/account-separation.md §6.3 で仕様確定済みの
 // サブコマンド(両アカウントの窓を開ける)。実装前にスロット名として取られると、実装した
 // 瞬間に `swap warmup` がそのスロットの復元ではなくサブコマンドとして解釈され、復元する
 // 引数の形が失われる(save で実際に起きたのと同じ袋小路)。予約は 1 語ぶんの自由と引き換えに
 // それを塞ぐので、実装を待たずにここへ入れておく。
-const RESERVED_NAMES = new Set(['save', 'help', '-h', '--help', 'warmup']);
+// ただし「新しく作らせない」ことと「既にあるスロットを復元できない」ことは別。予約しただけの
+// 名前は main() が横取りしないので、今は `swap warmup` で普通に復元できる。両者を同じ集合で
+// 判定していたため、status が復元できるスロットを「復元できません」と警告し、不要な改名や、
+// より危険な /login のやり直しへ誘導していた。実装するときはこの名前を上へ移すだけでよい。
+const RESERVED_ONLY_NAMES = new Set(['warmup']);
+const RESERVED_NAMES = new Set([...DISPATCHED_NAMES, ...RESERVED_ONLY_NAMES]);
 const DAY_MS = 86400000;
 
 function fail(msg) {
@@ -761,7 +768,8 @@ function cmdStatus() {
   // 使い回す(前は判定と表示で別々に全スロットを読んでいた)。
   const savedCreds = new Map(saved.map(n => [n, readCredsOrNull(accountFile(n))]));
   const outdated = outdatedSlots(cur, curSlot, savedCreds);
-  const unreachable = saved.filter(n => RESERVED_NAMES.has(n));
+  const unreachable = saved.filter(n => DISPATCHED_NAMES.has(n));
+  const reservedOnly = saved.filter(n => RESERVED_ONLY_NAMES.has(n));
   console.log('\n退避済み (' + ACCOUNTS_DIR + '):');
   if (saved.length === 0) {
     console.log('  なし。`swap save` で現在のアカウントを退避してください');
@@ -791,6 +799,13 @@ function cmdStatus() {
     console.log('\n復元できない名前の退避があります: ' + unreachable.join(', '));
     console.log('  swap のサブコマンドと同じ名前なので `swap <name>` で復元できません。'
       + 'accounts/<name>.json を別の名前へ改名してください');
+  }
+  if (reservedOnly.length > 0) {
+    // まだ横取りされていないので復元はできる。「できない」と書くと嘘になるが、黙っていると
+    // 実装した日に突然復元できなくなるので、猶予があるうちに改名を勧める。
+    console.log('\nいずれ復元できなくなる名前の退避があります: ' + reservedOnly.join(', '));
+    console.log('  今は `swap <name>` で復元できますが、将来のサブコマンド用に予約済みの'
+      + '名前です。実装された時点で復元できなくなるので、いまのうちに改名してください');
   }
   const replaced = replacedCounts();
   if (replaced.overwritten > 0) {
