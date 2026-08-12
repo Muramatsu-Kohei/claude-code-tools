@@ -1740,4 +1740,51 @@ console.log('swap');
   check('復元できないスロットを作らない', !fs.existsSync(acctPath(home, 'save')), r.out + r.err);
 }
 
+{
+  // 復元先スロットの読み取り失敗を「壊れている」と決め打ちしていた頃は、ウイルス対策や
+  // バックアップツールが一時的に掴んでいるだけのときにも `/login` し直す案内を出していた。
+  // そのとおり打つと、まだ退避していない現在のアカウントの refreshToken がそこで消える
+  // (現在の credentials 側では既に避けている経路)。ディレクトリを置いて EISDIR で再現する。
+  const home = sandbox('restore-target-unreadable', { current: creds('pro', { token: 'now' }) });
+  fs.mkdirSync(acctPath(home, 'team'), { recursive: true });
+  const r = runSwap(home, ['team']);
+  check('読めない復元先では上書きしない', r.code !== 0, r.out + r.err);
+  check('読み取り失敗を「壊れている」と断定しない', !/壊れているか/.test(r.err), r.out + r.err);
+  check('読めない理由を添える', /EISDIR/.test(r.err), r.out + r.err);
+  check('読めないだけの復元先で /login を勧めない',
+    !/`\/login` し直して/.test(r.err), r.out + r.err);
+  check('現在のログインはそのまま', tokenOf(credPath(home)) === 'now', r.out + r.err);
+}
+
+{
+  // 対照: JSON としては読めるのに accessToken が無い復元先は、待っても直らない(手で編集した・
+  // 別バージョンが書いた・将来の構造変更)。従来どおり入れ直しを案内してよい。
+  const home = sandbox('restore-target-no-token', {
+    current: creds('pro', { token: 'now' }),
+    accounts: { team: { claudeAiOauth: { subscriptionType: 'team' } } },
+  });
+  const r = runSwap(home, ['team']);
+  check('待っても直らない復元先では入れ直しを案内する',
+    /`\/login` し直して/.test(r.err), r.out + r.err);
+}
+
+{
+  // 読めない現在の控えは pruneReplaced の対象外(復旧に使えないことを証明できないので消さない)
+  // なので、壊れた credentials を抱えたまま --force を繰り返すと上限の効かないまま増え続けて
+  // いた。同じバイト列なら同じ中身の控えなので、新しい番号を作らない。
+  const home = sandbox('unreadable-keepaside-dedup', { current: '{ broken' });
+  runSwap(home, ['save', '--force']);
+  runSwap(home, ['save', '--force']);
+  runSwap(home, ['save', '--force']);
+  check('同じ中身の控えは増やさない',
+    replacedFiles(home, '.unreadable-current').length === 1,
+    replacedFiles(home, '.unreadable-current').join(', '));
+  // 中身が変われば別の控えとして残す(取りこぼしを作らない)
+  fs.writeFileSync(credPath(home), '{ broken differently', 'utf8');
+  runSwap(home, ['save', '--force']);
+  check('中身が変われば控えを増やす',
+    replacedFiles(home, '.unreadable-current').length === 2,
+    replacedFiles(home, '.unreadable-current').join(', '));
+}
+
 report();

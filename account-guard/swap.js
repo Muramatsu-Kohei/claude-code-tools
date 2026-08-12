@@ -432,6 +432,27 @@ function pruneReplaced(base, protect) {
   }
 }
 
+// file と同じバイト列を持つ既存の控えを探す。比較を JSON ではなくバイト列で行うのは、
+// 読めない中身(まさに控えを取る理由)でも「同じものか」だけは判断できるため。
+// 読めない場合は比較を諦めて null を返す(新しい控えを作る側に倒す。控えが 1 本増えるのは、
+// 唯一の 1 本を取り違えて消すことに比べれば何でもない)。
+function sameContentEntry(file, list) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file);
+  } catch {
+    return null;
+  }
+  for (const e of list) {
+    try {
+      if (fs.readFileSync(e.file).equals(raw)) return e.file;
+    } catch {
+      // この控えとは比較できなかっただけ。他の控えの判定は続ける
+    }
+  }
+  return null;
+}
+
 // 上書きで失われる内容の控えを取る。移動ではなく複製なのは、控えを作る途中で落ちても
 // 元のファイルが手つかずで残るようにするため。控えが取れなければ上書きへは進まない
 // (切り替えられないのは後から取り返せるが、消えた資格情報は取り返せない)。
@@ -454,6 +475,13 @@ function keepAside(file, base) {
   // (控えを残すための処理そのものが別の控えを消す)。読めなければ進まない。
   const { list, error } = replacedEntries(base);
   if (error) replacedFail('数えられませんでした', { code: error });
+  // 既に同じバイト列の控えがあるなら、それがこの中身の控えそのものなので新しく作らない。
+  // pruneReplaced は読めない控えを消さない(復旧に使えないことを証明できないため)ので、
+  // 壊れた credentials を抱えたまま --force を繰り返すと .unreadable-current-N.json が
+  // 上限の効かないまま増え続け、status の「復元に使えない控え」も膨らんでいた。同じ中身を
+  // 数えないだけなので、残っている情報は 1 本も減らない。
+  const twin = sameContentEntry(file, list);
+  if (twin) return twin;
   const n = list.length ? list[list.length - 1].n + 1 : 1;
   const dest = path.join(REPLACED_DIR, base + '-' + n + '.json');
   try {
@@ -995,10 +1023,19 @@ function cmdSwap(target, force) {
     next = readCreds(file);
   } catch {
     // 例外メッセージは出さない。JSON.parse の失敗文はファイル先頭を引用するため、
-    // credentials が相手だとトークンの断片が端末やログに残る
-    fail(target + ' の内容が壊れているか、想定した形式ではありません。上書きを中止しました'
+    // credentials が相手だとトークンの断片が端末やログに残る。
+    // 理由は unreadableReason で切り分ける。ここを「壊れている」と決め打ちして /login を
+    // 案内していた頃は、ウイルス対策やバックアップツールが一時的にスロットを掴んでいるだけの
+    // ときにも同じ案内を出しており、そのとおり打つと、まだ退避していない現在のアカウントの
+    // refreshToken が /login で消えていた(現在の credentials 側では既に避けている経路)。
+    const why = unreadableReason(file);
+    fail(target + ' を復元できません(' + why.label + ')。上書きを中止しました'
       + '\n  ファイル: ' + file
-      + '\n  そのアカウントで `/login` し直してから `swap save ' + target + ' --force` で入れ直してください'
+      + (why.retryable
+        ? '\n  時間をおいて同じコマンドをやり直してください'
+          + '\n  /login はまだ試さないでください(中身が健全なまま読めないだけのことが多く、'
+          + 'やり直すと未退避のアカウントには戻れなくなります)'
+        : '\n  そのアカウントで `/login` し直してから `swap save ' + target + ' --force` で入れ直してください')
       + '\n  上書きで失われた旧内容の控えが残っていれば ' + REPLACED_DIR + ' から戻せることがあります');
   }
 

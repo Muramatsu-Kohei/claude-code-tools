@@ -56,6 +56,16 @@ function hasUsableCredentials(json) {
   return Boolean(json && json.claudeAiOauth && json.claudeAiOauth.accessToken);
 }
 
+// 「上書きしたら失って困るものが残っているか」。復元に使えるか(hasUsableCredentials)とは
+// 別の問いなので判定も分ける。accessToken が無くても refreshToken が残っていれば、それは
+// 交換すればまた使える資格情報で、/login で上書きすれば復旧はブラウザ OAuth のやり直しになる。
+// 2 つを同じ判定で済ませていた頃は、ガードが「この状態で失われる認証情報はない」と断言して
+// /login を勧めており、書き込み途中の credentials(accessToken だけ欠ける)がその条件に当たった。
+function hasRecoverableToken(json) {
+  const o = json && json.claudeAiOauth;
+  return Boolean(o && (o.accessToken || o.refreshToken));
+}
+
 // credentials に uuid やメールアドレスのような identity フィールドは存在しないため、
 // プラン種別を代用の識別子にする(2026-08 時点で実測済み)。
 function subscriptionTypeOf(json) {
@@ -79,6 +89,7 @@ module.exports = {
   ACCOUNT_UNKNOWN,
   readCredentials,
   hasUsableCredentials,
+  hasRecoverableToken,
   subscriptionTypeOf,
   currentAccount,
 };

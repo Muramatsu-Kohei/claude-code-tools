@@ -1115,4 +1115,29 @@ console.log('account-guard');
     JSON.stringify(resBroken));
 }
 
+// accessToken だけが欠けた credentials(書き込みの途中が典型)。復元には使えないので
+// hasUsableCredentials は false になるが、refreshToken は交換すればまた使えるため、
+// 「失われる認証情報はない」と言って /login を勧めると、まだ退避していないアカウントの
+// 認証がそこで消える。破損(0 バイト)と同じ扱いにしていた頃はそうなっていた。
+{
+  const home = sandbox('creds-refresh-only', {
+    rules: ORG,
+    raw: JSON.stringify({ claudeAiOauth: { refreshToken: 'r-1', subscriptionType: 'pro' } }),
+  });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:\\org-tree\\proj',
+    tool_name: 'Read', tool_input: { file_path: 'src/main.py' },
+  });
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('refreshToken だけ残る場合も拒否する', decision(res) === 'deny', JSON.stringify(res));
+  check('refreshToken だけ残る場合は「失われる認証情報はない」と断言しない',
+    !/失われる認証情報はない/.test(reason), reason);
+  check('refreshToken が残っていることを理由として示す', /refreshToken/.test(reason), reason);
+  check('先に /login すると失われることを伝える', /`\/login` すると/.test(reason), reason);
+  // swap 側はこの中身も「読めない現在」として扱う(hasUsableCredentials が false)。
+  // --force を付けずに案内すると、案内どおり打っても必ず中止される。
+  check('案内する swap には --force が付いている',
+    /swap save <name> --force/.test(reason) && reason.includes('swap <name> --force'), reason);
+}
+
 report();

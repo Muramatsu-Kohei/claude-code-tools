@@ -68,8 +68,11 @@ try {
     // (まだ退避していないアカウントなら、その時点で refreshToken が失われる)。
     || typeof loaded.readCredentials !== 'function'
     || typeof loaded.hasUsableCredentials !== 'function'
+    // hasRecoverableToken も同じ理由で必須。欠ける版が隣にあると credentialsState() の
+    // catch が拾って「読み取れなかった」の案内に落ち、真因が出ないまま文面だけが変わる。
+    || typeof loaded.hasRecoverableToken !== 'function'
   ) {
-    throw new Error('credentials.js の形式が不正です(HOME / CREDENTIALS / ACCOUNT_UNKNOWN / currentAccount / readCredentials / hasUsableCredentials のいずれかが欠けています)');
+    throw new Error('credentials.js の形式が不正です(HOME / CREDENTIALS / ACCOUNT_UNKNOWN / currentAccount / readCredentials / hasUsableCredentials / hasRecoverableToken のいずれかが欠けています)');
   }
   credentials = loaded;
 } catch (e) {
@@ -454,8 +457,12 @@ function violation(input, account, config) {
 // 消える(復旧はブラウザ OAuth のやり直し)。swap.js 側は同じ状況を捨ててよいとは扱わず、
 // `.unreadable-current-N.json` に控えを取ってから進む設計になっている。
 //   'usable'     … 読めて、復元にも使える
-//   'unusable'   … 読めたが復元に使えない(accessToken が無い)。失って困るものは無い
+//   'stale'      … 読めたが復元に使えない(accessToken が無い)。ただし refreshToken は残っている
+//   'unusable'   … 読めたが復元に使えず、refreshToken も無い。失って困るものは無い
 //   'unreadable' … 読み取れなかった。中身に価値があるかは判断できない
+// stale を unusable に混ぜていた頃は、accessToken だけが欠けた状態(書き込みの途中が典型)に
+// 対して「失われる認証情報はない」と断言して /login を勧めていた。refreshToken は交換すれば
+// また使えるので、そこで消せば復旧はブラウザ OAuth のやり直しになる。
 function credentialsState() {
   let json;
   try {
@@ -469,10 +476,11 @@ function credentialsState() {
     return e instanceof SyntaxError ? 'unusable' : 'unreadable';
   }
   try {
-    return credentials.hasUsableCredentials(json) ? 'usable' : 'unusable';
+    if (credentials.hasUsableCredentials(json)) return 'usable';
+    return credentials.hasRecoverableToken(json) ? 'stale' : 'unusable';
   } catch {
-    // 形式検証をすり抜けた版の hasUsableCredentials が投げた場合。中身の判断はできないので、
-    // 「失って困るものは無い」側には倒さない。
+    // 形式検証をすり抜けた版の hasUsableCredentials / hasRecoverableToken が投げた場合。
+    // 中身の判断はできないので、「失って困るものは無い」側には倒さない。
     return 'unreadable';
   }
 }
@@ -591,6 +599,26 @@ function denyMessage(hit, account) {
     return noCredentialsAtStakeMessage(
       head, '認証情報のファイルはありますが、復元に使える中身ではありません(accessToken がありません)。', hit, true
     );
+  }
+
+  // 読めたが accessToken が無く、refreshToken だけが残っている。復元には使えないので
+  // swap の hasUsableCredentials は false になるが、refreshToken は交換すればまた使えるため、
+  // 「失われる認証情報はない」とは言えない(unusable と同じ扱いにしていた頃は、この状態で
+  // /login を勧めていた)。swap 側はこの中身も「読めない現在」として控えを取ってから進むので、
+  // どちらの手にも --force が要る(付けずに案内すると必ず中止される)。
+  if (state === 'stale') {
+    return head.concat([
+      '認証情報のファイルは読めますが、復元に使える中身ではありません(accessToken がありません)。',
+      'ただし refreshToken は残っています。これは交換すればまた使えるため、先に `/login` すると、',
+      'まだ退避していないアカウントはその時点で失われます(復旧はブラウザ OAuth のやり直しです)。',
+      '',
+      '退避済みの別アカウントへ切り替えるか、先に現在の中身の控えを残してください。',
+      '  swap save <name> --force … 現在の中身の控えを残したうえで退避を試みる',
+      '  swap <name> --force      … 退避済みの別アカウントへ切り替える(`swap` で一覧を確認できます)',
+      ...swapCwdNote(hit),
+      ...SWAP_MISSING_NOTE,
+      '回避しようとせず、ユーザーにアカウントの切り替えが必要であることを伝えてください。',
+    ]).join('\n');
   }
 
   // 読み取り自体に失敗した。中身が健全なまま手が届かないだけかもしれないので、
