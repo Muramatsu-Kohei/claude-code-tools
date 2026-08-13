@@ -420,6 +420,21 @@ function expiryNote(json) {
   return days <= 1 ? '  [まもなく失効]' : `  [残り ${days} 日]`;
 }
 
+// そのスロットを `swap <name>` で復元するとき --force が要るか。復元の手前にあるガードは
+// 4 つあり、どれか 1 つでも当たれば --force なしでは中止される。以前は同一プランだけを
+// 見ていたため、失効した退避に対して `swap <name>` とだけ案内し、そのとおり打った人が
+// 「失効しています」で二度目の中止に当たっていた。判定はこの関数だけが持つ。
+// もとは cmdSwap 専用のローカル関数だったが、「退避されていません」案内(target が
+// 存在しないとき、利用可能なスロットごとに実際に打てるコマンドを列挙する)からも同じ判定を
+// 使うため、モジュールスコープへ移した(中身は変えていない)。案内する場所ごとにこの判定を
+// 書き写すと、片方だけ直して「案内どおり打つと止まる」事故が再発する(このファイルで
+// 繰り返し起きてきた)。
+function needsForceToRestore(fromJson, slotJson) {
+  if (!slotJson) return true;
+  if (isExpired(slotJson) || !refreshTokenOf(slotJson) || !subscriptionTypeOf(slotJson)) return true;
+  return fromJson ? !planDiffers(fromJson, slotJson) : false;
+}
+
 // existsSync だけを盾に readdirSync していた頃は、ACCOUNTS_DIR が手違いでファイルとして
 // 存在すると ENOTDIR の生例外が main() まで抜け、原因も対処も示されないまま全サブコマンドが
 // 死んでいた。同じファイルの listReplaced() (340-345 付近)と同じパターンに揃え、
@@ -1356,6 +1371,23 @@ function cmdSwap(target, force) {
   target = canonicalSlotName(target);
 
   const file = accountFile(target);
+
+  // .current は cmdSwap の中で読み直すたびにディスク I/O が増えるだけでなく、同じ実行の中で
+  // 何度も同じ値を評価する取り違え事故(forceHint と復元ガードが完全に同一の式
+  // `cur && currentSlotOf(cur) === target` を別々に評価していて、片方だけ直す事故につながった)
+  // の元にもなる。ここで 1 回だけ読み、以降はこの定数を使い回す。
+  // 書き換わる経路(この関数の下にある短絡の writeCurrentSlot、末尾の切り替え仕上げの
+  // writeCurrentSlot、および saveCurrent 内部の writeCurrentSlot)はすべてこのキャッシュより
+  // 後にあるので、キャッシュした値を使ってよいのはそれより前の評価に限る
+  // (curSlot 自身も readCurrentSlot、curSlotOf も currentSlotOf と同じ計算式)。
+  // 以前はこのすぐ下の「退避されていません」案内より後で読んでいたが、その案内でも
+  // 同じ cur/curSlotOf が要る(利用可能なスロットごとに、いま打てば通るコマンドを
+  // 具体化するため)ようになったので、ここまで読み込み位置を前へ動かした。読み込みは
+  // 引き続き 1 回のまま(二度読むと、判定に使ったバイト列と実際に退避するバイト列がずれる)。
+  const cur = readCredsOrNull(CREDENTIALS);
+  const curSlot = readCurrentSlot();
+  const curSlotOf = curSlot || (cur && cur.json ? accountNameOf(cur.json) : null);
+
   // 「無い」ときだけ「退避されていません」と言い切る。existsSync では読めないだけのスロットも
   // ここへ落ち、実際には退避済みなのに「退避されていません」と案内していた(そのまま
   // `swap save <target>` を打つと、読めない中身の上に現在のログインを書いて控えを 1 本失う)。
@@ -1371,12 +1403,59 @@ function cmdSwap(target, force) {
         + '\n  同じ名前のファイルが置かれていないか、ディレクトリの権限を確認してください'
         + '\n  一覧は `swap` で確認できます');
     } else if (saved.length > 0) {
+      // 名前を並べるだけでは、その名前で `swap <名前>` を打っても別のガードで止まりうる
+      // (失効・refreshToken 欠け・subscriptionType 欠け・同一プランで別アカウント未確認・
+      // 復元先が復元元と同じ名前になる、等)。実際に打てば通る形へ具体化する。判定は
+      // cmdSwap 本体の復元ガードと同じ関数に通し、この案内だけの基準を作らない
+      // (このファイルで繰り返し起きた「案内する場所で条件を書き写して片方だけ直す」事故を
+      // 避けるため)。
+      //   needsForceToRestore … 復元先の健全性と同一プランのどれかで --force が要るか
+      //   saveFirstText(needsName, sameAsTarget, saveBlocked, curSlotOf) … 単発の復元コマンドでは
+      //     通らない状況(名前を決められない/退避先が復元元と同じ名前になる/自動で選ばれる
+      //     退避先に既に別の認証情報が入っている)を forceHint と同じ形で先に案内する
+      const needsName = !!cur && !curSlotOf;
+      const saveBlocked = !!(cur && curSlotOf && overwriteGate(cur, curSlotOf, curSlot).blocked);
+      // 各スロットの見出し(`name:`)は必ず付ける。見出しを省いて実行コマンドの行だけを
+      // 連ねると、複数スロットぶんの行が隙間なく並び、「どれか1つを選ぶ択一の選択肢」ではなく
+      // 「上から順に全部打つ手順」に見えてしまう(この案内どおりに前のスロットへ切り替えてから
+      // 次のスロットへ切り替えようとすると、直前の切り替えのせいで判定の前提が変わり、
+      // 案内どおり打っているのに止まることがある)。見出し行を挟むことで、スロットごとに
+      // 独立した選択肢だと分かる形にする。
+      const lines = saved.map((name) => {
+        const c = readCredsOrNull(accountFile(name));
+        // 読めないスロットは「打てば必ず通る」と請け合えない。列挙から外し、存在だけ伝える。
+        if (!c) return '    ' + name + ':\n      読めないため案内できません';
+        const sameAsTarget = !!cur && curSlotOf === name;
+        const restore = 'swap ' + name
+          + (needsForceToRestore(cur ? cur.json : null, c.json) ? ' --force' : '');
+        const g = saveFirstText(needsName, sameAsTarget, saveBlocked, curSlotOf);
+        if (!g.needed) return '    ' + name + ':\n      ' + restore;
+        return '    ' + name + ':\n      ' + g.cmd + '\n      ' + restore + g.why;
+      });
       fail('退避されていません: ' + target
-        + '\n  利用可能: ' + saved.join(', ')
-        + '\n  この中の名前で `swap <名前>` を実行してください');
+        + '\n  利用可能なスロットと、実際に打てるコマンド(いずれか1つを選んでください):'
+        + '\n' + lines.join('\n'));
     } else {
-      fail('退避されていません: ' + target
-        + '\n  まだ何も退避されていません。先に `swap save` で現在のアカウントを退避してください');
+      // 素の `swap save` は、現在のログインの状態によっては退避の段で止まりうる(名前を
+      // 決められない/credentials が読めない)。forceHint と同じ saveFirstText の判定で
+      // 実際に打てる形にする。未ログインなら退避できるものが無く具体化しようがないので、
+      // 元の案内のまま(/login を挟む以外に進みようがない)。
+      let hint = '\n  まだ何も退避されていません。先に `swap save` で現在のアカウントを退避してください';
+      if (cur) {
+        const g = saveFirstText(!curSlotOf, false, false, curSlotOf);
+        if (g.needed) {
+          hint = '\n  まだ何も退避されていません。先に `' + g.cmd
+            + '` で現在のアカウントを退避してください' + g.why;
+        }
+      } else if (probeFile(CREDENTIALS).exists) {
+        // ファイルはあるが読めない(壊れている/権限が無いなど)。saveCurrent 自身がこの状態を
+        // 「控えだけ残して先へ進む」経路(--force)で持っているので、それを案内する
+        // (saveFirstText の staleCur 分岐の文面をそのまま使う)。
+        const g = saveFirstText(false, false, false, curSlotOf, true);
+        hint = '\n  まだ何も退避されていません。現在の credentials を読めないため、先に `'
+          + g.cmd + '` を実行してください' + g.why;
+      }
+      fail('退避されていません: ' + target + hint);
     }
   }
 
@@ -1458,18 +1537,8 @@ function cmdSwap(target, force) {
       + '\n  上書きで失われた旧内容の控えが残っていれば ' + REPLACED_DIR + ' から戻せることがあります');
   }
 
-  const cur = readCredsOrNull(CREDENTIALS);
-
-  // .current は cmdSwap の中で読み直すたびにディスク I/O が増えるだけでなく、同じ実行の中で
-  // 何度も同じ値を評価する取り違え事故(下の forceHint と復元ガードが完全に同一の式
-  // `cur && currentSlotOf(cur) === target` を別々に評価していて、片方だけ直す事故につながった)
-  // の元にもなる。ここで 1 回だけ読み、以降はこの定数を使い回す。
-  // 書き換わる経路(この関数の下にある短絡の writeCurrentSlot、末尾の切り替え仕上げの
-  // writeCurrentSlot、および saveCurrent 内部の writeCurrentSlot)はすべてこのキャッシュより
-  // 後にあるので、キャッシュした値を使ってよいのはそれより前の評価に限る
-  // (curSlot 自身も readCurrentSlot、curSlotOf も currentSlotOf と同じ計算式)。
-  const curSlot = readCurrentSlot();
-  const curSlotOf = curSlot || (cur && cur.json ? accountNameOf(cur.json) : null);
+  // cur/curSlot/curSlotOf はこの関数の先頭(「退避されていません」案内より前)で読み込み済み
+  // (そちらのコメント参照)。ここで読み直さない。
 
   // 中身が同じなら復元しても認証は何も変わらないので、credentials には触らず来歴だけ合わせる。
   // 「credentials は書けたが .current の書き込みで落ちた」中断状態も、再実行がここに来て
@@ -1505,15 +1574,9 @@ function cmdSwap(target, force) {
   //   退避側 … 来歴が一致していてもプラン種別が食い違えば止まる
   const planned = cur ? planDiffers(cur.json, next.json) : false;
 
-  // そのスロットを `swap <name>` で復元するとき --force が要るか。復元の手前にあるガードは
-  // 4 つあり、どれか 1 つでも当たれば --force なしでは中止される。以前は同一プランだけを
-  // 見ていたため、失効した退避に対して `swap <name>` とだけ案内し、そのとおり打った人が
-  // 「失効しています」で二度目の中止に当たっていた。判定はこの関数だけが持つ。
-  const needsForceToRestore = (fromJson, slotJson) => {
-    if (!slotJson) return true;
-    if (isExpired(slotJson) || !refreshTokenOf(slotJson) || !subscriptionTypeOf(slotJson)) return true;
-    return fromJson ? !planDiffers(fromJson, slotJson) : false;
-  };
+  // needsForceToRestore はモジュールスコープに定義してある(このファイル冒頭寄りの
+  // isExpired の近く)。「退避されていません」案内(target が存在しないとき)からも同じ判定を
+  // 呼びたいため、cmdSwap 専用のローカル関数のままにしておけなかった。
   // 向きで判定が変わるので 2 つ持つ。読み込み済みの中身をそのまま渡すのは、target は next として
   // 既に読んであり、戻す先は今の cur そのものだから(同じファイルを読み直しても結果は変わらない)。
   //   restoreCmd     … いま target を復元する向き(現在は cur)

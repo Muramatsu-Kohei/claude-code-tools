@@ -18,6 +18,13 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { makeHarness } = require('./harness');
+// RNG・パス規約・トークン不変条件チェックは test/reachable.test.js と共通なので
+// test/sandbox.js に切り出してある(由来と設計意図は sandbox.js のコメント参照)。
+const {
+  DAY, makeRng, mixSeed, shuffle,
+  credPath, acctPath, slotPath,
+  collectTokens, listFiles,
+} = require('./sandbox');
 
 // SWAP_FAULT を親プロセス(このファイル自身)の環境に残したまま require すると、
 // fault-fs.js の分岐がここで発火して自分の fs まで壊しかねない。WRAPPED_CALLS を
@@ -28,11 +35,12 @@ const { WRAPPED_CALLS } = require('./fault-fs');
 if (savedFault !== undefined) process.env.SWAP_FAULT = savedFault;
 
 const BASE = path.join(__dirname, '.tmp', 'fault');
-const SWAP = path.join(__dirname, '..', 'swap.js');
+// SWAP_SCRIPT でテスト対象の swap.js を差し替えられるようにしておく(test/reachable.test.js と
+// 同じ口。感度検証で変異版を指して FAIL が出ることを確かめるためのもので、既定は本物の swap.js)。
+const SWAP = process.env.SWAP_SCRIPT ? path.resolve(process.env.SWAP_SCRIPT) : path.join(__dirname, '..', 'swap.js');
 const FAULT_FS = path.join(__dirname, 'fault-fs.js');
 fs.rmSync(BASE, { recursive: true, force: true });
 
-const DAY = 86400000;
 const { check, report } = makeHarness();
 
 // シードは固定(コマンドラインから上書きできるようにはするが、既定値は常に同じ数)。
@@ -41,36 +49,6 @@ const SEED = Number(process.env.FAULT_SEED) || 424242;
 // ケース数は約 200 が目安。子プロセスを 1 ケースあたり 1〜4 回起動する重さがあるので、
 // 実測して 60 秒を大きく超えるようなら FAULT_CASES で減らせるようにしておく。
 const CASES = Number(process.env.FAULT_CASES) || 200;
-
-// --- 擬似乱数(xorshift32)。Math.random() は使わない(シード固定・再現性のため) ---
-function makeRng(seed) {
-  let s = (seed >>> 0) || 1; // 0 は xorshift の不動点なので避ける
-  return function rng() {
-    s ^= s << 13; s >>>= 0;
-    s ^= s >>> 17;
-    s ^= s << 5; s >>>= 0;
-    return s / 0x100000000;
-  };
-}
-
-// ケースごとに独立したシードを作る。全ケースで 1 本の乱数列を使い回すと、あるケースの
-// 操作数が変わるだけで後続の全ケースの乱数列がずれ、「ケース i だけ再現する」ができなくなる。
-// seed と i だけから決まるようにしておけば、失敗したケース単体を後から再現できる。
-function mixSeed(seed, i) {
-  let x = (seed ^ Math.imul(i + 1, 0x9e3779b1)) >>> 0;
-  x ^= x >>> 16; x = Math.imul(x, 0x85ebca6b) >>> 0;
-  x ^= x >>> 13; x = Math.imul(x, 0xc2b2ae35) >>> 0;
-  x ^= x >>> 16;
-  return x >>> 0;
-}
-
-function shuffle(rng, arr) {
-  for (let k = arr.length - 1; k > 0; k--) {
-    const j = Math.floor(rng() * (k + 1));
-    [arr[k], arr[j]] = [arr[j], arr[k]];
-  }
-  return arr;
-}
 
 // --- credentials の組み立て(test/swap.test.js の creds() と同じ考え方) ---
 // refreshToken を呼び出し元から直接受け取る(ケース内で一意な文字列を渡させる)。
@@ -115,94 +93,11 @@ function buildInitialState(rng, i) {
   return { accounts, current, slot };
 }
 
-const credPath = (home) => path.join(home, '.claude', '.credentials.json');
-const acctPath = (home, name) => path.join(home, '.claude', 'accounts', name + '.json');
-const slotPath = (home) => path.join(home, '.claude', 'accounts', '.current');
-const replacedDir = (home) => path.join(home, '.claude', 'accounts', '.replaced');
-
 function writeSandbox(home, { current, accounts, slot }) {
   fs.mkdirSync(path.join(home, '.claude', 'accounts'), { recursive: true });
   if (current !== undefined) fs.writeFileSync(credPath(home), JSON.stringify(current), 'utf8');
   for (const [n, v] of Object.entries(accounts)) fs.writeFileSync(acctPath(home, n), JSON.stringify(v), 'utf8');
   if (slot !== undefined) fs.writeFileSync(slotPath(home), slot + '\n', 'utf8');
-}
-
-// --- 実行前後のスナップショット ---
-// 「実行前に存在した refreshToken が実行後もどこかに残っているか」だけを見る。JSON.parse は
-// 使わない: 切り詰められたファイルでも、切れた位置より手前にあるトークンは拾えるべきという
-// 前提(credentials.js の rawHasRecoverableToken と同じ思想)なので、正規表現で生バイト列から
-// 直接拾う。読む対象は仕様どおり .credentials.json / accounts/*.json / accounts/.replaced/** の
-// 3 箇所に限る(accounts/*.json.tmp のような書きかけの一時ファイルは対象外。writeAtomic は
-// 上書きされる側の内容を必ず先にどこか安全な場所へ複製してから書き換える設計なので、
-// 一時ファイルにしか残っていない状態を不変条件の対象にすると、この設計そのものではなく
-// 「rename の直前で止まった」という無関係な事情で偽陽性になる)。
-const TOKEN_RE = /"refreshToken"\s*:\s*"([^"]+)"/g;
-function tokensInFile(file) {
-  let raw;
-  try {
-    raw = fs.readFileSync(file);
-  } catch {
-    return [];
-  }
-  // latin1 で文字列化するのは 1 バイト = 1 文字で復元するため。truncate 注入で UTF-8 の
-  // マルチバイト列が途中で切れても、utf8 デコードのように置換文字(U+FFFD)へ化けて
-  // トークンの一部を読み違えることがない(トークンそのものは ASCII なので情報は落ちない)。
-  const text = raw.toString('latin1');
-  const out = [];
-  let m;
-  TOKEN_RE.lastIndex = 0;
-  while ((m = TOKEN_RE.exec(text))) out.push(m[1]);
-  return out;
-}
-
-function collectTokens(home) {
-  const tokens = new Set();
-  tokensInFile(credPath(home)).forEach((t) => tokens.add(t));
-  const accountsDir = path.join(home, '.claude', 'accounts');
-  let entries = [];
-  try {
-    entries = fs.readdirSync(accountsDir);
-  } catch { /* まだ 1 度も退避していない */ }
-  for (const f of entries) {
-    if (!f.endsWith('.json')) continue; // .current や .replaced/ 自体はここでは拾わない
-    tokensInFile(path.join(accountsDir, f)).forEach((t) => tokens.add(t));
-  }
-  (function walk(dir) {
-    let ents;
-    try {
-      ents = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const ent of ents) {
-      const full = path.join(dir, ent.name);
-      if (ent.isDirectory()) walk(full);
-      else tokensInFile(full).forEach((t) => tokens.add(t));
-    }
-  })(replacedDir(home));
-  return tokens;
-}
-
-// FAIL したときの手掛かり用。中身までは出さない(トークン文字列はダミーだが、実物の
-// swap.js の出力と同じ形式に慣れさせないため、あえてパスと種別だけに留める)。
-function listFiles(home) {
-  const root = path.join(home, '.claude');
-  const out = [];
-  (function walk(dir, rel) {
-    let ents;
-    try {
-      ents = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const ent of [...ents].sort((a, b) => a.name.localeCompare(b.name))) {
-      const relPath = rel ? rel + '/' + ent.name : ent.name;
-      const full = path.join(dir, ent.name);
-      if (ent.isDirectory()) { out.push('D ' + relPath); walk(full, relPath); }
-      else out.push('F ' + relPath);
-    }
-  })(root, '');
-  return out;
 }
 
 // --- 操作列 ---
