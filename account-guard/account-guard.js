@@ -71,6 +71,10 @@ try {
     // hasRecoverableToken も同じ理由で必須。欠ける版が隣にあると credentialsState() の
     // catch が拾って「読み取れなかった」の案内に落ち、真因が出ないまま文面だけが変わる。
     || typeof loaded.hasRecoverableToken !== 'function'
+    // probeFile は「ファイルが無い」と「あるのに読めない」を分ける唯一の場所。欠ける版が
+    // 隣にあると loggedOut の判定が TypeError で落ち、下に書いてあるのと同じ無言 fail-open の
+    // 経路(denyMessage を組み立てられないまま reportCrash に抜ける)に入る。
+    || typeof loaded.probeFile !== 'function'
     // rawHasRecoverableToken は credentialsState() が生の中身を分類するのに使う。ここが
     // 抜けていた頃は、欠ける版が隣にあると credentialsState() が TypeError で落ち、
     // denyMessage を組み立てられないまま main() を抜けて reportCrash に到達していた。
@@ -584,13 +588,17 @@ function denyMessage(hit, account) {
   // 「退避されていません」で、どちらも必ず失敗する。/login を抑止したまま行き止まりになる。
   // ここも account では門番しない(下の state と同じ理由)。打つ手を決めるのは
   // 「失って困る認証情報が現にあるか」で、ファイルが無ければアカウントの判別結果によらない。
-  const loggedOut = !!credentials && !fs.existsSync(credentials.CREDENTIALS);
+  // 「無い」ときだけ未ログインと断じる。existsSync は権限やロックで stat が失敗しても false を
+  // 返すため、読めないだけで中身は生きている credentials を「ログインしていません」と判定し、
+  // /login を抑止しないまま案内していた。案内どおり /login すれば、まだ退避していない
+  // アカウントの refreshToken はその時点で消える。判定は swap 側と同じ probeFile に合流させる。
+  const loggedOut = !!credentials && !credentials.probeFile(credentials.CREDENTIALS).exists;
   if (loggedOut) {
     // ファイルが無い場合、swap は「現在なし」として素直に復元へ進むので --force は要らない。
     return noCredentialsAtStakeMessage(head, 'ログインしていません(認証情報のファイルがありません)。', hit, false);
   }
 
-  // ファイルはあるが中身を確かめられた結果 accessToken が無い。existsSync だけでは上の
+  // ファイルはあるが中身を確かめられた結果 accessToken が無い。存在の有無だけでは上の
   // loggedOut と区別できず、下の「切り替え手順」に落ちて swap save を勧めてしまうが、それは
   // 「現在の credentials を読めません」で必ず失敗し、退避も無ければ行き止まりになる。
   // ここで残っているファイルの中身はもう使えないので、失って困るものは無い。
@@ -605,7 +613,7 @@ function denyMessage(hit, account) {
   // 門番があると下の汎用文へ落ちるため。汎用文が案内する swap save / swap は swap 側の
   // hasUsableCredentials に弾かれて必ず止まり、ガードと swap で基準がずれた袋小路に戻る。
   // 打つ手を決めるのは「中身が使えるか」であって「どのアカウントか」ではない。
-  const state = !loggedOut && !!credentials && fs.existsSync(credentials.CREDENTIALS)
+  const state = !loggedOut && !!credentials && credentials.probeFile(credentials.CREDENTIALS).exists
     ? credentialsState()
     : null;
   if (state === 'unusable') {
@@ -784,7 +792,12 @@ function main() {
         + '外してください(保護は外れるので、直したあとに戻してください)。');
       return;
     }
-    console.log(`設定: ${CONFIG}${fs.existsSync(CONFIG) ? '' : ' (未作成 — 保護は無効)'}`);
+    // 「未作成 — 保護は無効」と言い切れるのは、設定が本当に無いときだけ。existsSync は
+    // 読めないだけの設定も false にするので、broken(修復するまで全拒否 = 保護は最も強く
+    // 効いている)状態に対して「保護は無効」と正反対の表示を出していた。判定は probeFile に
+    // 合流させ、broken が分かっているときはそちらの表示に任せる(すぐ下で出す)。
+    const configMissing = !config.broken && !!credentials && !credentials.probeFile(CONFIG).exists;
+    console.log(`設定: ${CONFIG}${configMissing ? ' (未作成 — 保護は無効)' : ''}`);
     if (config.broken) {
       console.log('設定を読めません — 修復するまで、設定ファイル自身の編集以外は拒否します。');
       return;

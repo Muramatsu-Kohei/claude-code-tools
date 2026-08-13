@@ -79,6 +79,7 @@ if (
   || typeof credentials.HOME !== 'string' || !credentials.HOME.trim()
   || typeof credentials.CREDENTIALS !== 'string' || !credentials.CREDENTIALS
   || typeof credentials.readCredentials !== 'function'
+  || typeof credentials.probeFile !== 'function'
   || typeof credentials.subscriptionTypeOf !== 'function'
   || typeof credentials.hasUsableCredentials !== 'function'
   || typeof credentials.hasRecoverableToken !== 'function'
@@ -86,13 +87,14 @@ if (
 ) {
   fail('swap.js の隣にある credentials.js の形式が想定と違います'
     + '\n  (' + path.join(__dirname, 'credentials.js') + ')'
-    + '\n  HOME / CREDENTIALS / readCredentials / subscriptionTypeOf / hasUsableCredentials / '
-    + 'hasRecoverableToken / rawHasRecoverableToken のいずれかが欠けているか、期待する型ではありません'
+    + '\n  HOME / CREDENTIALS / readCredentials / probeFile / subscriptionTypeOf / '
+    + 'hasUsableCredentials / hasRecoverableToken / rawHasRecoverableToken のいずれかが欠けているか、'
+    + '期待する型ではありません'
     + '\n  swap.js と対応する版の credentials.js を同じディレクトリへ置き直してください');
 }
 const {
-  HOME, CREDENTIALS, readCredentials, subscriptionTypeOf, hasUsableCredentials, hasRecoverableToken,
-  rawHasRecoverableToken,
+  HOME, CREDENTIALS, readCredentials, probeFile, subscriptionTypeOf, hasUsableCredentials,
+  hasRecoverableToken, rawHasRecoverableToken,
 } = credentials;
 
 // 退避先を ~/.claude 配下に置くのは、元の credentials と同じ ACL を継承させるため。
@@ -220,11 +222,12 @@ function isLiveCredentialsFile(file) {
 }
 function unreadableReason(file) {
   const live = isLiveCredentialsFile(file);
-  let raw;
-  try {
-    raw = fs.readFileSync(file, 'utf8');
-  } catch (e) {
-    if (e.code === 'ENOENT') {
+  // 読み取りは probeFile に一本化する。ここで readFileSync を書き起こしていた頃は、
+  // 「無い」と「読めない」の区別がこの関数にしか無く、existsSync で判断する他の
+  // 呼び出し元(writeSlot / saveCurrent など)がその区別を持たないまま素通ししていた。
+  const p = probeFile(file);
+  if (!p.readable) {
+    if (!p.exists) {
       // 呼び出し元は存在を確かめてから呼ぶので、ここへ来るのは直後に消えたとき。中身を
       // 一度も見ていない以上「無価値」とは言い切れない(unusable は控えを消させる)。
       return { label: 'ファイルがありません', verdict: 'unreadable' };
@@ -232,9 +235,9 @@ function unreadableReason(file) {
     // EISDIR / ENOTDIR は「そこに読めるファイルが無い」の変種。同じ名前のディレクトリが
     // 置かれている(あるいは途中の要素がファイルになっている)ことが原因で、一過性の
     // ロックとは種類が違うが、中身を確認できていない点では同じ扱いになる。
-    if (e.code === 'EISDIR' || e.code === 'ENOTDIR') {
+    if (p.code === 'EISDIR' || p.code === 'ENOTDIR') {
       return {
-        label: '読み取りに失敗しました(' + e.code + ')。'
+        label: '読み取りに失敗しました(' + p.code + ')。'
           + '同じ名前のディレクトリが置かれていないか確認してください',
         verdict: 'unreadable',
       };
@@ -244,14 +247,11 @@ function unreadableReason(file) {
     // 区別できない。account-guard.js の credentialsState() も同じ状況を 'unreadable'
     // (中身の価値は判断できない)に分類する。待つ以外の対処も文面に添える。
     return {
-      label: '読み取りに失敗しました(' + e.code + ')。掴んでいるプロセスを終えるか、権限を確認してください',
+      label: '読み取りに失敗しました(' + p.code + ')。掴んでいるプロセスを終えるか、権限を確認してください',
       verdict: 'unreadable',
     };
   }
-  let json;
-  try {
-    json = JSON.parse(raw);
-  } catch {
+  if (p.parseError) {
     // 途中まで書かれたファイルは JSON として壊れて見える。切れ目より手前に refreshToken が
     // 残っていることがあるので、パースできなかったことを「中身が無い」の証拠にはしない。
     // live かどうかは原因の心当たりを変えるだけで、確認できていない事実は変わらない。
@@ -260,13 +260,13 @@ function unreadableReason(file) {
       verdict: 'unreadable',
     };
   }
-  if (!hasUsableCredentials(json)) {
+  if (!hasUsableCredentials(p.json)) {
     // accessToken が無くても refreshToken が残っていることがある(書き込み途中が典型)。
     // refreshToken は交換すればまた使える資格情報なので、accessToken だけが欠けた状態を
     // 「失って困るものは無い」側の unusable と同じに扱ってはいけない。account-guard.js の
     // credentialsState() も同じ状況を stale として分けており、swap 側だけが粗いままだと、
     // ガードは /login を勧めないのに swap は勧める、という食い違いが起きて refreshToken を失う。
-    if (hasRecoverableToken(json)) {
+    if (hasRecoverableToken(p.json)) {
       return {
         label: 'claudeAiOauth.accessToken がありません(形式が想定と違います)。'
           + 'ただし refreshToken は残っています(交換すればまた使えます)',
@@ -417,7 +417,6 @@ function expiryNote(json) {
 // 死んでいた。同じファイルの listReplaced() (340-345 付近)と同じパターンに揃え、
 // エラーを戻り値に入れて呼び出し元に判断を返す。
 function savedAccounts() {
-  if (!fs.existsSync(ACCOUNTS_DIR)) return { names: [], error: null };
   try {
     return {
       names: fs.readdirSync(ACCOUNTS_DIR)
@@ -428,6 +427,10 @@ function savedAccounts() {
       error: null,
     };
   } catch (e) {
+    // ENOENT(まだ 1 度も退避していない)だけが「無い」。existsSync を盾にしていた頃は、
+    // 権限で stat できない場合も同じ「0 件・error なし」に落ちており、すぐ下のコメントが
+    // 禁じている「読めないことを 0 件に倒す」を入口で自分がやっていた。
+    if (e.code === 'ENOENT') return { names: [], error: null };
     return { names: [], error: e.code || e.message };
   }
 }
@@ -448,10 +451,12 @@ function accountFile(name) {
 // して置かれている環境で status が出力の途中から `ENOTDIR` の生の例外に落ち、その直前に
 // 自分で案内した対処コマンドも同じ形で死ぬ、という行き止まりになっていた。
 function listReplaced() {
-  if (!fs.existsSync(REPLACED_DIR)) return { files: [], error: null };
   try {
     return { files: fs.readdirSync(REPLACED_DIR), error: null };
   } catch (e) {
+    // ENOENT(まだ 1 度も控えを作っていない)だけが「無い」。existsSync では権限で読めない
+    // 場合も同じ「空・error なし」に落ち、控えがあるのに 0 件と表示していた。
+    if (e.code === 'ENOENT') return { files: [], error: null };
     return { files: [], error: e.code || e.message };
   }
 }
@@ -747,7 +752,10 @@ function readCurrentSlot() {
   } catch {
     return null; // 未記録(このツールを使い始めた直後、または手で消した)
   }
-  if (!NAME_RE.test(name) || !fs.existsSync(accountFile(name))) return null;
+  // 指す先が「無い」ときだけ来歴を無効にする。existsSync は読めないだけのスロットも false に
+  // するので、来歴は生きているのに「未記録」へ落ち、overwriteGate の provenance 判定が
+  // 効かないまま別アカウントのスロットを上書きする経路になっていた。
+  if (!NAME_RE.test(name) || !probeFile(accountFile(name)).exists) return null;
   // 大小違いで書かれた来歴(このツールの旧版が書いた、手で書いた)もここで実名に揃える。
   // 揃えないと、指しているファイルは正しいのに名前の比較だけが食い違い、status の印も
   // 「現在のログインと内容が違います」の警告も出なくなる(退化に気づく手段が消える)。
@@ -869,7 +877,10 @@ function driftedProvenance(cur, name, prevSlot) {
 // 省略して自分で読む(saveCurrent の経路では、そこへ来るまでに .current が書き換わりうる)。
 function overwriteGate(cur, name, prevSlot) {
   const file = accountFile(name);
-  const exists = fs.existsSync(file);
+  // 「無い」ときだけ上書きガードを素通しにする。existsSync では読めないだけのスロットも
+  // exists=false になり、blocked=false でガード自体が発火しなかった(writeSlot の控え取得も
+  // 同じ理由で飛ばされるため、2 つが重なると控えなしで別アカウントを潰す)。
+  const exists = probeFile(file).exists;
   const old = exists ? readCredsOrNull(file) : null;
   const identical = !!(old && sameCreds(cur.json, old.json));
   // 来歴が一致しても素通しにはしない。/login や書き込みの中断で来歴は古くなりうるので、
@@ -921,7 +932,11 @@ function failOverwrite(name, old, provenance, different, afterCmd) {
 // 任せない(任せた結果、かつての別名スロット同期が控えを 1 本も残さず上書きしていた)。
 function writeSlot(name, cur, old) {
   const file = accountFile(name);
-  if (fs.existsSync(file)) {
+  // existsSync では「権限が足りず stat できない」「別プロセスが掴んでいる」も false になり、
+  // そのとき控えを 1 本も取らないまま下の writeAtomic が上書きしていた。probeFile は ENOENT の
+  // ときだけ exists を false にするので、読めないスロットは「失って困る中身があるかもしれない」
+  // 側として必ず控えを取る。控えが取れなければ keepAside がそこで中止する。
+  if (probeFile(file).exists) {
     const prev = old !== undefined ? old : readCredsOrNull(file);
     if (!(prev && sameCreds(cur.json, prev.json))) keepAside(file, name);
   }
@@ -987,7 +1002,10 @@ function saveCurrent(explicitName, force, forceCmd, pre, afterCmd) {
   const cur = pre || readCredsOrNull(CREDENTIALS);
 
   if (!cur) {
-    if (!fs.existsSync(CREDENTIALS)) return null; // 単に未ログイン
+    // 「無い」ときだけ未ログインとして退避を省く。existsSync は権限やロックで stat が失敗
+    // しても false を返すため、生きた未退避トークンがあるのに「未ログイン」と判断し、
+    // 呼び出し元(cmdSwap)が退避せずそのまま CREDENTIALS を上書きする経路になっていた。
+    if (!probeFile(CREDENTIALS).exists) return null; // 単に未ログイン
     // 「読めない」で止めるだけだと、この状態から抜け出す手段が無くなる(swap も save も
     // 同じ判定で止まるため)。中身を確認した人が先へ進めるよう --force を用意する。
     const why = unreadableReason(CREDENTIALS);
@@ -1110,7 +1128,7 @@ function outdatedSlots(cur, curSlot, savedCreds) {
 
 function cmdStatus() {
   const cur = readCredsOrNull(CREDENTIALS);
-  const exists = fs.existsSync(CREDENTIALS);
+  const exists = probeFile(CREDENTIALS).exists;
   const curSlot = readCurrentSlot();
 
   // 「未ログイン(ファイルが無い)」と「読めない(破損・権限・書き込み中)」を混ぜない。
@@ -1322,7 +1340,11 @@ function cmdSwap(target, force) {
   target = canonicalSlotName(target);
 
   const file = accountFile(target);
-  if (!fs.existsSync(file)) {
+  // 「無い」ときだけ「退避されていません」と言い切る。existsSync では読めないだけのスロットも
+  // ここへ落ち、実際には退避済みなのに「退避されていません」と案内していた(そのまま
+  // `swap save <target>` を打つと、読めない中身の上に現在のログインを書いて控えを 1 本失う)。
+  // 読めない場合は下の readCreds へ進み、unreadableReason が理由を添えて中止する。
+  if (!probeFile(file).exists) {
     // ここは中止メッセージを組み立てている最中なので、一覧の取得で止めない。止めると
     // 「退避されていません: <名前>」という本当の理由が「一覧を読めません」に差し替わる
     // (hasCopyElsewhere のコメントが禁じているのと同じ形)。読めなければ候補だけ省く。

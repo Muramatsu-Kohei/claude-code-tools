@@ -55,6 +55,48 @@ function readCredentials(file) {
   }
 }
 
+// ファイルの素性を 1 回の読み取りで確かめる。「無い」と「読めない」を分ける唯一の場所。
+//
+// fs.existsSync を使わないのは、Node の仕様上 stat が失敗すれば理由を問わず false を返す
+// ためで、権限が足りない・別プロセスが掴んでいる・同名のディレクトリが置かれている、
+// といった「あるのに読めない」状態がすべて「無い」と区別できなくなる。このツールで
+// 「無い」は「失うものは無いので上書きしてよい」と同義なので、取り違えると生きた資格情報を
+// 控えなしで潰す(実際に writeSlot と saveCurrent がその形になっていた)。
+//
+// したがって exists は「ENOENT だったときだけ false」にする。EACCES/EBUSY/EISDIR/ENOTDIR
+// などは「あるかもしれないが確かめられない」として exists を true 側に倒す。安全側とは、
+// 常に「まだ失って困るものがあるかもしれない」と考える側のこと。
+//
+// readable と exists を分けて返すのは、呼び出し側の問いが 2 種類あるため。
+//   - 上書き・削除してよいか      → exists を見る(「無い」ときだけ素通し)
+//   - 中身を判断材料に使えるか    → readable と json を見る
+// raw も返すのは、パースできなくても切り詰められた中に refreshToken が残ることがあり
+// (rawHasRecoverableToken)、その判断材料をここで捨てると呼び出し側が読み直すしかなく、
+// その隙に書き換わると判定と実体がずれるため。
+function probeFile(file) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    const missing = e.code === 'ENOENT';
+    return {
+      exists: !missing,
+      readable: false,
+      raw: null,
+      json: null,
+      code: e.code || null,
+      parseError: false,
+    };
+  }
+  try {
+    return { exists: true, readable: true, raw, json: JSON.parse(raw), code: null, parseError: false };
+  } catch {
+    // 読めたが JSON として壊れている。raw は残すので、呼び出し側は
+    // rawHasRecoverableToken でトークンの残骸を確かめられる。
+    return { exists: true, readable: true, raw, json: null, code: null, parseError: true };
+  }
+}
+
 // 「復元に使える中身か」の判定。JSON として読めることと、認証に使えることは別で、
 // `{}` や `{"claudeAiOauth":{}}` は JSON.parse を通るが復元しても意味がない。
 // ここを 1 箇所に置くのは、ガードと swap で基準がずれると「ガードは正常と判定して
@@ -109,6 +151,7 @@ module.exports = {
   CREDENTIALS,
   ACCOUNT_UNKNOWN,
   readCredentials,
+  probeFile,
   hasUsableCredentials,
   hasRecoverableToken,
   rawHasRecoverableToken,
