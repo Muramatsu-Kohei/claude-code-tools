@@ -63,6 +63,21 @@ if (process.env.SWAP_FAULT) {
     return args.some((a) => typeof a === 'string' && a.includes(spec.match));
   }
 
+  // nth は単一の回数(従来どおりの数値)のほか、複数回を狙い撃ちしたいケースのために
+  // 配列(`[1, 4]`)やカンマ区切り文字列(`"1,4"`)も受け付ける。たとえば
+  // readCurrentForGuard() のように、同じ引数で同じ関数を 5 回呼びながら 1・4 回目
+  // (readCredsOrNull 経由)だけを失敗させ、2・3・5 回目(probeFile 経由)は成功させたい
+  // 状況は、呼び出し元を区別する手段がここには無い以上、回数の集合でしか表現できない。
+  // Set にしておけば、これまでどおりの単一の数値指定(`nth: 1`)も `new Set([1])` として
+  // 同じ判定になるので後方互換になる。
+  function normalizeNth(nth) {
+    if (nth === undefined) return undefined;
+    if (Array.isArray(nth)) return new Set(nth);
+    if (typeof nth === 'string') return new Set(nth.split(',').map((s) => Number(s.trim())));
+    return new Set([nth]);
+  }
+  const nthSet = normalizeNth(spec.nth);
+
   // nth 番目に当たるかどうかの判定。絞り込みを通った呼び出しだけを数える
   // (match で絞ったのに絞り込み前の回数で nth を数えると、「絞り込んだ対象の n 回目」という
   // 直感と食い違う)。
@@ -70,8 +85,8 @@ if (process.env.SWAP_FAULT) {
     if (spec.call !== call) return false;
     if (!matches(args)) return false;
     counts[call] = (counts[call] || 0) + 1;
-    if (spec.nth === undefined) return true;
-    return counts[call] === spec.nth;
+    if (nthSet === undefined) return true;
+    return nthSet.has(counts[call]);
   }
 
   function wrap(name) {

@@ -1352,6 +1352,43 @@ console.log('swap');
     tokenOf(acctPath(home, 'warmup')) === 'warmup-new-tok', r.out + r.err);
 }
 
+// --- レビュー指摘: 復元できない名前を「打てるコマンド」として案内しない ---
+{
+  // 「退避されていません」の一覧(cmdSwap 冒頭)。accounts/save.json は予約語と衝突していて
+  // `swap save` は復元ではなく save サブコマンドとして解釈されるため、案内どおり打つと
+  // 切り替わらないまま exit 0 で終わる(restorableByName / renameToRestoreText 参照)。
+  // alpha は従来どおり `swap alpha` を案内してよい対照として一緒に置く。
+  const home = sandbox('missing-target-reserved-name', {
+    accounts: { alpha: creds('pro'), save: creds('pro') },
+  });
+  const r = runSwap(home, ['nosuchslot']);
+  check('復元できない名前は「打てるコマンド」として案内しない',
+    r.code === 1 && !/^\s*swap save\s*$/m.test(r.err), r.out + r.err);
+  check('代わりに改名を促す案内を出す',
+    /swap のサブコマンドと同じ名前なので/.test(r.err) && /別の名前へ改名してください/.test(r.err),
+    r.err);
+  check('復元できる名前はこれまでどおり案内する',
+    /^\s*swap alpha\s*$/m.test(r.err), r.err);
+}
+{
+  // 切り替え後の「元に戻すには」も同じ判定を通す。来歴が save を指したまま切り替えると、
+  // saveCurrent は save の中身を(必要なら)更新して saved.name = 'save' を返すが、
+  // それをそのまま restoreBackCmd に渡すと「元に戻すには: swap save」になり、
+  // 案内どおり打った人は save サブコマンドが走って戻れないまま誤解する。
+  const home = sandbox('return-cmd-reserved-name', {
+    current: creds('pro', { token: 'live' }),
+    accounts: { save: creds('pro', { token: 'live' }), team: creds('team', { token: 'team-tok' }) },
+    slot: 'save',
+  });
+  const r = runSwap(home, ['team']);
+  check('切り替えは成功する(前提)', r.code === 0, r.out + r.err);
+  check('「元に戻すには」に save サブコマンドを案内しない',
+    !r.out.includes('元に戻すには: swap save'), r.out);
+  check('代わりに改名を促す案内を出す',
+    /元に戻すには: swap のサブコマンドと同じ名前なので/.test(r.out) && /別の名前へ改名してください/.test(r.out),
+    r.out);
+}
+
 // --- 中止の不変条件 ---
 // swap.js の中止経路それぞれについて、「実行前スナップショットを取る → 中止させる →
 // checkAbort」を繰り返す。個々の中止理由の妥当性は上のテストで確認済みなので、ここでは
@@ -2243,6 +2280,28 @@ const TRUNCATED_CURRENT =
   check('開けないことと、控えも取れないことを伝える', out.includes('控えも取れない'), out);
 }
 
+{
+  // 開くことすらできない現在(EISDIR)から、失効済みの復元先へ切り替えようとした場合。
+  // curUnsavable(現在を退避できない理由)を forceHint が見ていなかった頃は、needsName /
+  // sameAsTarget / saveBlocked の 3 つがすべて false(cur が null で判定材料が無い)になり、
+  // 案内が「現在のログインはそのままです。承知のうえで復元するなら: swap alpha --force」の
+  // 1 行だけに退化していた。案内どおり打つと、開けない現在は copyFileSync も同じ理由で
+  // 失敗するため keepAside が控えを取れずに中止し、「もう一度実行してください」を繰り返す
+  // 無限リトライになる(上の「開けない現在では控えを約束しない」と根は同じ)。
+  const home = sandbox('unopenable-current-expired-target', {
+    accounts: { alpha: creds('pro', { expiresInDays: -1 }) },
+  });
+  fs.mkdirSync(credPath(home), { recursive: true });
+  const r = runSwap(home, ['alpha']);
+  const out = r.out + r.err;
+  check('開けない現在からの復元は中止する', r.code !== 0, out);
+  check('裸の --force 案内だけにしない',
+    !out.includes('現在のログインはそのままです。承知のうえで復元するなら: swap alpha --force'), out);
+  check('先に控えを残す手順を案内する',
+    out.includes('先に退避してから、承知のうえで復元してください') && out.includes('swap save --force'),
+    out);
+}
+
 // --- 大小を区別するファイルシステムでは読み替えない ---
 // canonicalSlotName の、上の「大小無視 FS」ブロックとは逆側。Windows/macOS の既定では実測分岐で
 // スキップされてしまい、Linux でしか検査できていなかった。区別する FS の本質は「打った名前の
@@ -2313,6 +2372,51 @@ const TRUNCATED_CURRENT =
     !(s.out + s.err).includes('読めません(いまは健全に読めています'), s.out + s.err);
 }
 
+// --- 読み取りが 2 回続けて失敗する現在の credentials(1 回だけでは再現できない自己矛盾) ---
+// readCurrentForGuard() の最終分岐(「読めたり読めなかったりします」verdict='unreadable')は、
+// 同じ実行内で .credentials.json への readFileSync が 1→(readCredsOrNull) 2→(probeFile,
+// exists 確認) 3→(probeFile, 1 回目の unreadableReason) 4→(readCredsOrNull, 再読み込み)
+// 5→(probeFile, 2 回目の unreadableReason) の順に最大 5 回呼ばれる設計になっている(実装
+// コメント参照)。この分岐に届くには 1 回目と 4 回目(readCredsOrNull 経由)だけを失敗させ、
+// 2・3・5 回目(probeFile 経由)は成功させる必要がある。readCredsOrNull も probeFile も内部で
+// `fs.readFileSync(file, 'utf8')` を同じ引数で呼んでいて、SWAP_FAULT は呼び出し元を区別
+// できないため、離れた 2 回(1 と 4)だけを狙い撃つには nth が単一の回数では表現できない
+// (fault-fs.js を単一値のままにして「1 回目だけ」を注入すると、4 回目の再読み込みは
+// 素通りして健全に読めてしまい、この分岐には届かない。実測で裏を取ってある: 下記コメント
+// 「実測」参照)。fault-fs.js の nth を配列/カンマ区切りで複数指定できるよう拡張し
+// (単一の数値もこれまでどおり動く後方互換)、1 と 4 だけを注入できるようにした。
+//
+// 実測: nth の値を変えながら実際に注入して出力を確認し、上の対応(1,4 → 目的の分岐/
+// 2,3,5 → probeFile 経由)が推測ではなく事実であることを確かめてある。
+//   nth:[1]   … 4 回目の再読み込みが素通りして回復する(「1 回目だけ読めなくても」と同じ)
+//   nth:[1,2] … 2 回目(exists 確認)は失敗しても probeFile が code から exists=true を
+//               返すため、nth:[1] と同じ結果になる(2 回目を失敗させても効かない)
+//   nth:[1,3] … 3 回目(1 回目の unreadableReason)が失敗し、verdict が 'usable' に届かない
+//               ので、4 回目へ進まずに「読み取りに失敗しました(EBUSY)」で確定して終わる
+//   nth:[1,5] … 5 回目は 4 回目が成功すれば呼ばれないので、nth:[1] と同じ結果になる
+//   nth:[1,4] … 目的の「読めたり読めなかったりします」に到達する(下のテスト)
+{
+  const home = sandbox('current-unreadable-twice-guard', {
+    current: creds('pro', { token: 'CUR-NEW' }),
+    accounts: { mypro: creds('pro', { token: 'SLOT-OLD' }) },
+    slot: 'mypro',
+  });
+  const s = execSwapScript(SWAP, [], {
+    env: {
+      ...homeEnv(home),
+      NODE_OPTIONS: '--require ' + path.join(__dirname, 'fault-fs.js'),
+      SWAP_FAULT: JSON.stringify({
+        call: 'readFileSync', match: '.credentials.json', kind: 'throw', code: 'EBUSY', nth: [1, 4],
+      }),
+    },
+  });
+  const out = s.out + s.err;
+  check('2 回続けて読めないときは「いまは健全に読めています」と言わない',
+    !out.includes('いまは健全に読めています'), out);
+  check('代わりに「読めたり読めなかったりします」と言う',
+    /読めたり読めなかったりします/.test(out), out);
+}
+
 // --- 来歴(.current)が読めないときに黙って別名を作らない ---
 // 生の readFileSync + catch で「無い」に倒していた頃は、権限やロックで読めないだけでも
 // 「未記録」になり、subscriptionType 由来の名前へ黙って乗り換えて、同じアカウントを 2 つの
@@ -2344,6 +2448,20 @@ const TRUNCATED_CURRENT =
   check('書きかけのファイルを status が知らせる', out.includes('mypro.json.tmp'), out);
   check('退避済みの一覧には混ぜない(.json ではないので)',
     !out.includes('* mypro.json.tmp'), out);
+}
+{
+  // 上のテストは accounts/ 配下の書きかけ(savedPartial)を見ている。書きかけは現在の
+  // credentials 側(切り替えの最終段である writeAtomic(CREDENTIALS))にも同じ理由で残りうるが、
+  // savedPartial は accounts/ の readdir なので構造上 ~/.claude/.credentials.json.tmp を
+  // 拾えない。ここを見ていないと、平文トークンを含む .tmp が accounts/ の外に残り続けても
+  // status がずっと気づかない。
+  const home = sandbox('current-partial-write-visible-in-status', { current: creds('pro') });
+  fs.writeFileSync(credPath(home) + '.tmp', '{"claudeAiOauth":{"accessToken":"AT-LIVE","refreshTo', 'utf8');
+  const out = (({ out: o, err }) => o + err)(runSwap(home, []));
+  check('現在の credentials 側の書きかけファイルも status が知らせる',
+    out.includes(credPath(home) + '.tmp'), out);
+  check('書きかけの枠に入れて知らせる',
+    out.includes('書きかけのまま残っているファイルがあります'), out);
 }
 
 report();
