@@ -1369,6 +1369,25 @@ console.log('swap');
     r.err);
   check('復元できる名前はこれまでどおり案内する',
     /^\s*swap alpha\s*$/m.test(r.err), r.err);
+  // 対照: 復元できるスロット(alpha)が 1 つでもあれば、これまでどおり択一を促す見出しのまま
+  check('復元できるスロットが 1 つでもあれば択一を促す',
+    /いずれか1つを選んでください/.test(r.err), r.err);
+}
+{
+  // 追加修正(1): 復元できるスロットが 1 つも無い(save は予約語衝突、help も同様)ときに、
+  // 「いずれか1つを選んでください」と択一を促すと、無い選択肢を探させることになる。
+  // 各行には改名や読み取り失敗への対処が書いてあるので、見出しはそちらへ読ませる文面に切り替わる。
+  const home = sandbox('missing-target-all-unrestorable', {
+    accounts: { save: creds('pro'), help: creds('pro') },
+  });
+  const r = runSwap(home, ['nosuchslot']);
+  check('選べる行が無いときは択一を促さない', !/いずれか1つを選んでください/.test(r.err), r.err);
+  check('代わりに「いま復元できるものはありません」と言う',
+    /退避はありますが、いま復元できるものはありません/.test(r.err), r.err);
+  check('各スロットの改名案内はこれまでどおり出る',
+    /^\s*save:/m.test(r.err) && /^\s*help:/m.test(r.err)
+    && /swap のサブコマンドと同じ名前なので/.test(r.err) && /別の名前へ改名してください/.test(r.err),
+    r.err);
 }
 {
   // 切り替え後の「元に戻すには」も同じ判定を通す。来歴が save を指したまま切り替えると、
@@ -1387,6 +1406,37 @@ console.log('swap');
   check('代わりに改名を促す案内を出す',
     /元に戻すには: swap のサブコマンドと同じ名前なので/.test(r.out) && /別の名前へ改名してください/.test(r.out),
     r.out);
+}
+{
+  // 追加修正(2): reportOtherSlots(取り残されるスロットの案内)は returnCmd が null
+  // (退避名がサブコマンドと衝突していて、戻すコマンドが打てる形で存在しない)のとき、以前は
+  // 警告ごと行が消えていた。その下に並ぶ `swap save <n> --force` が書き込むのは現在のログイン
+  // = いま復元したアカウントなので、警告が無いとそのまま打ってよく見える(戻さずに打つと
+  // mirror の唯一の控えが復元後の内容で潰れる)。来歴が save を指したまま切り替え、かつ
+  // 同じ内容を持つ別名スロット(mirror)を用意して reportOtherSlots を発火させる
+  // (組み立ては「切り替え時の退避でも他スロットは書き換えない」の stale-slots-swap と同じで、
+  // スロット名を save/mirror に差し替えただけ)。
+  const home = sandbox('report-other-slots-reserved-name', {
+    current: creds('pro', { token: 'pro-new' }),
+    accounts: {
+      save: creds('pro', { token: 'pro-old' }),
+      mirror: creds('pro', { token: 'pro-old' }),
+      team: creds('team'),
+    },
+    slot: 'save',
+  });
+  const r = runSwap(home, ['team']);
+  check('切り替えは成功する(前提)', r.code === 0, r.out + r.err);
+  check('取り残されるスロットを知らせる(前提)', /内容が違うスロットがあります: mirror/.test(r.out),
+    r.out + r.err);
+  check('戻すコマンドが無くても上書きの警告は消さない',
+    /先に元へ戻さないと/.test(r.out), r.out);
+  // 「復元コマンドとしての swap save」(単独行)と「更新コマンドとしての swap save mirror --force」
+  // (末尾に別名と --force が付く)を取り違えないよう、行単位で判定する。
+  check('swap save を復元コマンドとしては案内しない',
+    !r.out.split('\n').some((l) => /^\s*swap save\s*$/.test(l)), r.out);
+  check('swap save <別名> --force という更新コマンドはこれまでどおり出る',
+    /^\s*swap save mirror --force\s*$/m.test(r.out), r.out);
 }
 
 // --- 中止の不変条件 ---
