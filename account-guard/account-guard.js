@@ -796,7 +796,13 @@ function main() {
     // 読めないだけの設定も false にするので、broken(修復するまで全拒否 = 保護は最も強く
     // 効いている)状態に対して「保護は無効」と正反対の表示を出していた。判定は probeFile に
     // 合流させ、broken が分かっているときはそちらの表示に任せる(すぐ下で出す)。
-    const configMissing = !config.broken && !!credentials && !credentials.probeFile(CONFIG).exists;
+    // credentials.js を読み込めなかった構成では probeFile が使えない。そこで判定ごと諦めると、
+    // 設定が本当に無くても「未作成 — 保護は無効」が出なくなる。status は「なぜ拒否される/
+    // されない」を調べに来る入り口なので、精度は落ちても存在の有無だけは伝える
+    // (existsSync は読めないだけの設定も false にするが、その場合は config.broken 側の
+    // 表示がすぐ下で出るため、ここで取り違えたまま終わることはない)。
+    const configExists = credentials ? credentials.probeFile(CONFIG).exists : fs.existsSync(CONFIG);
+    const configMissing = !config.broken && !configExists;
     console.log(`設定: ${CONFIG}${configMissing ? ' (未作成 — 保護は無効)' : ''}`);
     if (config.broken) {
       console.log('設定を読めません — 修復するまで、設定ファイル自身の編集以外は拒否します。');

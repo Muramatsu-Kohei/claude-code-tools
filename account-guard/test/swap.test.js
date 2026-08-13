@@ -2243,4 +2243,63 @@ const TRUNCATED_CURRENT =
   check('開けないことと、控えも取れないことを伝える', out.includes('控えも取れない'), out);
 }
 
+// --- 1 回目の読み取りだけ失敗する現在の credentials ---
+// cmdSwap は cur が null のときだけ復元ガードを素通しする設計なので、たまたま 1 回目の read が
+// 失敗しただけの状態を null のまま進めると、来歴一致・退避先が復元元と同じ・同一プランで
+// 別アカウント未確認の 3 つが同時に外れる。実機相当の再現(credentials の 1 回目の read にだけ
+// EBUSY を注入)では「切り替え: mypro -> mypro」と表示して読み込み済みの旧内容を書き戻し、
+// exit 0 で終わっていた(ローテート前のトークンへ退化する)。
+{
+  const home = sandbox('current-unreadable-once-guard', {
+    current: creds('pro', { token: 'CUR-NEW' }),
+    accounts: { mypro: creds('pro', { token: 'SLOT-OLD' }) },
+    slot: 'mypro',
+  });
+  const r = execSwapScript(SWAP, ['mypro'], {
+    env: {
+      ...homeEnv(home),
+      NODE_OPTIONS: '--require ' + path.join(__dirname, 'fault-fs.js'),
+      SWAP_FAULT: JSON.stringify({
+        call: 'readFileSync', match: '.credentials.json', kind: 'throw', code: 'EBUSY', nth: 1,
+      }),
+    },
+  });
+  check('1 回目だけ読めなくても復元ガードは素通りしない', r.code !== 0, r.out + r.err);
+  check('現在のログインはローテート前へ巻き戻らない',
+    tokenOf(credPath(home)) === 'CUR-NEW', tokenOf(credPath(home)));
+}
+
+// --- 来歴(.current)が読めないときに黙って別名を作らない ---
+// 生の readFileSync + catch で「無い」に倒していた頃は、権限やロックで読めないだけでも
+// 「未記録」になり、subscriptionType 由来の名前へ黙って乗り換えて、同じアカウントを 2 つの
+// 名前で退避した状態(README が危険だと書いている状態)を無警告で作っていた。
+{
+  const home = sandbox('current-slot-unreadable-warns', {
+    current: creds('pro', { token: 'cur' }),
+    accounts: { mypro: creds('pro', { token: 'mypro' }) },
+  });
+  fs.mkdirSync(slotPath(home), { recursive: true }); // .current をディレクトリにして読めなくする
+  const r = runSwap(home, ['save']);
+  // 「来歴」を含むかだけを見ると、書き込み側の失敗(来歴を記録できませんでした)が同じ語を
+  // 含むため、読み取り側の通知を消しても緑のままになる。読み取り側の文面を名指しで見る。
+  check('来歴を読めないことを黙って握り潰さない',
+    (r.out + r.err).includes('来歴(.current)を読めません'), r.out + r.err);
+}
+
+// --- 書きかけのまま残ったファイルを status が知らせる ---
+// writeAtomic の後始末は例外経路にしか効かないので、書き込み中にプロセスごと落ちると平文の
+// トークンを含む <名前>.json.tmp が残る。一覧も控えの集計も `.json` しか見ないため、
+// 知らせる場所が 1 つも無かった。
+{
+  const home = sandbox('partial-write-visible-in-status', {
+    current: creds('pro', { token: 'cur' }),
+    accounts: { mypro: creds('pro', { token: 'mypro' }) },
+  });
+  fs.writeFileSync(acctPath(home, 'mypro') + '.tmp', '{"claudeAiOauth":{"refreshToken":"rt', 'utf8');
+  const out = (({ out: o, err }) => o + err)(runSwap(home, []));
+  check('書きかけのファイルを status が知らせる', out.includes('mypro.json.tmp'), out);
+  check('退避済みの一覧には混ぜない(.json ではないので)',
+    !out.includes('* mypro.json.tmp'), out);
+}
+
 report();

@@ -315,8 +315,36 @@ function unreadableReason(file) {
     label: 'いまは健全に読めています(先ほど読めなかった理由は特定できません)',
     verdict: 'usable',
     copyable: true,
-    hasToken: true,
+    // 健全に読めても refreshToken を持たない形はありうる(accessToken だけの構造)。
+    // 事実を確かめずに true を返すと、将来この verdict を案内に通したときに
+    // 「refreshToken が残っています」と嘘をつく。
+    hasToken: !!refreshTokenOf(p.json),
   };
+}
+
+// 「現在のログイン」を、復元ガードが門番に使える形で読む。cmdSwap は cur が null のときだけ
+// ガードを素通しする設計なので、1 回目の読み取りがたまたま失敗しただけの状態を null のまま
+// 進めると、来歴一致・退避先が復元元と同じ・同一プランで別アカウント未確認の 3 つが同時に
+// 外れる。実際、credentials の 1 回目の read にだけ EBUSY を注入すると(Windows で稼働中の
+// Claude Code やウイルス対策が一瞬掴む状況)、`swap <いま居るスロット>` が「切り替え: X -> X」と
+// 表示しながら読み込み済みの旧内容をマシン全体へ書き戻し、exit 0 で終わっていた
+// (ローテート前のトークンへ退化する。このツールが防ごうとしている事象そのもので、exit 0 な
+// ぶんラッパーも異常に気づけない)。
+// unreadableReason が 'usable' を返すのは「いま読み直せば健全に読めた」という事実なので、
+// それに従って 1 度だけ読み直す。cmdSave は同じ状況を「いまは読めています。そのまま
+// もう一度実行してください」と案内しており、読み直す判断はそこと揃う。
+//   cur … 読めた現在のログイン(null なら未ログイン、または読めない)
+//   why … cur が null で、かつファイルは在るときの理由(未ログインなら null)
+function readCurrentForGuard() {
+  const cur = readCredsOrNull(CREDENTIALS);
+  if (cur) return { cur, why: null };
+  if (!probeFile(CREDENTIALS).exists) return { cur: null, why: null }; // 単に未ログイン
+  const why = unreadableReason(CREDENTIALS);
+  if (why.verdict !== 'usable') return { cur: null, why };
+  // 読み直しても取れなければ、その隙にまた掴まれたということ。理由を取り直して「読めない」
+  // として扱う(null のまま進めると、上に書いたガードの素通しが再発する)。
+  const again = readCredsOrNull(CREDENTIALS);
+  return again ? { cur: again, why: null } : { cur: null, why: unreadableReason(CREDENTIALS) };
 }
 
 // 残した控えをどう扱えばよいかの案内。verdict から 1 箇所で決める。この判断が cmdSwap と
@@ -405,7 +433,9 @@ function writeAtomic(file, data) {
     renamed = true;
   } finally {
     // 書き込み・chmod・rename のどこで落ちても、平文トークン入りの .tmp を残さない。
-    // 一覧は `.json` しか拾わないので、残しても誰も気づけないまま溜まっていく。
+    // ただしここで掃除できるのは例外経路だけで、書き込み中にプロセスごと落ちる(電源断・
+    // 強制終了)と .tmp は残る。一覧は `.json` しか拾わないため気づけないので、savedAccounts が
+    // 同じ readdir で拾い、status が知らせる(そちらのコメント参照)。
     if (!renamed) { try { fs.unlinkSync(tmp); } catch {} }
   }
 }
@@ -472,22 +502,28 @@ function needsForceToRestore(fromJson, slotJson, curUnsavable) {
 // 存在すると ENOTDIR の生例外が main() まで抜け、原因も対処も示されないまま全サブコマンドが
 // 死んでいた。同じファイルの listReplaced() (340-345 付近)と同じパターンに揃え、
 // エラーを戻り値に入れて呼び出し元に判断を返す。
+// 書きかけの .tmp も同じ readdir で拾う。writeAtomic の finally は例外経路しか掃除しないので、
+// 書き込み中に落ちる(電源断・強制終了)と平文のトークンを含む <名前>.json.tmp が残る。一覧も
+// 控えの集計も `.json` しか見ないため、残っても誰も気づけないまま置かれ続けていた。読む側を
+// 増やさず、ここで一緒に返して status に知らせさせる。
 function savedAccounts() {
   try {
+    const entries = fs.readdirSync(ACCOUNTS_DIR);
     return {
-      names: fs.readdirSync(ACCOUNTS_DIR)
+      names: entries
         .filter(f => f.endsWith('.json'))
         .map(f => f.slice(0, -5))
         .filter(n => NAME_RE.test(n))
         .sort(),
+      partial: entries.filter(f => f.endsWith('.json.tmp')).sort(),
       error: null,
     };
   } catch (e) {
     // ENOENT(まだ 1 度も退避していない)だけが「無い」。existsSync を盾にしていた頃は、
     // 権限で stat できない場合も同じ「0 件・error なし」に落ちており、すぐ下のコメントが
     // 禁じている「読めないことを 0 件に倒す」を入口で自分がやっていた。
-    if (e.code === 'ENOENT') return { names: [], error: null };
-    return { names: [], error: e.code || e.message };
+    if (e.code === 'ENOENT') return { names: [], partial: [], error: null };
+    return { names: [], partial: [], error: e.code || e.message };
   }
 }
 
@@ -809,13 +845,31 @@ function canonicalSlotName(name) {
   return hits.length === 1 ? hits[0] : name;
 }
 
+// 来歴が読めないことは 1 回の実行で 6 箇所から検出されうる(readCurrentSlot の呼び出し数)。
+// そのたびに出すと本題の案内が埋もれるので、最初の 1 回だけ知らせる。
+let currentSlotWarned = false;
+function warnCurrentUnreadable(code) {
+  if (currentSlotWarned) return;
+  currentSlotWarned = true;
+  console.error('注意: 来歴(.current)を読めません(' + (code || '理由不明') + ')。'
+    + '退避名は subscriptionType から決めます: ' + CURRENT_FILE);
+}
+
 function readCurrentSlot() {
-  let name;
-  try {
-    name = fs.readFileSync(CURRENT_FILE, 'utf8').trim();
-  } catch {
-    return null; // 未記録(このツールを使い始めた直後、または手で消した)
+  // 読み取りは probeFile に一本化する(規則1)。生の readFileSync + catch で「無い」に倒して
+  // いた頃は、.current が権限やロックで読めないだけでも「未記録」になり、来歴を失ったまま
+  // subscriptionType 由来の名前へ黙って乗り換えて、同じアカウントを 2 つの名前で退避した
+  // 状態(README が危険だと書いている状態)を無警告で作っていた。--force では「退避先が
+  // 復元元と同じ名前になります」のガードも同じ経路で外れる。
+  const p = probeFile(CURRENT_FILE);
+  if (!p.exists) return null; // 未記録(このツールを使い始めた直後、または手で消した)
+  if (!p.readable) {
+    // 読めない来歴を「無い」と同じに扱わない。名前を決められないことは伝わるべきで、
+    // 黙って別名を作らせない(呼び出し元は null を「決められない」として扱う)。
+    warnCurrentUnreadable(p.code);
+    return null;
   }
+  const name = p.raw.trim();
   // 指す先が「無い」ときだけ来歴を無効にする。existsSync は読めないだけのスロットも false に
   // するので、来歴は生きているのに「未記録」へ落ち、overwriteGate の provenance 判定が
   // 効かないまま別アカウントのスロットを上書きする経路になっていた。
@@ -1216,7 +1270,7 @@ function cmdStatus() {
   // status は「いま何が残っているか」を確かめる唯一の入り口なので、一覧が読めなくても
   // 最後まで出しきる。ここで止めると下の .replaced の復旧・保全の案内に到達せず、
   // 控えが残っていること自体に気づけない(listReplaced が例外を戻り値に変えているのと同じ理由)。
-  const { names: saved, error: savedError } = savedAccounts();
+  const { names: saved, partial: savedPartial, error: savedError } = savedAccounts();
   // 各スロットの中身はここで 1 回だけ読み、outdatedSlots の判定と下の表示ループの両方で
   // 使い回す(前は判定と表示で別々に全スロットを読んでいた)。
   const savedCreds = new Map(saved.map(n => [n, readCredsOrNull(accountFile(n))]));
@@ -1239,6 +1293,15 @@ function cmdStatus() {
         + (c ? expiryNote(c.json) : '  [読めません]')
         + (outdated.has(name) ? '  [現在のログインと内容が違います]' : ''));
     }
+  }
+  // 書きかけのまま残ったファイル。writeAtomic の後始末は例外経路にしか効かないので、書き込み
+  // 中に落ちるとここに残る。中身は平文のトークンで、退避の一覧にも控えの集計にも現れないため、
+  // 知らせるのはこの status だけ。消してよいかは中身を見ないと決められない(唯一のコピーで
+  // ありうる)ので、判断材料だけ出して削除は促さない(keptNote と同じ扱い)。
+  if (savedPartial && savedPartial.length > 0) {
+    console.log('\n書きかけのまま残っているファイルがあります(平文のトークンを含みます):');
+    for (const f of savedPartial) console.log('  ' + path.join(ACCOUNTS_DIR, f));
+    console.log('  退避が済んでいるかを確かめたうえで、不要なら削除してください');
   }
   if (outdated.size > 0) {
     console.log('\n[現在のログインと内容が違います] の退避は、復元しても現在と同じ状態には'
@@ -1431,19 +1494,15 @@ function cmdSwap(target, force) {
   // 同じ cur/curSlotOf が要る(利用可能なスロットごとに、いま打てば通るコマンドを
   // 具体化するため)ようになったので、ここまで読み込み位置を前へ動かした。読み込みは
   // 引き続き 1 回のまま(二度読むと、判定に使ったバイト列と実際に退避するバイト列がずれる)。
-  const cur = readCredsOrNull(CREDENTIALS);
-  const curSlot = readCurrentSlot();
-  const curSlotOf = curSlot || (cur && cur.json ? accountNameOf(cur.json) : null);
   // cur が null でも「未ログイン(ファイルが無い)」と「あるが読めない・壊れている」は別物で、
   // 出すべき案内が正反対になる(前者は退避するものが無い、後者は先に控えを取らないと
   // そのあとの /login で未退避の refreshToken を失う)。cur だけを見て分岐していた頃は
   // 後者が前者に混ざり、「退避されていません」の案内が素の `swap <name>` だけを並べ、
-  // 打つと「現在の credentials を読めません」で即座に止まっていた。ここで 1 回だけ見立てを
-  // 取り、以降の案内はすべてこの値を通す(判定を各所で書き写さない)。
-  // verdict 'usable' を除くのは、読み直した時点で読めているなら退避できるため
-  // (readCredsOrNull が失敗した直後にロックが解けた場合。--force を勧める理由が無い)。
-  const curWhy = !cur && probeFile(CREDENTIALS).exists ? unreadableReason(CREDENTIALS) : null;
-  const curUnsavable = curWhy && curWhy.verdict !== 'usable' ? curWhy : null;
+  // 打つと「現在の credentials を読めません」で即座に止まっていた。curUnsavable が
+  // その区別(= 読めない理由)で、以降の案内はすべてこの値を通す(判定を各所で書き写さない)。
+  const { cur, why: curUnsavable } = readCurrentForGuard();
+  const curSlot = readCurrentSlot();
+  const curSlotOf = curSlot || (cur && cur.json ? accountNameOf(cur.json) : null);
 
   // 「無い」ときだけ「退避されていません」と言い切る。existsSync では読めないだけのスロットも
   // ここへ落ち、実際には退避済みなのに「退避されていません」と案内していた(そのまま
