@@ -2138,5 +2138,10 @@ function main() {
 try {
   main();
 } catch (e) {
-  fail(e.message);
+  // 想定外の例外は、どの出力の途中でも起こりうる唯一の経路(他の fail はすべて、まだ何も
+  // stdout へ出していない時点のガードとして使っている)。ここで process.exit すると、
+  // そこまでに出した行 ─ 切り替えの結果、退避先、控えの場所 ─ がパイプ越しに切れて、
+  // 何がどこまで済んだのかを読み取れなくなる。exitCode を立てて自然に抜ける。
+  failText(e.message);
+  process.exitCode = 1;
 }
