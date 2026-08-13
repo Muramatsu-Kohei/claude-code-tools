@@ -2243,6 +2243,36 @@ const TRUNCATED_CURRENT =
   check('開けないことと、控えも取れないことを伝える', out.includes('控えも取れない'), out);
 }
 
+// --- 大小を区別するファイルシステムでは読み替えない ---
+// canonicalSlotName の、上の「大小無視 FS」ブロックとは逆側。Windows/macOS の既定では実測分岐で
+// スキップされてしまい、Linux でしか検査できていなかった。区別する FS の本質は「打った名前の
+// ファイルが実在しない(ENOENT)」ことなので、accounts/Pro.json の読み取りにだけ ENOENT を
+// 注入して同じ状況を作る(readdir には pro.json しか現れない、という条件はそのまま成立する)。
+// 名前だけで読み替えていた頃は、`swap save Pro` が既存の pro スロットへ読み替わり、別アカウントの
+// 唯一の退避を狙って上書きガードも来歴判定もすり抜けていた。
+{
+  const home = sandbox('canonical-slot-name-case-sensitive', {
+    current: creds('pro', { token: 'cur-account' }),
+    accounts: { pro: creds('pro', { token: 'other-account' }) },
+  });
+  const r = execSwapScript(SWAP, ['save', 'Pro'], {
+    env: {
+      ...homeEnv(home),
+      NODE_OPTIONS: '--require ' + path.join(__dirname, 'fault-fs.js'),
+      SWAP_FAULT: JSON.stringify({
+        call: 'readFileSync', match: 'Pro.json', kind: 'throw', code: 'ENOENT',
+      }),
+    },
+  });
+  const out = r.out + r.err;
+  // 実ファイルの中身では判定できない(このマシンの FS は大小を無視するので、Pro.json への
+  // 書き込みは pro.json に当たる)。読み替えたかどうかは、選ばれたスロット名に現れる。
+  check('区別する FS では既存の pro スロットへ読み替えない',
+    out.includes('Pro') && !/退避しました: pro\b/.test(out), out);
+  check('別アカウントの退避を上書きするガードに当たらない(そもそも別スロット)',
+    !out.includes('上書きを中止'), out);
+}
+
 // --- 1 回目の読み取りだけ失敗する現在の credentials ---
 // cmdSwap は cur が null のときだけ復元ガードを素通しする設計なので、たまたま 1 回目の read が
 // 失敗しただけの状態を null のまま進めると、来歴一致・退避先が復元元と同じ・同一プランで
