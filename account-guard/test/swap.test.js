@@ -2189,4 +2189,58 @@ console.log('swap');
   // (target='Pro' は accounts/pro.json に一致しないため)。check() を出さずに抜ける。
 }
 
+// --- 読めない現在の credentials に対する案内 ---
+// 3 つとも根は同じ: コードが現在の credentials を「読める / 無い」の 2 値でしか持たず、
+// 「読めない」を扱う唯一の箇所が accessToken 欠け(stale)決め打ちだったこと。判定は
+// unreadableReason の copyable / hasToken に合流させてある(swap.js の同名コメント参照)。
+// 書き込みが途中で切れた形。JSON としては壊れているが、生バイト列に refreshToken が残る。
+const TRUNCATED_CURRENT =
+  '{"claudeAiOauth":{"accessToken":"at-x","refreshToken":"rt-only-copy","expiresAt":1';
+
+{
+  // 復元先も壊れていて中止するとき、現在の唯一の refreshToken を控えに残す手順を先に案内する。
+  // 案内せず `/login` し直すことだけを勧めていた頃は、.replaced に控えが 1 つも無い状態で
+  // 上書きを促しており、そのとおり打つと未退避の refreshToken が完全に失われた。
+  const home = sandbox('unreadable-current-restore-guidance', {
+    current: TRUNCATED_CURRENT,
+    accounts: { alpha: '{ broken slot' },
+  });
+  const out = (({ out: o, err }) => o + err)(runSwap(home, ['alpha']));
+  check('壊れた現在では控えを残す手順を先に案内する',
+    out.includes('swap save --force') && out.includes('控え'), out);
+  check('控えに refreshToken が残ることまで伝える', out.includes('refreshToken'), out);
+}
+
+{
+  // 退避済みスロットがあるときの一覧。現在が読めないと saveFirstText が「不要」を返し、
+  // 素の `swap <名前>` だけを並べていた。打つと「現在の credentials を読めません」で
+  // 即座に止まる(このファイルで繰り返し起きた「案内どおり打つと止まる」)。
+  const home = sandbox('unreadable-current-slot-list', {
+    current: TRUNCATED_CURRENT,
+    accounts: { alpha: creds('pro', { token: 'alpha-token' }) },
+  });
+  const out = (({ out: o, err }) => o + err)(runSwap(home, ['nosuch']));
+  check('読めない現在では控えを取る手順も案内する', out.includes('swap save --force'), out);
+  check('復元コマンドに --force が付く(付けないと退避の段で止まる)',
+    out.includes('swap alpha --force'), out);
+  // 案内どおり打つと本当に通ることまで確かめる(reachable.test.js と同じ基準)。
+  runSwap(home, ['save', '--force']);
+  const r2 = runSwap(home, ['alpha', '--force']);
+  check('案内どおり打つと切り替えまで到達する', r2.code === 0, r2.out + r2.err);
+  check('現在の中身は控えとして残っている',
+    replacedFiles(home, '.unreadable-current').length === 1,
+    replacedFiles(home, '.unreadable-current').join(', '));
+}
+
+{
+  // 開くことすらできない現在(ここでは同名ディレクトリを置いて EISDIR にする)。控えは
+  // copyFileSync が同じ理由で落ちるので取れないのに、「--force を付ければ控えが残ります
+  // (refreshToken を取り出せます)」と約束していた。約束してよいのはバイト列を読めたときだけ。
+  const home = sandbox('unopenable-current-no-copy-promise');
+  fs.mkdirSync(credPath(home), { recursive: true });
+  const out = (({ out: o, err }) => o + err)(runSwap(home, ['nosuch']));
+  check('開けない現在では控えを約束しない', !out.includes('控えだけが残ります'), out);
+  check('開けないことと、控えも取れないことを伝える', out.includes('控えも取れない'), out);
+}
+
 report();

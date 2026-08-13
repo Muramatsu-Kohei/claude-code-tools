@@ -228,6 +228,14 @@ function readCredsOrNull(file) {
 function isLiveCredentialsFile(file) {
   return file === CREDENTIALS;
 }
+// verdict のほかに、案内を組み立てる側が必要とする事実を 2 つ添える。verdict だけを見て
+// 文面を決めていた頃は、呼び出し側が「読めない = accessToken 欠け」と決め打ちし、開くことすら
+// できないファイルにも「--force を付ければ控えが残ります(refreshToken を取り出せます)」と
+// 約束していた(実際には copyFileSync が同じ理由で落ち、控えは 1 つも残らない)。
+//   copyable … バイト列としては読めた = keepAside で控えを取れる。約束してよいのはこのときだけ
+//   hasToken … その中身に refreshToken が残っている = /login で上書きさせてはいけない
+// hasToken の判定は credentials.js の rawHasRecoverableToken に合流させる(ここで書き起こすと、
+// account-guard.js の credentialsState() と同じ状態を別の基準で分類する食い違いが戻る)。
 function unreadableReason(file) {
   const live = isLiveCredentialsFile(file);
   // 読み取りは probeFile に一本化する。ここで readFileSync を書き起こしていた頃は、
@@ -238,7 +246,7 @@ function unreadableReason(file) {
     if (!p.exists) {
       // 呼び出し元は存在を確かめてから呼ぶので、ここへ来るのは直後に消えたとき。中身を
       // 一度も見ていない以上「無価値」とは言い切れない(unusable は控えを消させる)。
-      return { label: 'ファイルがありません', verdict: 'unreadable' };
+      return { label: 'ファイルがありません', verdict: 'unreadable', copyable: false, hasToken: false };
     }
     // EISDIR / ENOTDIR は「そこに読めるファイルが無い」の変種。同じ名前のディレクトリが
     // 置かれている(あるいは途中の要素がファイルになっている)ことが原因で、一過性の
@@ -248,6 +256,8 @@ function unreadableReason(file) {
         label: '読み取りに失敗しました(' + p.code + ')。'
           + '同じ名前のディレクトリが置かれていないか確認してください',
         verdict: 'unreadable',
+        copyable: false,
+        hasToken: false,
       };
     }
     // ENOENT 以外の読み取り失敗(EBUSY・EPERM・EACCES など)。ウイルス対策やバックアップ
@@ -257,6 +267,8 @@ function unreadableReason(file) {
     return {
       label: '読み取りに失敗しました(' + p.code + ')。掴んでいるプロセスを終えるか、権限を確認してください',
       verdict: 'unreadable',
+      copyable: false,
+      hasToken: false,
     };
   }
   if (p.parseError) {
@@ -266,6 +278,8 @@ function unreadableReason(file) {
     return {
       label: live ? '壊れているか、他のプロセスが書き込み中' : '壊れています(JSON として読めません)',
       verdict: 'unreadable',
+      copyable: true,
+      hasToken: rawHasRecoverableToken(p.raw),
     };
   }
   if (!hasUsableCredentials(p.json)) {
@@ -279,18 +293,30 @@ function unreadableReason(file) {
         label: 'claudeAiOauth.accessToken がありません(形式が想定と違います)。'
           + 'ただし refreshToken は残っています(交換すればまた使えます)',
         verdict: 'stale',
+        copyable: true,
+        hasToken: true,
       };
     }
     // JSON として読めたうえで、交換できるトークンも無い。「復元に使えない」と言い切れるのは
     // 中身を最後まで確認できたこの経路だけで、控えを消してよいと案内できるのもここに限る。
-    return { label: 'claudeAiOauth.accessToken がありません(形式が想定と違います)', verdict: 'unusable' };
+    return {
+      label: 'claudeAiOauth.accessToken がありません(形式が想定と違います)',
+      verdict: 'unusable',
+      copyable: true,
+      hasToken: false,
+    };
   }
   // ここへ来る = 読み直した時点では健全に読める。cmdSave は --force を挟んでから改めて
   // この関数を呼ぶ設計なので、その間にロック(や書き込み)が解けていれば必ずここに落ちる。
   // 「待てば直るかもしれない」という推測ではなく「いま読めた」という事実なので、案内も
   // 推測ではなく事実として出す。ここで /login を案内すると、健全な credentials を前に
   // 未退避アカウントの refreshToken を捨てさせることになる。
-  return { label: 'いまは健全に読めています(先ほど読めなかった理由は特定できません)', verdict: 'usable' };
+  return {
+    label: 'いまは健全に読めています(先ほど読めなかった理由は特定できません)',
+    verdict: 'usable',
+    copyable: true,
+    hasToken: true,
+  };
 }
 
 // 残した控えをどう扱えばよいかの案内。verdict から 1 箇所で決める。この判断が cmdSwap と
@@ -429,7 +455,14 @@ function expiryNote(json) {
 // 使うため、モジュールスコープへ移した(中身は変えていない)。案内する場所ごとにこの判定を
 // 書き写すと、片方だけ直して「案内どおり打つと止まる」事故が再発する(このファイルで
 // 繰り返し起きてきた)。
-function needsForceToRestore(fromJson, slotJson) {
+// curUnsavable は「現在の credentials をそのまま退避できない」ときの理由(unreadableReason の
+// 戻り値)。この状態では復元にも必ず --force が要る(saveCurrent は force.unreadable を見て
+// 初めて控えだけ残して先へ進む)。fromJson は未ログインでも読めない場合でも同じく null に
+// なるため、fromJson だけでは両者を区別できない。区別せずに案内していた頃は、読めない現在に
+// 対して素の `swap <name>` を案内し、案内どおり打つと「現在の credentials を読めません」で
+// 必ず止まっていた(このファイルで繰り返し起きた「案内どおり打つと止まる」と同じ形)。
+function needsForceToRestore(fromJson, slotJson, curUnsavable) {
+  if (curUnsavable) return true;
   if (!slotJson) return true;
   if (isExpired(slotJson) || !refreshTokenOf(slotJson) || !subscriptionTypeOf(slotJson)) return true;
   return fromJson ? !planDiffers(fromJson, slotJson) : false;
@@ -1330,23 +1363,37 @@ function cmdSave(name, force) {
 // 表す json の由来が 2 箇所で違う。片方は accessToken 必須の readCredsOrNull、もう片方は
 // verdict 'stale' も拾う)。文面の組み立てだけをここに集め、片方だけ直して食い違う事故
 // (このファイルで繰り返し起きた「案内どおり打つと止まる」)を防ぐ。
-// staleCur は「現在の credentials が accessToken を欠いている」(refreshToken だけ残っている)。
+// curUnsavable は「現在の credentials をそのままスロットへ退避できない」ときの理由
+// (unreadableReason の戻り値。読めない・壊れている・accessToken 欠けのいずれも入る)。
 // この状態では素の `swap save <name>` は「現在の credentials を読めません」で必ず止まり、
 // --force を付けても読めない中身はスロットに入れない設計なので、退避そのものは達成できない
 // (控えだけが .replaced に残る)。ここを普通の退避として案内していた頃は、案内どおり 2 手
 // 打っても退避できず、利用者が行き止まりに入っていた。打てば何が起きるかまで書く。
-function saveFirstText(needsName, sameAsTarget, saveBlocked, curSlotOf, staleCur) {
-  const needed = needsName || sameAsTarget || saveBlocked || !!staleCur;
-  // staleCur では名前を出さない。この経路の --force は「読めない現在を諦めて控えだけ残す」
+// 理由を boolean の staleCur で受けていた頃は、呼び出し側が「読めない = accessToken 欠け」と
+// 決め打ちして true を渡しており、開くことすらできないファイル(EACCES/EBUSY/EISDIR)にも
+// 「--force を付ければ控えが残ります」と約束していた。控えを約束してよいのは copyable の
+// ときだけで、refreshToken の存在に触れてよいのは hasToken のときだけ。
+function saveFirstText(needsName, sameAsTarget, saveBlocked, curSlotOf, curUnsavable) {
+  const needed = needsName || sameAsTarget || saveBlocked || !!curUnsavable;
+  // curUnsavable では名前を出さない。この経路の --force は「読めない現在を諦めて控えだけ残す」
   // ことにしか効かず、saveCurrent は名前を決める手前で返るので名前は使われない。にもかかわらず
   // `<name>` を埋めて案内すると、表示どおり打った人が validateName に弾かれて別のエラーで
   // 止まり、控えを残す経路に到達できない(cmdSave の forceCmd で同じ事故を既に直している)。
   const name = needsName ? '<name>' : (sameAsTarget || saveBlocked) ? '<別名>' : curSlotOf;
-  const cmd = staleCur ? 'swap save --force' : 'swap save ' + name;
-  const why = staleCur
-    ? '\n  (現在の credentials は accessToken を欠いているため、スロットへは退避できません。'
-      + '--force を付けると ' + REPLACED_DIR + ' に控えだけが残ります'
-      + '(そこに refreshToken が残るので、あとから取り出せます))'
+  const cmd = curUnsavable ? 'swap save --force' : 'swap save ' + name;
+  const why = curUnsavable
+    ? (curUnsavable.copyable
+      // 開けてはいる(バイト列は読めた)。スロットへは入らないが控えは確実に取れるので、
+      // そこまでを約束する。refreshToken に触れてよいのは、実際に残っていると確かめた
+      // ときだけ(rawHasRecoverableToken の判定を hasToken として受け取っている)。
+      ? '\n  (現在の credentials はスロットへ退避できません: ' + curUnsavable.label
+        + '。--force を付けると ' + REPLACED_DIR + ' に控えだけが残ります'
+        + (curUnsavable.hasToken ? '。控えに refreshToken が残るので、あとから取り出せます' : '')
+        + ')'
+      // 開くことすらできない。控えは copyFileSync が同じ理由で落ちるので取れない。
+      // ここで控えを約束すると、案内どおり打った人が「控えを取れませんでした」で行き止まる。
+      : '\n  (現在の credentials を開けません: ' + curUnsavable.label
+        + '。開けないあいだは控えも取れないので、先に原因を解いてください)')
     : needsName
       ? '\n  (現在のログインは退避名を決められない状態です'
         + '(subscriptionType が読めず、来歴も記録されていません)。'
@@ -1387,6 +1434,16 @@ function cmdSwap(target, force) {
   const cur = readCredsOrNull(CREDENTIALS);
   const curSlot = readCurrentSlot();
   const curSlotOf = curSlot || (cur && cur.json ? accountNameOf(cur.json) : null);
+  // cur が null でも「未ログイン(ファイルが無い)」と「あるが読めない・壊れている」は別物で、
+  // 出すべき案内が正反対になる(前者は退避するものが無い、後者は先に控えを取らないと
+  // そのあとの /login で未退避の refreshToken を失う)。cur だけを見て分岐していた頃は
+  // 後者が前者に混ざり、「退避されていません」の案内が素の `swap <name>` だけを並べ、
+  // 打つと「現在の credentials を読めません」で即座に止まっていた。ここで 1 回だけ見立てを
+  // 取り、以降の案内はすべてこの値を通す(判定を各所で書き写さない)。
+  // verdict 'usable' を除くのは、読み直した時点で読めているなら退避できるため
+  // (readCredsOrNull が失敗した直後にロックが解けた場合。--force を勧める理由が無い)。
+  const curWhy = !cur && probeFile(CREDENTIALS).exists ? unreadableReason(CREDENTIALS) : null;
+  const curUnsavable = curWhy && curWhy.verdict !== 'usable' ? curWhy : null;
 
   // 「無い」ときだけ「退避されていません」と言い切る。existsSync では読めないだけのスロットも
   // ここへ落ち、実際には退避済みなのに「退避されていません」と案内していた(そのまま
@@ -1427,8 +1484,8 @@ function cmdSwap(target, force) {
         if (!c) return '    ' + name + ':\n      読めないため案内できません';
         const sameAsTarget = !!cur && curSlotOf === name;
         const restore = 'swap ' + name
-          + (needsForceToRestore(cur ? cur.json : null, c.json) ? ' --force' : '');
-        const g = saveFirstText(needsName, sameAsTarget, saveBlocked, curSlotOf);
+          + (needsForceToRestore(cur ? cur.json : null, c.json, curUnsavable) ? ' --force' : '');
+        const g = saveFirstText(needsName, sameAsTarget, saveBlocked, curSlotOf, curUnsavable);
         if (!g.needed) return '    ' + name + ':\n      ' + restore;
         return '    ' + name + ':\n      ' + g.cmd + '\n      ' + restore + g.why;
       });
@@ -1447,11 +1504,12 @@ function cmdSwap(target, force) {
           hint = '\n  まだ何も退避されていません。先に `' + g.cmd
             + '` で現在のアカウントを退避してください' + g.why;
         }
-      } else if (probeFile(CREDENTIALS).exists) {
+      } else if (curUnsavable) {
         // ファイルはあるが読めない(壊れている/権限が無いなど)。saveCurrent 自身がこの状態を
-        // 「控えだけ残して先へ進む」経路(--force)で持っているので、それを案内する
-        // (saveFirstText の staleCur 分岐の文面をそのまま使う)。
-        const g = saveFirstText(false, false, false, curSlotOf, true);
+        // 「控えだけ残して先へ進む」経路(--force)で持っているので、それを案内する。
+        // 理由をそのまま渡す(ここで true を決め打ちしていた頃は、開けないファイルにも
+        // 「控えが残ります」と約束していた)。
+        const g = saveFirstText(false, false, false, curSlotOf, curUnsavable);
         hint = '\n  まだ何も退避されていません。現在の credentials を読めないため、先に `'
           + g.cmd + '` を実行してください' + g.why;
       }
@@ -1492,29 +1550,44 @@ function cmdSwap(target, force) {
       // readCredsOrNull(accessToken 必須)だけで判定していた頃は、この状態を拾えずに
       // ここを素通しして下の /login 案内だけが出ていた(cmdSave は同じ状態を見て /login を
       // 止めているのに、ここだけ食い違っていた)。
-      const curFull = readCredsOrNull(CREDENTIALS);
-      let curJson = curFull ? curFull.json : null;
-      let staleCur = false;
-      if (!curJson && unreadableReason(CREDENTIALS).verdict === 'stale') {
+      // 壊れて JSON として読めない中身からは json を組み立てられない(readCredentials も
+      // 同じ SyntaxError で落ちる)ので、verdict を 'stale' に寄せても curJson は null のまま
+      // になる。救うべきものがあるかどうかは、json ではなく生バイト列に refreshToken が
+      // 残っているか(hasToken)で決める。json の有無で判定していた頃は、書き込み途中で
+      // 切れた credentials が唯一の refreshToken を抱えているのに「先に退避してください」が
+      // 出ず、下の /login 案内だけが残っていた(そのとおり打つと、その控えごと失われる)。
+      let curJson = cur ? cur.json : null;
+      if (!curJson && curUnsavable && curUnsavable.verdict === 'stale') {
         try {
           curJson = readCredentials(CREDENTIALS).json;
-          staleCur = true;
         } catch { /* 直後に読めなくなった */ }
       }
+      // スロットへ入らず控えだけが残る状態か(文面が「退避してから」ではなく
+      // 「控えを残してから」に変わる)。理由オブジェクトをそのまま saveFirstText へ渡す。
+      const staleCur = curUnsavable;
       const curToken = curJson ? refreshTokenOf(curJson) : null;
       const { names: savedNames, error: savedErr } = savedAccounts();
       const curSaved = !!(curToken && !savedErr && slotsHoldingIn(savedNames, curToken).length > 0);
-      if (curJson && !curSaved) {
+      // 救うべきものがあるのは、読めた json があってどのスロットにも入っていないとき
+      // (curJson && !curSaved)か、json を組み立てられなくても生バイト列に refreshToken が
+      // 残っているとき(hasToken)。後者は中身を照合できないので「どのスロットに既に入って
+      // いるか」を確かめようがない。確かめられないものを退避済みとみなすと、控えを取らせない
+      // まま /login を案内することになるため、安全側(控えを勧める)に倒す。
+      const rescuable = (curJson && !curSaved)
+        || !!(!curJson && curUnsavable && curUnsavable.hasToken);
+      if (rescuable) {
         // 案内するコマンドは saveFirstText(下の forceHint と共通)に通し、既存の overwriteGate と
         // sameAsTarget の判定を経由させる。ここだけ「swap save <curSlotOf>」と決め打ちしていた
         // 頃は、退避先に別の認証情報が入っていても素通しで案内し(--force なしでは退避の段で
         // 止まる)、退避先がたまたま target 自身だと、この fail() のすぐ下にある
         // `swap save <target> --force` が退避したばかりの内容を自分自身で潰していた。
         const curSlot0 = readCurrentSlot();
-        const curSlotOf0 = curSlot0 || accountNameOf(curJson);
+        // curJson が無い(壊れて読めない)経路では、名前も上書きガードも判定材料が無い。
+        // null を overwriteGate へ渡すと別の判定に化けるので、curJson があるときだけ通す。
+        const curSlotOf0 = curSlot0 || (curJson ? accountNameOf(curJson) : null);
         const needsName0 = !curSlotOf0;
         const sameAsTarget0 = curSlotOf0 === target;
-        const saveBlocked0 = !!(curSlotOf0
+        const saveBlocked0 = !!(curJson && curSlotOf0
           && overwriteGate({ json: curJson }, curSlotOf0, curSlot0).blocked);
         const g = saveFirstText(needsName0, sameAsTarget0, saveBlocked0, curSlotOf0, staleCur);
         // staleCur では「退避してから」と書けない(スロットへは入らず、控えだけが残る)。
@@ -1582,7 +1655,7 @@ function cmdSwap(target, force) {
   //   restoreCmd     … いま target を復元する向き(現在は cur)
   //   restoreBackCmd … 切り替えたあと元へ戻す向き(そのときの現在は next で、復元先は cur の内容)
   const restoreCmd = 'swap ' + target
-    + (needsForceToRestore(cur ? cur.json : null, next.json) ? ' --force' : '');
+    + (needsForceToRestore(cur ? cur.json : null, next.json, curUnsavable) ? ' --force' : '');
   const restoreBackCmd = (name) => 'swap ' + name
     + (needsForceToRestore(next.json, cur ? cur.json : null) ? ' --force' : '');
   // 唯一の呼び出し元(下の「すでに復元済み」案内)は常に名前を省いて呼ぶ(退避名は
