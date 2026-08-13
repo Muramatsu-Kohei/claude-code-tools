@@ -875,7 +875,54 @@ console.log('swap');
   check('読み取り失敗に時間をおいての案内は出さない',
     !/時間をおいて/.test(r.err), r.out + r.err);
   check('読み取りに失敗した理由に応じた対処を添える', /ディレクトリ/.test(r.err), r.out + r.err);
-  check('読み取りに失敗した場合も先へ進む手段は示す', /--force/.test(r.err), r.err);
+  // レビュー指摘: この check はもともと「--force という文字列が出ること」だけを見ていたが、
+  // 開けない現在(copyable:false)では --force は脱出路にならない。keepAside の copyFileSync が
+  // 同じ理由で落ち、その失敗が「もう一度実行してください」と案内するため、--force を勧めると
+  // 2 コマンドを往復し続ける行き止まりになる(saveCurrent の degraded 分岐参照)。新しい文面にも
+  // 「--force」という語自体は残るので、旧 check は意図と正反対の内容のまま緑で通っていた。
+  check('開けない現在に --force を脱出路として勧めない',
+    !/そのまま先へ進めます/.test(r.err), r.err);
+  check('代わりに、開ける状態に戻すべきパスを示す',
+    r.err.includes(credPath(home)) && /開ける状態に戻して/.test(r.err), r.err);
+}
+{
+  // 対照: 控えを取れる壊れ方(JSON として壊れているだけ。バイト列は読める = copyable:true)
+  // では、これまでどおり --force が「そのまま先へ進めます」の形で脱出路として案内される。
+  // これが無いと、「copyable にかかわらず常に --force を出さない」実装でも上のテストは
+  // 緑になってしまう。
+  const home = sandbox('swap-unreadable-json-copyable', {
+    current: '{ broken',
+    accounts: { team: creds('team') },
+  });
+  const r = runSwap(home, ['team']);
+  check('控えを取れる壊れ方では --force を脱出路として案内する',
+    /そのまま先へ進めます/.test(r.err) && /swap team --force/.test(r.err), r.err);
+}
+{
+  // レビュー指摘1: 開けない現在(EISDIR)では、--force を付けても keepAside の copyFileSync が
+  // 同じ理由で落ちるため、「--force を付けてもう一度実行してください」と「もう一度実行しても
+  // 同じなら…」を行き来するだけで、どちらのコマンドを打っても先に進めない状態になっていた。
+  // 両方を実際に打って、往復が成立しないことを確かめる。打ち直しの案内が出るかを見るのは
+  // --force 付きの側だけでよい。その文言は keepAside の失敗にしか無く、--force 無しは
+  // saveCurrent の入口で止まってそこへ到達しないため、どんな実装でも出ない(検査を置いても
+  // 変異で落ちない = 何も検査していないチェックが増えるだけになる)。往復は片側を止めれば
+  // 成立しないので、--force 無しの側は終了コードと副作用だけを見る。
+  const home = sandbox('unreadable-dir-no-retry-loop', { accounts: { team: creds('team') } });
+  fs.mkdirSync(credPath(home), { recursive: true });
+  // --force 側は keepAside が控えの置き場所(accounts/.replaced)を作ってからコピーに失敗する。
+  // 空ディレクトリの作成自体は「書き換え」に数えない(keepaside-copy-fails と同じ理由で、
+  // ここを差分に含めると mkdirSync 自体が snapshotTree の比較に引っかかってしまう)。
+  fs.mkdirSync(replacedDir(home), { recursive: true });
+  const before = snapshotTree(home);
+  const plain = runSwap(home, ['team']);
+  const forced = runSwap(home, ['team', '--force']);
+  check('--force 付きは同じコマンドの打ち直しを勧めない',
+    !/先ほどと同じ swap コマンドをもう一度実行してください/.test(forced.out + forced.err),
+    forced.out + forced.err);
+  check('どちらも非ゼロ終了する', plain.code !== 0 && forced.code !== 0,
+    `plain=${plain.code} forced=${forced.code}`);
+  check('どちらも何も書き換えない', snapshotTree(home) === before,
+    `-- before --\n${before}\n-- after --\n${snapshotTree(home)}`);
 }
 {
   const home = sandbox('status-empty', {});
@@ -1680,6 +1727,22 @@ console.log('swap');
     replacedFiles(home, 'personal').length === 0, replacedFiles(home, 'personal').join(','));
 }
 {
+  // レビュー指摘: 控えを取れない理由を「権限とロック」に決め打ちしていた頃は、probe が
+  // EISDIR(同名のディレクトリが置かれている)と言っている直後に「別プロセスを終了したうえで
+  // もう一度実行してください」を出しており、そのとおり動いても直らなかった(存在しないプロセス
+  // 探しから始めさせることになる)。判定を unreadableReason に合流させ、原因に応じた対処
+  // (このケースなら「先に原因を解いてください」)と、控えを取れない状態でも進める次の一手
+  // (別の名前での退避)を出す。keepaside-copy-fails と同じサンドボックスを使う。
+  const home = sandbox('keepaside-copy-fails-reason', { current: creds('pro', { token: 'incoming' }) });
+  fs.mkdirSync(acctPath(home, 'personal'), { recursive: true }); // ファイルの代わりにディレクトリ
+  fs.mkdirSync(replacedDir(home), { recursive: true });
+  const r = runSwap(home, ['save', 'personal', '--force']);
+  check('控えを取れない理由に、EISDIR に応じた原因(同じ名前のディレクトリ)を出す',
+    /同じ名前のディレクトリ/.test(r.err), r.err);
+  check('別の名前で退避すれば触れずに済むという次の一手を出す',
+    /別の名前で退避すれば personal には触れずに済みます: swap save <別名>/.test(r.err), r.err);
+}
+{
   // cmdSwap 末尾(writeCurrentSlot(target) を包む try/catch): credentials の差し替えは成功した
   // あと、来歴(.current)の書き込みだけが失敗する状況。CURRENT_FILE をディレクトリにしておくと
   // writeAtomic の rename が失敗する。以前は生の Node 例外だけを出して exit 1 だったため、
@@ -1883,6 +1946,29 @@ console.log('swap');
   check('取り残される全スロットに更新コマンドを出す',
     /swap save alias1 --force/.test(r.out) && /swap save alias2 --force/.test(r.out),
     r.out + r.err);
+}
+
+{
+  // レビュー指摘(前回の退行): reportOtherSlots は cmdSwap(切り替え直後)と cmdSave(退避しか
+  // していない)の両方から呼ばれる。returnCmd が null であることだけを根拠に「いま復元した
+  // アカウントの内容で上書きされます」「元に戻すには」を出すと、何も復元していない cmdSave の
+  // 呼び出しにまで、復元した前提の案内が出てしまう(実際には切り替えていないので「元に戻す」
+  // 相手が無く、上の「元に戻すには」の行自体も存在しない)。drifted(来歴が指していたスロットが
+  // 取り残される)は cmdSave の `swap save <新しい名前>` 経由でしか作れない(cmdSwap は必ず
+  // 来歴のスロットへ書き戻すため drifted にならない)ので、この経路が唯一の再現手段。
+  const home = sandbox('save-drifted-no-restored-premise', {
+    current: creds('pro', { token: 'acct-B' }),
+    accounts: { old: creds('pro', { token: 'acct-A' }) },
+    slot: 'old',
+  });
+  const r = runSwap(home, ['save', 'team']);
+  check('退避は成功する(前提)', r.code === 0, r.out + r.err);
+  check('取り残されたスロット(old)の警告は従来どおり出る',
+    /今回の退避と内容が違うスロットがあります: old/.test(r.out), r.out + r.err);
+  check('復元した前提の文言(いま復元したアカウント)は出さない',
+    !r.out.includes('いま復元したアカウント'), r.out);
+  check('「元に戻すには」も出さない(切り替えていないので戻す相手が無い)',
+    !r.out.includes('元に戻すには'), r.out);
 }
 
 {
@@ -2465,6 +2551,34 @@ const TRUNCATED_CURRENT =
     !out.includes('いまは健全に読めています'), out);
   check('代わりに「読めたり読めなかったりします」と言う',
     /読めたり読めなかったりします/.test(out), out);
+}
+
+{
+  // レビュー指摘: 現在の credentials が読めない(--force で控えだけ取って先へ進む degraded
+  // 経路)状態から、差し替え本体の writeAtomic(CREDENTIALS) が失敗すると、以前は控えの
+  // パス(「中身の控え: <path>」)を stdout の console.log でしか出しておらず、直後の
+  // process.exit がパイプ越しにそれを切ることがあった(fail が守るのは stderr だけ)。控えの
+  // 場所を見失うと、読めなかった現在のログインを取り戻す手掛かりが消える。fail を
+  // failText + process.exitCode + return に分け、控えのパスを stderr 側にも載せるようにした。
+  // writeAtomic の rename(tmp -> CREDENTIALS)だけを狙って EPERM を注入する(tmp のパスにしか
+  // 現れない `.credentials.json.tmp` で絞り込むので、keepAside の copyFileSync 等は巻き込まない)。
+  const home = sandbox('writeatomic-fail-after-degraded-save', {
+    current: '{ broken', // copyable(JSON としては壊れているだけ)なので --force で控えを取れる
+    accounts: { team: creds('team') },
+  });
+  const r = execSwapScript(SWAP, ['team', '--force'], {
+    env: {
+      ...homeEnv(home),
+      NODE_OPTIONS: '--require ' + path.join(__dirname, 'fault-fs.js'),
+      SWAP_FAULT: JSON.stringify({
+        call: 'renameSync', match: '.credentials.json.tmp', kind: 'throw', code: 'EPERM',
+      }),
+    },
+  });
+  check('差し替え自体は失敗する(前提)', r.code !== 0, r.out + r.err);
+  check('控えの場所を stderr 側にも載せる(パイプに切られても残る)',
+    /読めなかった現在の内容の控え: /.test(r.err)
+    && r.err.includes(replacedDir(home)), r.err);
 }
 
 // --- 来歴(.current)が読めないときに黙って別名を作らない ---
