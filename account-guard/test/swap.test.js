@@ -2297,6 +2297,20 @@ const TRUNCATED_CURRENT =
   check('1 回目だけ読めなくても復元ガードは素通りしない', r.code !== 0, r.out + r.err);
   check('現在のログインはローテート前へ巻き戻らない',
     tokenOf(credPath(home)) === 'CUR-NEW', tokenOf(credPath(home)));
+
+  // status も同じ読み方に揃っていること。揃っていないと「読めません(いまは健全に読めて
+  // います)」という、それ自体で矛盾した行が出る(原因の切り分けができなくなる)。
+  const s = execSwapScript(SWAP, [], {
+    env: {
+      ...homeEnv(home),
+      NODE_OPTIONS: '--require ' + path.join(__dirname, 'fault-fs.js'),
+      SWAP_FAULT: JSON.stringify({
+        call: 'readFileSync', match: '.credentials.json', kind: 'throw', code: 'EBUSY', nth: 1,
+      }),
+    },
+  });
+  check('status は自己矛盾した行を出さない',
+    !(s.out + s.err).includes('読めません(いまは健全に読めています'), s.out + s.err);
 }
 
 // --- 来歴(.current)が読めないときに黙って別名を作らない ---

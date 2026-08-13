@@ -1245,7 +1245,11 @@ function outdatedSlots(cur, curSlot, savedCreds) {
 }
 
 function cmdStatus() {
-  const cur = readCredsOrNull(CREDENTIALS);
+  // cmdSwap と同じ読み方に揃える。readCredsOrNull だけで判定していた頃は、1 回目の読み取りが
+  // たまたま失敗しただけでも「読めません(いまは健全に読めています)」という、それ自体で
+  // 矛盾した行を出していた(status は何が起きているかを調べに来る入り口なので、ここが
+  // 自己矛盾していると原因の切り分けができない)。
+  const { cur, why: curUnsavable } = readCurrentForGuard();
   const exists = probeFile(CREDENTIALS).exists;
   const curSlot = readCurrentSlot();
 
@@ -1254,7 +1258,9 @@ function cmdStatus() {
   // 上書きされて消える。status は状況確認の唯一の入り口なので、ここでの誤誘導は重い。
   let label;
   if (cur) label = subscriptionTypeOf(cur.json) || '不明(subscriptionType が読めない)';
-  else if (exists) label = '読めません(' + unreadableReason(CREDENTIALS).label + ')';
+  // 理由は readCurrentForGuard が確定させたものを使う(ここで読み直すと、その間に状態が
+  // 変わって cur との食い違いが生まれる)。
+  else if (exists) label = '読めません(' + (curUnsavable ? curUnsavable.label : '理由不明') + ')';
   else label = '未ログイン';
 
   // 来歴を併記するのは現在の credentials が読めるときだけ。未ログイン・読み取り不能なのに
