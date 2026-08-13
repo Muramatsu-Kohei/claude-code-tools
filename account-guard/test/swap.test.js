@@ -1312,6 +1312,45 @@ console.log('swap');
   check('実際に `swap warmup` を実行すると復元できる',
     restored.code === 0 && tokenOf(credPath(home)) === 'warmup-tok', restored.out + restored.err);
 }
+{
+  // 予約名スロットの来歴があると、以後どのアカウントへも切り替えられなくなっていたバグの回帰。
+  // `swap warmup` で復元すると .current が warmup を指す。その後の `swap <他のスロット>` は
+  // 切り替えの前に必ず現在のログインを来歴の名前(= warmup)へ退避するが、validateName が
+  // 予約語を実在確認なしで一律に弾いていた頃は、ここで「サブコマンドと同じなので使えません」
+  // に当たり中断していた(退避なしでは切り替えも起きない)。既に実在するスロットには予約語
+  // チェックを効かせないことで、この行き止まりを塞いだ(validateName 参照)。
+  const home = sandbox('reserved-name-warmup-provenance-swap', {
+    current: creds('team', { token: 'warmup-cur-tok' }),
+    accounts: {
+      warmup: creds('team', { token: 'warmup-old-tok' }),
+      other: creds('max', { token: 'other-tok' }),
+    },
+    slot: 'warmup',
+  });
+  const r = runSwap(home, ['other']);
+  check('予約名スロットの来歴があっても他スロットへ切り替えられる(行き止まりの回帰)',
+    r.code === 0, r.out + r.err);
+  check('credentials は切り替え先の中身になる',
+    tokenOf(credPath(home)) === 'other-tok', r.out + r.err);
+  check('切り替え前の現在のログインは warmup へ退避される',
+    tokenOf(acctPath(home, 'warmup')) === 'warmup-cur-tok', r.out + r.err);
+  check('来歴も切り替え先へ進む', slotOf(home) === 'other', r.out + r.err);
+}
+{
+  // 同じ来歴の状態でも `swap save warmup`(既存スロットの明示的な更新)は通ることの確認。
+  // 予約語チェックは「新しく作らせない」ためのものなので、既に実在するスロットの更新までは
+  // 止めない(上のテストと対になる。予約語が無条件でまだ実在しないときに弾かれることは
+  // 「サブコマンドと同じ名前のスロットは作らせない」のテストで確認済み)。
+  const home = sandbox('reserved-name-warmup-provenance-save', {
+    current: creds('team', { token: 'warmup-new-tok' }),
+    accounts: { warmup: creds('team', { token: 'warmup-old-tok' }) },
+    slot: 'warmup',
+  });
+  const r = runSwap(home, ['save', 'warmup']);
+  check('予約名でも既存スロットの明示的な更新は通る', r.code === 0, r.out + r.err);
+  check('warmup の中身が現在のログインで更新される',
+    tokenOf(acctPath(home, 'warmup')) === 'warmup-new-tok', r.out + r.err);
+}
 
 // --- 中止の不変条件 ---
 // swap.js の中止経路それぞれについて、「実行前スナップショットを取る → 中止させる →
