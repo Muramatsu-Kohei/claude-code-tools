@@ -199,23 +199,22 @@ function readCredsOrNull(file) {
 // 読めない理由を案内に反映するために、もう一度だけ読んで原因を切り分ける。ここを
 // 「破損しているか書き込み中」と決め打ちすると、権限で読めない環境の人に
 // 「時間をおいて再実行」という永久に効かない対処を繰り返させることになる。
-// 返り値の retryable は「待てば直りうるか」で、案内の文面を分ける。retryable false は
-// 「中身を見たうえで、待っても直らないと言い切れる」ときだけに限る。呼び出し元はこれを根拠に
-// /login を勧めるので、判断がつかないものまで false に倒すと、まだ退避していないアカウントの
-// refreshToken を捨てさせることになる。false にしてよいのは「待っても直らない」と言い切れる
-// 次の場合だけで、原因を特定できないものは true に倒す。
-//   - ファイルが無い(ENOENT)
-//   - 同じ名前のディレクトリが置かれている(EISDIR / ENOTDIR)
-//   - 誰も書き換えないファイルが JSON として壊れている(スロットと .replaced の控え)
-//   - JSON として読めたのに形が違う(手で編集した、別バージョンが書いた、将来の構造変更)
+// 返り値の verdict は「中身について何を確認できたか」を表し、案内の方向を決める。以前は
+// 「待てば直りうるか」(retryable)で分けていたが、待てば直るかはこのツールには分からない。
+// 推測で分けた結果、永久に直らない状態へ「時間をおいてやり直してください」を出し続ける
+// 無限ループと、そこから抜ける手順が反対側の分岐にしか無い行き止まりを両方作った。
+// 時間についての推測をやめ、確認できた事実だけで分ける。待てば直るケースは、案内に共通で
+// 添える「もう一度実行しても同じなら」の一文が、分岐を増やさずに吸収する。
+// 語彙は account-guard.js の credentialsState() に揃える。同じ状態を 2 つのツールが別の
+// 名前で呼び、別の対処を案内していたことが、繰り返した食い違いの元だった。
+//   usable     … 読み直したら健全に読めた(推測ではなく事実)。/login を勧めてはいけない
+//   stale      … accessToken は無いが refreshToken は残る。交換すればまた使える
+//   unusable   … 中身を確認したうえで、復元に使えるものは無いと言い切れる
+//   unreadable … 中身を確認できていない。使えるとも使えないとも言えず、控えは消させない
 // このファイルを他のプロセスが書き換えうるか。書き換えうるのは Claude Code が更新する
 // CREDENTIALS だけで、スロット(accounts/<name>.json)も .replaced の控えも、writeAtomic の
-// rename か 1 回きりの copyFileSync でしか書かれない。この違いが「JSON として壊れて見えるとき、
-// 待てば直りうるか」を分ける。スロットの破損に「時間をおいてやり直してください」と案内して
-// いた頃は、永久に直らない状態に対して同じコマンドを打ち続けさせており、そこから抜ける唯一の
-// 手順(別名で退避 → /login → `swap save <name> --force` で入れ直す)は retryable false の
-// 分岐にしかないため一度も出てこなかった。判定を呼び出し側の引数に委ねると、経路が増えたときに
-// 取り違える(このファイルで繰り返した事故なので)、ファイルの素性からここで決める。
+// rename か 1 回きりの copyFileSync でしか書かれない。この違いは verdict を変えない
+// (どちらも中身は確認できていない)が、原因の手掛かりとして label の文面だけを分ける。
 function isLiveCredentialsFile(file) {
   return file === CREDENTIALS;
 }
@@ -225,63 +224,85 @@ function unreadableReason(file) {
   try {
     raw = fs.readFileSync(file, 'utf8');
   } catch (e) {
-    if (e.code === 'ENOENT') return { label: 'ファイルがありません', retryable: false };
-    // EISDIR / ENOTDIR は「そこに読めるファイルが無い」の変種で、待っても直らない。同じ名前の
-    // ディレクトリが置かれている(あるいは途中の要素がファイルになっている)ことが原因で、
-    // 一過性のロックとは種類が違う。ここも retryable に倒していた頃は「時間をおいてやり直して
-    // ください」だけが出て、案内どおり打ち続けても一歩も進まなかった(退避を促す案内まで
-    // retryable のゲートで消えていた)。
+    if (e.code === 'ENOENT') {
+      // 呼び出し元は存在を確かめてから呼ぶので、ここへ来るのは直後に消えたとき。中身を
+      // 一度も見ていない以上「無価値」とは言い切れない(unusable は控えを消させる)。
+      return { label: 'ファイルがありません', verdict: 'unreadable' };
+    }
+    // EISDIR / ENOTDIR は「そこに読めるファイルが無い」の変種。同じ名前のディレクトリが
+    // 置かれている(あるいは途中の要素がファイルになっている)ことが原因で、一過性の
+    // ロックとは種類が違うが、中身を確認できていない点では同じ扱いになる。
     if (e.code === 'EISDIR' || e.code === 'ENOTDIR') {
       return {
         label: '読み取りに失敗しました(' + e.code + ')。'
           + '同じ名前のディレクトリが置かれていないか確認してください',
-        retryable: false,
+        verdict: 'unreadable',
       };
     }
-    // ENOENT 以外の読み取り失敗(EBUSY・EPERM・EACCES など)は、中身が健全なままファイルに
-    // 手が届いていないだけのことがある。ウイルス対策やバックアップツールが一時的に掴んでいる、
-    // ACL が一時的に変わっている、といった一過性の要因が典型で、account-guard.js の
-    // credentialsState() は同じ状況を 'unreadable'(中身の価値は判断できない)に分類し、
-    // 掴んでいるプロセスを終えてから再実行するよう案内している。ここだけ retryable false に
-    // していたため、同じ状況に対して 2 ツールの案内が食い違い、swap 側は /login を勧めていた。
-    // 恒久的な権限問題なら待つだけでは直らないので、待つ以外の対処も文面に添える。
+    // ENOENT 以外の読み取り失敗(EBUSY・EPERM・EACCES など)。ウイルス対策やバックアップ
+    // ツールが一時的に掴んでいるだけのことも、恒久的な権限問題のこともあり、ここでは
+    // 区別できない。account-guard.js の credentialsState() も同じ状況を 'unreadable'
+    // (中身の価値は判断できない)に分類する。待つ以外の対処も文面に添える。
     return {
       label: '読み取りに失敗しました(' + e.code + ')。掴んでいるプロセスを終えるか、権限を確認してください',
-      retryable: true,
+      verdict: 'unreadable',
     };
   }
   let json;
   try {
     json = JSON.parse(raw);
   } catch {
-    // 途中まで書かれたファイルは JSON として壊れて見える。書き込み中なら待てば直るが、
-    // それが言えるのは他のプロセスが書き換える CREDENTIALS だけ(上の isLiveCredentialsFile)。
-    if (live) return { label: '壊れているか、他のプロセスが書き込み中', retryable: true };
-    return { label: '壊れています(JSON として読めません)', retryable: false };
+    // 途中まで書かれたファイルは JSON として壊れて見える。切れ目より手前に refreshToken が
+    // 残っていることがあるので、パースできなかったことを「中身が無い」の証拠にはしない。
+    // live かどうかは原因の心当たりを変えるだけで、確認できていない事実は変わらない。
+    return {
+      label: live ? '壊れているか、他のプロセスが書き込み中' : '壊れています(JSON として読めません)',
+      verdict: 'unreadable',
+    };
   }
   if (!hasUsableCredentials(json)) {
     // accessToken が無くても refreshToken が残っていることがある(書き込み途中が典型)。
     // refreshToken は交換すればまた使える資格情報なので、accessToken だけが欠けた状態を
     // 「失って困るものは無い」側の unusable と同じに扱ってはいけない。account-guard.js の
-    // credentialsState() は同じ状況を stale として分けており、swap 側だけが粗いままだと、
-    // ガードは /login を勧めないのに swap は勧める、という食い違いが起きて refreshToken を失う
-    // (呼び出し元の cmdSave / cmdSwap は staleRefreshToken を見て /login 一択の案内をやめる)。
+    // credentialsState() も同じ状況を stale として分けており、swap 側だけが粗いままだと、
+    // ガードは /login を勧めないのに swap は勧める、という食い違いが起きて refreshToken を失う。
     if (hasRecoverableToken(json)) {
       return {
         label: 'claudeAiOauth.accessToken がありません(形式が想定と違います)。'
           + 'ただし refreshToken は残っています(交換すればまた使えます)',
-        retryable: false,
-        staleRefreshToken: true,
+        verdict: 'stale',
       };
     }
-    return { label: 'claudeAiOauth.accessToken がありません(形式が想定と違います)', retryable: false };
+    // JSON として読めたうえで、交換できるトークンも無い。「復元に使えない」と言い切れるのは
+    // 中身を最後まで確認できたこの経路だけで、控えを消してよいと案内できるのもここに限る。
+    return { label: 'claudeAiOauth.accessToken がありません(形式が想定と違います)', verdict: 'unusable' };
   }
   // ここへ来る = 読み直した時点では健全に読める。cmdSave は --force を挟んでから改めて
   // この関数を呼ぶ設計なので、その間にロック(や書き込み)が解けていれば必ずここに落ちる。
-  // つまり「原因不明」ではなく「もう読める」ことのほうが多い。retryable false にしていた
-  // 頃は、健全な credentials を前に /login を案内していた(未退避アカウントの refreshToken を
-  // 失う経路)。理由を特定できない以上、待てば直りうる側に倒す。
-  return { label: '読めない理由を特定できません(今は読める状態かもしれません)', retryable: true };
+  // 「待てば直るかもしれない」という推測ではなく「いま読めた」という事実なので、案内も
+  // 推測ではなく事実として出す。ここで /login を案内すると、健全な credentials を前に
+  // 未退避アカウントの refreshToken を捨てさせることになる。
+  return { label: 'いまは健全に読めています(先ほど読めなかった理由は特定できません)', verdict: 'usable' };
+}
+
+// 残した控えをどう扱えばよいかの案内。verdict から 1 箇所で決める。この判断が cmdSwap と
+// cmdStatus に分かれて書かれていた頃は、同じ控えに一方が「消さないでください」、他方が
+// 「消して構いません」と案内していた。「消して構いません」と言えるのは、中身を最後まで
+// 確認できた unusable だけで、読めなかった控え(unreadable)は未退避アカウントの唯一の
+// コピーでありうる以上、消させない。
+function keptNote(verdict) {
+  if (verdict === 'usable') {
+    return 'いまは読めています。中身は健全なので、この控えは消さないでください';
+  }
+  if (verdict === 'stale') {
+    return 'accessToken が無いため、そのままでは accounts/<name>.json へ戻しても復元できませんが、'
+      + 'refreshToken は交換すればまた使えます。消さないでください';
+  }
+  if (verdict === 'unusable') {
+    return 'この控えは復元には使えません(accessToken を取り出せない中身です)';
+  }
+  return '中身を確認できていません。健全なアカウントの唯一のコピーである可能性があるため、'
+    + '原因が分かるまで消さないでください';
 }
 
 // 同一性の判断材料 1。値そのものは比較にしか使わず、出力にもログにも出さない。
@@ -639,24 +660,26 @@ function keepAside(file, base) {
 // ツールが掴んでいるだけのことがあり、健全な未退避アカウントの唯一のコピーでも同じ表示に
 // なりうる。この切り分けは unreadableReason が内部でしている「開けなかった(e.code)」と
 // 「開けたが JSON として壊れている」の区別に合流させる(新しい判定を書き起こさない)。
-// ただし unreadableReason の retryable をそのまま使うのではなく、後者(JSON.parse 失敗)は
-// 「一時的に読めない」には数えない。unreadableReason は生きている CREDENTIALS 向けに
-// 「JSON として壊れて見えるのは書き込み中かもしれない」という理由で両方を retryable に
-// しているが、.replaced の控えは keepAside が 1 回だけ copyFileSync するだけで以後だれも
-// 書き換えない(コピー元が壊れていれば、それをそのまま複製しただけ)。開けている以上、
-// 待っても直らないので、再実行を促す案内は嘘になる。
-// 一方で「待っても直らない」と「消してよい」は別の問いで、ここを混ぜると資格情報を失う。
+// ただし後者(JSON.parse 失敗)は「読み取れない」には数えない。unreadableReason は生きている
+// CREDENTIALS も相手にするので両方を unreadable にまとめるが、.replaced の控えは keepAside が
+// 1 回だけ copyFileSync するだけで以後だれも書き換えない(コピー元が壊れていれば、それを
+// そのまま複製しただけ)。開けている以上、中身は rawHasRecoverableToken まで確認できる。
+// 一方で「読めない」と「消してよい」は別の問いで、ここを混ぜると資格情報を失う。
 // コピー元が書き込みの途中だった控えは、JSON としては壊れたまま切れ目より手前に
 // refreshToken を残していることがあり、それが未退避アカウントの唯一のコピーでありうる。
 // 消してよいと言えるのは、トークンらしき文字列すら残っていないと確認できたときだけなので、
-// パースできなかった中身は rawHasRecoverableToken に通してから staleToken と unreadable に分ける。
+// パースできなかった中身は rawHasRecoverableToken に通してから staleToken と unusable に分ける。
+// 数える軸は unreadableReason の verdict と同じ「中身について何を確認できたか」で、
+// unreadable(読み取り自体に失敗した。中身は不明)と unusable(最後まで確認して使えない)を
+// 分ける。以前の名前(unreadableRetryable)は「待てば直る」という推測を指していたが、
+// 実際に数えていたのは読み取りに失敗したかどうかで、名前だけが推測を匂わせていた。
 function replacedCounts() {
   const { files, error } = listReplaced();
-  if (error) return { overwritten: 0, staleToken: 0, unreadableRetryable: 0, unreadable: 0, error };
+  if (error) return { overwritten: 0, staleToken: 0, unreadable: 0, unusable: 0, error };
   let overwritten = 0;
   let staleToken = 0;
-  let unreadableRetryable = 0;
   let unreadable = 0;
+  let unusable = 0;
   for (const f of files.filter(f => f.endsWith('.json'))) {
     const full = path.join(REPLACED_DIR, f);
     if (readCredsOrNull(full)) { overwritten++; continue; }
@@ -664,10 +687,11 @@ function replacedCounts() {
     try {
       raw = fs.readFileSync(full);
     } catch (e) {
-      // ENOENT(一覧を取った直後に消えた)は「壊れている」でも「一時的」でもないが、
-      // 消えている以上どちらのバケットに数えても実害はない。unreadable 側に寄せる。
-      if (e.code && e.code !== 'ENOENT') unreadableRetryable++;
-      else unreadable++;
+      // ENOENT(一覧を取った直後に消えた)は読み取りの失敗ではあるが、実体がもう無いので
+      // 「消さないでください」と案内しても意味がない。どちらに数えても実害はなく、
+      // 件数の説明が素直な unusable 側に寄せる。
+      if (e.code && e.code !== 'ENOENT') unreadable++;
+      else unusable++;
       continue;
     }
     let json;
@@ -682,15 +706,15 @@ function replacedCounts() {
       // 失わせる(swap 本体は同じ控えを「消さないでください」と案内しており、指示も食い違う)。
       // 判定は credentials.js の rawHasRecoverableToken に合流させ、ここでは書き起こさない。
       if (rawHasRecoverableToken(raw)) staleToken++;
-      else unreadable++;
+      else unusable++;
       continue;
     }
     // readCredsOrNull が null な理由が accessToken 欠けだけなら、refreshToken の有無を見る
     // (readCreds は accessToken 必須なのでここでは使えない)。
     if (hasRecoverableToken(json)) staleToken++;
-    else unreadable++;
+    else unusable++;
   }
-  return { overwritten, staleToken, unreadableRetryable, unreadable, error: null };
+  return { overwritten, staleToken, unreadable, unusable, error: null };
 }
 
 // --- 来歴(.current) ---
@@ -968,9 +992,10 @@ function saveCurrent(explicitName, force, forceCmd, pre, afterCmd) {
     // 同じ判定で止まるため)。中身を確認した人が先へ進めるよう --force を用意する。
     const why = unreadableReason(CREDENTIALS);
     if (!force.unreadable) {
+      // 「時間をおいて再実行」を verdict で出し分けていた頃の名残を残さない。もう一度打てば
+      // 直る種類の失敗はここで吸収され、直らなければ次の行の --force が常に脱出路になる。
       fail('現在の credentials を読めません(' + why.label + ')'
-        + (why.retryable ? '\n  時間をおいて再実行してください。' : '\n  ')
-        + '中身を確認したうえで、そのまま先へ進めるなら:'
+        + '\n  もう一度実行しても同じなら、中身を確認したうえで、そのまま先へ進めます:'
         + '\n    ' + forceCmd);
     }
     // 読めない中身はスロットに入れない。復元に使えないうえ、そこに入っている有効な退避を
@@ -1179,22 +1204,21 @@ function cmdStatus() {
     console.log('  accessToken が無いため accounts/<name>.json へ戻してもそのままでは復元できませんが、'
       + 'refreshToken は交換すればまた使えます。消さないでください');
   }
-  if (replaced.unreadableRetryable > 0) {
-    // ウイルス対策やバックアップツールが一時的に掴んでいる(EBUSY/EACCES/EPERM)だけかもしれず、
-    // それは中身が壊れている証拠にはならない。pruneReplaced は同じ理由でこの控えを決して
-    // 自動削除しないので、案内も「消して構いません」とは言わない(以前は unreadable に
-    // 混ぜていたため、自動削除の方針と表示の方針が逆を向いていた)。
-    console.log('\n一時的に読み取れない控え: ' + replaced.unreadableRetryable
-      + ' 件 (' + REPLACED_DIR + ')');
-    console.log('  掴んでいる別プロセス(ウイルス対策・バックアップツールなど)がいないか確認し、'
-      + '時間をおいて確認し直してください。健全な未退避アカウントの唯一のコピーである'
-      + '可能性があるため、原因が分かるまで消さないでください');
-  }
   if (replaced.unreadable > 0) {
+    // 読み取り自体に失敗した控え。ウイルス対策やバックアップツールが掴んでいる
+    // (EBUSY/EACCES/EPERM)だけかもしれず、それは中身が壊れている証拠にはならない。
+    // pruneReplaced は同じ理由でこの控えを決して自動削除しないので、案内も「消して
+    // 構いません」とは言わない(以前は使えないと確認済みの控えに混ぜていたため、自動削除の
+    // 方針と表示の方針が逆を向いていた)。文面は keptNote に合流させる。
+    console.log('\n読み取れない控え: ' + replaced.unreadable + ' 件 (' + REPLACED_DIR + ')');
+    console.log('  掴んでいる別プロセス(ウイルス対策・バックアップツールなど)がいないか'
+      + '確認してください。' + keptNote('unreadable'));
+  }
+  if (replaced.unusable > 0) {
     // 復元先には使えない中身なので、上と同じ「戻せます」の案内に混ぜない。
     // 読めなかった現在の credentials だけでなく、退けた時点で既に壊れていた旧内容も
     // ここに入るので、置き場所は UNREADABLE_BASE 固定ではなくディレクトリで示す。
-    console.log('\n復元に使えない控え: ' + replaced.unreadable + ' 件 (' + REPLACED_DIR + ')');
+    console.log('\n復元に使えない控え: ' + replaced.unusable + ' 件 (' + REPLACED_DIR + ')');
     console.log('  読めなかった現在の credentials か、退けた時点で既に壊れていた旧内容です。'
       + 'accounts/<name>.json へ戻しても復元できません(accessToken を取り出せない中身です)。'
       + '原因を調べ終えたら消して構いません');
@@ -1227,23 +1251,24 @@ function cmdSave(name, force) {
     // 理由は unreadableReason で改めて確認する(--force を挟む間にファイルの状態が変わって
     // いることもあるため、saveCurrent の中で見た理由を使い回さない)。
     const why = unreadableReason(CREDENTIALS);
-    // /login を勧めてよいのは「待っても直らない」と分かっているときだけ。書き込み途中を
-    // 読んだだけなら中身は健全で、数百ミリ秒後には読める。そこで /login をやり直させると、
-    // まだスロットへ退避していないアカウントの refreshToken をその時点で捨てさせることに
-    // なる(ガード側の案内も同じ理由で /login を最後に置いている)。
+    // /login を勧めてよいのは「中身を確認できていて、失うものが無い」ときだけ。いま読める
+    // (usable)なら健全な credentials がそこにあり、refreshToken が残る(stale)なら交換で
+    // また使える。どちらでも /login をやり直させると、まだスロットへ退避していないアカウントを
+    // その時点で捨てさせることになる(ガード側の案内も同じ理由で /login を最後に置いている)。
     fail('現在の credentials を読めないため、退避しませんでした(' + why.label + ')'
       + '\n  中身の控えは残しました: ' + saved.kept
-      + (why.retryable
-        ? '\n  時間をおいて `swap save` をやり直してください'
-          + '\n  /login はまだ試さないでください(中身が健全なまま読めないだけのことが多く、'
-          + 'やり直すと未退避のアカウントには戻れなくなります)'
-        : why.staleRefreshToken
+      + (why.verdict === 'usable'
+        ? '\n  いまは読めています。そのまま `swap save` をもう一度実行してください'
+          + '\n  /login はまだ試さないでください(中身は健全なので、やり直すと未退避の'
+          + 'アカウントには戻れなくなります)'
+        : why.verdict === 'stale'
           // refreshToken は交換すればまた使えるので /login では上書きさせない
           // (account-guard.js の 'stale' 案内・credentialsState() と同じ判断)。
           ? '\n  refreshToken は残っています(交換すればまた使えます)。/login すると、まだ'
             + '退避していないアカウントはその時点で失われるため、いま試さないでください'
             + '\n  退避済みの別アカウントへ切り替えるなら: swap <name> --force'
-          : '\n  控えの中身を確認したうえで、`/login` してから `swap save` をやり直してください'));
+          : '\n  もう一度実行しても同じなら、控えの中身を確認したうえで、`/login` してから'
+            + ' `swap save` をやり直してください'));
   }
   console.log('退避しました: ' + saved.name + ' -> ' + accountFile(saved.name));
   reportOtherSlots(saved, null);
@@ -1254,7 +1279,7 @@ function cmdSave(name, force) {
 // ガードで復元を中止する場合の forceHint)、同じ条件(needsName / sameAsTarget /
 // saveBlocked / staleCur)から同じ文面を作る必要がある。判定は呼び出し側が用意する(現在のログインを
 // 表す json の由来が 2 箇所で違う。片方は accessToken 必須の readCredsOrNull、もう片方は
-// staleRefreshToken も拾う)。文面の組み立てだけをここに集め、片方だけ直して食い違う事故
+// verdict 'stale' も拾う)。文面の組み立てだけをここに集め、片方だけ直して食い違う事故
 // (このファイルで繰り返し起きた「案内どおり打つと止まる」)を防ぐ。
 // staleCur は「現在の credentials が accessToken を欠いている」(refreshToken だけ残っている)。
 // この状態では素の `swap save <name>` は「現在の credentials を読めません」で必ず止まり、
@@ -1329,8 +1354,8 @@ function cmdSwap(target, force) {
     // ときにも同じ案内を出しており、そのとおり打つと、まだ退避していない現在のアカウントの
     // refreshToken が /login で消えていた(現在の credentials 側では既に避けている経路)。
     const why = unreadableReason(file);
-    // /login を案内するのは retryable false のときだけ。案内どおり打つと、いま
-    // ログイン中の credentials は問答無用で上書きされる。それがまだどのスロットにも
+    // /login を案内する前に、現在のログインが失われないことを確かめる。案内どおり打つと、
+    // いまログイン中の credentials は問答無用で上書きされる。それがまだどのスロットにも
     // 退避されていなければ、「このツールで最も高い代償を払う失敗」(冒頭コメント参照)を
     // そのまま踏ませることになる。/login より先に、必ず現在の状態を確認してから案内する
     // (判定は slotsHoldingIn に揃える。同じ判定を書き起こすと基準がずれる)。
@@ -1340,21 +1365,20 @@ function cmdSwap(target, force) {
     // (「一覧を読めません」)に差し替わって消えてしまう(修正E: accounts ディレクトリの
     // 読み取り権限だけが落ちている環境で発生)。読めなければ「退避済みか確認できなかった」と
     // みなし、安全側(=退避を促す側)に倒して案内を続ける。
-    // 「先に退避してください」は retryable の側でも出す。退避は現在のログインを何も壊さない
-    // 操作で、待つ前に済ませておけば、待っている間に /login や別セッションの更新で現在の
-    // 資格情報が入れ替わっても失わずに済む。これを retryable false のゲートの内側に置いて
-    // いた頃は、恒久的に読めないスロット(EISDIR など)を retryable と誤分類していたことと
-    // 重なって、「時間をおいてやり直してください」以外は何も出ない行き止まりになっていた。
+    // 「先に退避してください」は verdict によらず常に出す。退避は現在のログインを何も壊さない
+    // 操作で、先に済ませておけば、そのあと /login や別セッションの更新で現在の資格情報が
+    // 入れ替わっても失わずに済む。これを分岐の内側に置いていた頃は、「時間をおいてやり直して
+    // ください」以外は何も出ない行き止まりになっていた。
     let saveFirst = '';
     {
-      // accessToken が無くても refreshToken だけは残っていることがある(staleRefreshToken)。
+      // accessToken が無くても refreshToken だけは残っていることがある(verdict 'stale')。
       // readCredsOrNull(accessToken 必須)だけで判定していた頃は、この状態を拾えずに
-      // ここを素通しして下の /login 案内だけが出ていた(cmdSave は同じ状態を staleRefreshToken
-      // で見て /login を止めているのに、ここだけ食い違っていた)。
+      // ここを素通しして下の /login 案内だけが出ていた(cmdSave は同じ状態を見て /login を
+      // 止めているのに、ここだけ食い違っていた)。
       const curFull = readCredsOrNull(CREDENTIALS);
       let curJson = curFull ? curFull.json : null;
       let staleCur = false;
-      if (!curJson && unreadableReason(CREDENTIALS).staleRefreshToken) {
+      if (!curJson && unreadableReason(CREDENTIALS).verdict === 'stale') {
         try {
           curJson = readCredentials(CREDENTIALS).json;
           staleCur = true;
@@ -1386,13 +1410,13 @@ function cmdSwap(target, force) {
     }
     fail(target + ' を復元できません(' + why.label + ')。上書きを中止しました'
       + '\n  ファイル: ' + file
-      + (why.retryable
-        ? saveFirst
-          + '\n  時間をおいて同じコマンドをやり直してください'
-          + '\n  /login はまだ試さないでください(中身が健全なまま読めないだけのことが多く、'
-          + 'やり直すと未退避のアカウントには戻れなくなります)'
-        : saveFirst
-          + '\n  そのアカウントで `/login` し直してから `swap save ' + target + ' --force` で入れ直してください')
+      + saveFirst
+      + (why.verdict === 'usable'
+        ? '\n  いまは読めています。同じコマンドをもう一度実行してください'
+          + '\n  /login はまだ試さないでください(中身は健全なので、やり直すと未退避の'
+          + 'アカウントには戻れなくなります)'
+        : '\n  もう一度実行しても同じなら、そのアカウントで `/login` し直してから'
+          + ' `swap save ' + target + ' --force` で入れ直してください')
       + '\n  上書きで失われた旧内容の控えが残っていれば ' + REPLACED_DIR + ' から戻せることがあります');
   }
 
@@ -1616,16 +1640,10 @@ function cmdSwap(target, force) {
     const why = unreadableReason(CREDENTIALS);
     console.log('現在の credentials を読めなかったため、退避しませんでした(' + why.label + ')');
     console.log('  中身の控え: ' + saved.kept);
-    // staleRefreshToken(accessToken 欠けだが refreshToken は残る)を「使えない」に落として
-    // いなかった頃は、cmdStatus が同じ控えを「消さないでください」と案内しているのに、実際に
-    // 控えを作るこの経路だけが「使えない」と断定していた。cmdStatus の replaced.staleToken と
-    // 同じ判断・同じ文面に揃える(唯一の refreshToken の控えをその場で消させないため)。
-    console.log(why.retryable
-      ? '  中身は健全なまま読めなかっただけのことがあります。この控えは消さないでください'
-      : why.staleRefreshToken
-        ? '  accessToken が無いため、そのままでは accounts/<name>.json へ戻しても復元できませんが、'
-          + 'refreshToken は交換すればまた使えます。消さないでください'
-        : '  この控えは復元には使えません(accessToken を取り出せない中身です)');
+    // 控えの扱いは keptNote に集約する。ここと cmdStatus が別々に判断していた頃は、実際に
+    // 控えを作るこの経路だけが「使えない」と断定し、cmdStatus は同じ控えを「消さないで
+    // ください」と案内していて、指示が食い違っていた。
+    console.log('  ' + keptNote(why.verdict));
   } else {
     console.log('退避: ' + saved.name);
   }

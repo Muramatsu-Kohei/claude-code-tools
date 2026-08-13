@@ -854,8 +854,8 @@ console.log('swap');
     /読めません/.test(r.out) && !/未ログイン/.test(r.out), r.out + r.err);
 }
 {
-  // 読めない理由が権限やシステムエラーなら「時間をおいて再実行」は永久に効かない。
-  // 待てば直る話だと言い切ると、原因に気づけないまま繰り返させることになる。
+  // 読めない理由が権限やシステムエラーのとき、原因を伏せて「やり直してください」だけを
+  // 出すと、原因に気づけないまま繰り返させることになる。理由は必ず添える。
   // ディレクトリを置いて EISDIR を作り、err.code と原因に応じた対処が案内に出ることを見る。
   const home = sandbox('status-unreadable', {});
   fs.mkdirSync(credPath(home), { recursive: true });
@@ -864,16 +864,15 @@ console.log('swap');
   check('読めない理由に応じた対処を案内する', /ディレクトリ/.test(r.out), r.out);
 }
 {
-  // 読み取り自体に失敗した場合でも、原因によって「待てば直るか」は違う。EBUSY や EACCES は
-  // 中身が健全なままファイルに手が届いていないだけのことがあるが、EISDIR(同じ名前の
-  // ディレクトリが置かれている)は待っても永久に直らない。ここを一律 retryable に倒していた
-  // 頃は、この状態で「時間をおいてやり直してください」だけが出て、案内どおり打ち続けても
-  // 一歩も進まなかった。原因に応じた対処と、先へ進む手段が出ることを見る
-  // (待てば直る側の案内は別ブロック「待てば直る壊れ方では時間をおいて〜」で見ている)。
-  const home = sandbox('swap-unreadable-retryable', { accounts: { team: creds('team') } });
+  // 読み取り自体に失敗したとき、待てば直るかどうかはこのツールには分からない。EISDIR
+  // (同じ名前のディレクトリが置かれている)を「一過性のロック」と同じに扱って
+  // 「時間をおいてやり直してください」だけを出していた頃は、案内どおり打ち続けても
+  // 一歩も進まなかった。時間についての推測はやめ、原因に応じた対処と、先へ進む手段が
+  // 常に出ることを見る。
+  const home = sandbox('swap-unreadable-dir', { accounts: { team: creds('team') } });
   fs.mkdirSync(credPath(home), { recursive: true });
   const r = runSwap(home, ['team']);
-  check('待っても直らない読み取り失敗では再実行を案内しない',
+  check('読み取り失敗に時間をおいての案内は出さない',
     !/時間をおいて/.test(r.err), r.out + r.err);
   check('読み取りに失敗した理由に応じた対処を添える', /ディレクトリ/.test(r.err), r.out + r.err);
   check('読み取りに失敗した場合も先へ進む手段は示す', /--force/.test(r.err), r.err);
@@ -885,7 +884,8 @@ console.log('swap');
 }
 {
   // JSON としては読めるのに accessToken が無い(手で編集した、別バージョンが書いた、
-  // 将来の構造変更)。待っても直らないので「時間をおいて再実行」は永久に効かない案内になる。
+  // 将来の構造変更)。中身は最後まで確認できているので、「書き込み中かもしれない」と
+  // 曖昧に濁さず、形式の問題だと言い切る。
   const home = sandbox('status-no-token', {
     current: { claudeAiOauth: { subscriptionType: 'pro' } },
     accounts: { team: creds('team') },
@@ -894,7 +894,7 @@ console.log('swap');
   check('status は形式の問題を「書き込み中」と言わない',
     /accessToken/.test(s.out) && !/書き込み中/.test(s.out), s.out + s.err);
   const r = runSwap(home, ['team']);
-  check('待っても直らない理由では再実行を案内しない', !/時間をおいて/.test(r.err), r.out + r.err);
+  check('形式の問題に時間をおいての案内は出さない', !/時間をおいて/.test(r.err), r.out + r.err);
   check('先へ進む手段は案内する', /--force/.test(r.err), r.err);
 }
 {
@@ -1475,34 +1475,37 @@ console.log('swap');
     /\/login/.test(r.out + r.err) || /swap /.test(r.out + r.err), r.out + r.err);
 }
 {
-  // cmdSave(degraded 案内、swap.js:790 付近): 「待てば直る」壊れ方(JSON として壊れている
-  // = 書き込み途中を読んだ状態。unreadableReason が retryable: true を返す)では、中身は
-  // 健全なまま数百ミリ秒後には読めることが多い。そこで /login を勧めると、まだ退避していない
-  // アカウントの refreshToken をその場で消してしまうため、/login には触れず「時間をおいて」
-  // やり直す案内だけを出す。
-  const home = sandbox('save-degraded-retryable', { current: '{ broken' });
+  // cmdSave(degraded 案内): JSON として壊れている(書き込み途中を読んだ状態)は、中身を
+  // 最後まで確認できていないので verdict は 'unreadable'。ここを「待てば直る/直らない」で
+  // 出し分けていた頃は、直るかどうかの推測に案内を賭けており、永久に直らない状態へ
+  // 「時間をおいてやり直してください」を出し続ける無限ループを作っていた。いまは控えを
+  // 残したうえで「もう一度実行しても同じなら /login」の一本に寄せる。書き込み途中なら
+  // 次の実行で読めて別の案内(いまは読めています)に落ちるので、待てば直るケースは
+  // 分岐を増やさずに吸収される。控えが残っている以上、案内どおり /login しても失われない。
+  const home = sandbox('save-degraded-unreadable', { current: '{ broken' });
   const r = runSwap(home, ['save', '--force']);
-  check('待てば直る壊れ方では成功終了しない', r.code !== 0, r.out + r.err);
-  // 「/login はまだ試さないでください」という抑止の一文自体には /login が出るので、
-  // 見るのは「/login してから」という勧める言い回しが無いことに絞る
-  check('待てば直る壊れ方では /login を勧めない', !/`\/login` してから/.test(r.out + r.err), r.out + r.err);
-  check('待てば直る壊れ方では /login をまだ試すなと明示する',
-    /\/login はまだ試さないでください/.test(r.out + r.err), r.out + r.err);
-  check('待てば直る壊れ方では時間をおいてやり直す案内を出す',
-    /時間をおいて `swap save` をやり直してください/.test(r.out + r.err), r.out + r.err);
+  check('読めない壊れ方では成功終了しない', r.code !== 0, r.out + r.err);
+  check('読めない壊れ方でも控えは残す', replacedFiles(home).length === 1,
+    r.out + r.err + replacedFiles(home).join(','));
+  check('読めない壊れ方では時間をおいての案内は出さない',
+    !/時間をおいて/.test(r.out + r.err), r.out + r.err);
+  check('読めない壊れ方ではやり直しを先に、その後に /login を案内する',
+    /もう一度実行しても同じなら/.test(r.out + r.err) && /`\/login` してから/.test(r.out + r.err),
+    r.out + r.err);
 }
 {
-  // 対照: 待っても直らない壊れ方(JSON としては妥当だが accessToken が無い。手で編集した・
-  // 将来の構造変更を想定)では retryable: false になり、従来どおり控えの中身を確認したうえで
-  // /login する案内を出す。
-  const home = sandbox('save-degraded-not-retryable', {
+  // 対照: JSON としては妥当だが accessToken も refreshToken も無い(手で編集した・将来の
+  // 構造変更を想定)。中身を最後まで確認できたので verdict は 'unusable' になり、
+  // 「もう一度実行しても」を挟まずに済む……のではなく、文面は共通のまま /login を案内する。
+  // 案内を verdict ごとに書き分けないことが、行き止まりを作らないための肝。
+  const home = sandbox('save-degraded-unusable', {
     current: { claudeAiOauth: { subscriptionType: 'pro' } },
   });
   const r = runSwap(home, ['save', '--force']);
-  check('待っても直らない壊れ方では成功終了しない', r.code !== 0, r.out + r.err);
-  check('待っても直らない壊れ方では /login を勧める',
+  check('使えないと確認できた壊れ方では成功終了しない', r.code !== 0, r.out + r.err);
+  check('使えないと確認できた壊れ方では /login を勧める',
     /`\/login` してから/.test(r.out + r.err), r.out + r.err);
-  check('待っても直らない壊れ方では時間をおいての案内は出さない',
+  check('使えないと確認できた壊れ方でも時間をおいての案内は出さない',
     !/時間をおいて/.test(r.out + r.err), r.out + r.err);
 }
 {
@@ -1695,13 +1698,14 @@ console.log('swap');
   check('読めなかっただけの中身を「使えない」と断定しない',
     !/復元に使える形ではない/.test(r.out), r.out + r.err);
   check('退避しなかった理由を添える', /読めなかったため/.test(r.out), r.out + r.err);
-  check('待てば直る壊れ方では控えを消さないよう伝える',
-    /控えは消さないでください/.test(r.out), r.out + r.err);
+  check('読めなかっただけの控えは消さないよう伝える',
+    /消さないでください/.test(r.out), r.out + r.err);
 }
 
 {
-  // 対照: JSON としては読めるが accessToken が無い(待っても直らない)場合は、控えが復元に
-  // 使えないことまで言い切ってよい。上の断定を避けるのは理由が分からないときだけ。
+  // 対照: JSON としては読めるが accessToken も refreshToken も無い場合は、中身を最後まで
+  // 確認できているので、控えが復元に使えないことまで言い切ってよい。上の断定を避けるのは
+  // 中身を確認できていないときだけ。
   const home = sandbox('swap-degraded-unusable', {
     current: { claudeAiOauth: { subscriptionType: 'pro' } },
     accounts: { team: creds('team') },
@@ -1889,9 +1893,9 @@ console.log('swap');
   check('読めない復元先では上書きしない', r.code !== 0, r.out + r.err);
   check('読み取り失敗を「壊れている」と断定しない', !/壊れているか/.test(r.err), r.out + r.err);
   check('読めない理由を添える', /EISDIR/.test(r.err), r.out + r.err);
-  // EISDIR は待っても直らないので、抜ける手順(/login し直して入れ直す)は案内してよい。
-  // ただし現在の pro/now はまだどこにも退避されていないため、/login より先に必ず退避を
-  // 案内する。順序が逆になると、案内どおり打った時点で現在のアカウントが永久に失われる。
+  // 抜ける手順(/login し直して入れ直す)は、読めない理由によらず必ず案内する。ただし
+  // 現在の pro/now はまだどこにも退避されていないため、/login より先に必ず退避を案内する。
+  // 順序が逆になると、案内どおり打った時点で現在のアカウントが永久に失われる。
   check('/login より先に現在のログインの退避を案内する',
     r.err.indexOf('swap save pro') >= 0
     && r.err.indexOf('swap save pro') < r.err.indexOf('`/login` し直して'), r.out + r.err);
@@ -2042,15 +2046,16 @@ console.log('swap');
     !/この控えは復元には使えません/.test(r.out), r.out + r.err);
 }
 
-// --- 修正D: replacedCounts が一時的に読めないだけの控えを「消して構いません」側に分類していた ---
+// --- 修正D: replacedCounts が読み取れないだけの控えを「消して構いません」側に分類していた ---
 {
   // ウイルス対策やバックアップツールがファイルを掴んでいる(EBUSY/EACCES/EPERM)だけの控えが
-  // unreadable に落ち、cmdStatus が「原因を調べ終えたら消して構いません」と案内していた。
-  // pruneReplaced は同じ控えを「読めないことは復旧に使えないことの証明にならない」として
-  // 決して消さないので、自動削除の方針と表示の方針が逆を向いていた。
-  // 一時的な読み取り失敗はディレクトリで代用して EISDIR で再現する(既存の
+  // 「復元に使えない」側に落ち、cmdStatus が「原因を調べ終えたら消して構いません」と案内して
+  // いた。pruneReplaced は同じ控えを「読めないことは復旧に使えないことの証明にならない」として
+  // 決して消さないので、自動削除の方針と表示の方針が逆を向いていた。件数を分ける軸は
+  // 「待てば直るか」ではなく「中身を確認できたか」で、ここは読み取り自体に失敗した側。
+  // 読み取り失敗はディレクトリで代用して EISDIR で再現する(既存の
   // 「復元先スロットの読み取り失敗」テストと同じ技法)。
-  const home = sandbox('replaced-status-temporarily-unreadable', {
+  const home = sandbox('replaced-status-unreadable', {
     current: creds('pro', { token: 'now' }),
     accounts: { pro: creds('pro', { token: 'older' }) },
   });
@@ -2062,12 +2067,12 @@ console.log('swap');
   fs.rmSync(victim);
   fs.mkdirSync(victim); // ファイルをディレクトリに差し替えて EISDIR を起こす
   const r = runSwap(home, []);
-  check('一時的に読み取れない控えを別項目で出す',
-    /一時的に読み取れない控え: 1 件/.test(r.out), r.out + r.err);
+  check('読み取れない控えを別項目で出す',
+    /読み取れない控え: 1 件/.test(r.out), r.out + r.err);
   check('「消して構いません」には混ぜない',
-    !/一時的に読み取れない控え[\s\S]{0,300}消して構いません/.test(r.out), r.out);
+    !/読み取れない控え[\s\S]{0,300}消して構いません/.test(r.out), r.out);
   check('消さないでくださいと案内する',
-    /一時的に読み取れない控え[\s\S]{0,300}消さないでください/.test(r.out), r.out);
+    /読み取れない控え[\s\S]{0,300}消さないでください/.test(r.out), r.out);
 }
 
 // --- 修正E: 中止メッセージ組み立て中の slotsHolding が accounts 一覧を読めないと process を落とす ---
