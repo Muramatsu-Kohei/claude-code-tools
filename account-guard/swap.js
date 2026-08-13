@@ -163,7 +163,10 @@ const DAY_MS = 86400000;
 // Windows では出力先がパイプ(`swap team 2>&1 | tee log` など)だと書き込みが非同期になり、
 // console.error の直後に process.exit すると理由の文面が途中で切れて届かない。fs.writeSync は
 // 書き終わってから戻るので、直後に exit しても最後まで残る。
-function fail(msg) {
+// 文面を出すところまで。stdout に既に何かを出している場所では、process.exit が直前の
+// console.log を切ることがあるので、そこではこちらで出して exitCode を立て、自然に抜ける
+// (cmdSwap の「別アカウントだと確認できません」案内と同じ扱い)。
+function failText(msg) {
   const line = 'エラー: ' + msg + '\n';
   try {
     fs.writeSync(2, line);
@@ -172,6 +175,10 @@ function fail(msg) {
     // (切れる可能性は残るが、何も出ないよりはよい)
     process.stderr.write(line);
   }
+}
+
+function fail(msg) {
+  failText(msg);
   process.exit(1);
 }
 
@@ -714,7 +721,8 @@ function sameContentEntry(file, list) {
 // 上書きで失われる内容の控えを取る。移動ではなく複製なのは、控えを作る途中で落ちても
 // 元のファイルが手つかずで残るようにするため。控えが取れなければ上書きへは進まない
 // (切り替えられないのは後から取り返せるが、消えた資格情報は取り返せない)。
-function keepAside(file, base) {
+// nextStep は控えを取れずに中止するときへ添える「実際に効く次の一手」(呼び出し元ごとに違う)。
+function keepAside(file, base, nextStep) {
   // 置き場所を作れない・読めないのも「控えを取れなかった」の一種なので、copyFileSync と
   // 同じように理由と対処を添えて止める。素通しにしていた頃は、.replaced が手違いでファイルと
   // して置かれている環境で `EEXIST: file already exists, mkdir ...` という生の Node 例外だけが
@@ -755,10 +763,23 @@ function keepAside(file, base) {
     // しまう。しかも pruneReplaced は読めない控えを削除対象から意図的に外すので、自動でも
     // 消えない。unlink 自体の失敗は握りつぶす(そこまで失敗する環境では他に打つ手がない)。
     try { fs.unlinkSync(dest); } catch {}
+    // 失敗の理由は unreadableReason に判定させる。ここで文面を書き起こしていた頃は、原因を
+    // 権限とロックに決め打ちしていたため、probe が EISDIR(同名のディレクトリ)と言った直後に
+    // この行が EPERM を見せて別プロセスを終了させようとし、そのとおり動いても直らなかった。
+    // 読めさえすれば控えは取れるので、copyable が false = 打ち直しても同じ結果になる。
+    // 「もう一度」を勧めてよいのはその逆のときだけで、常に勧めると --force との間で
+    // 2 つのコマンドを往復し続ける案内になる。
+    const why = unreadableReason(file);
     fail('上書きで失われる内容の控えを取れませんでした(' + (e.code || e.message) + ')'
-      + '\n  ' + file + ' を読み取れません。権限を確認するか、ウイルス対策やバックアップツールなど'
-      + 'このファイルを掴んでいる別プロセスがあれば終了したうえで、'
-      + '先ほどと同じ swap コマンドをもう一度実行してください'
+      + '\n  ' + file + ': ' + why.label
+      + (why.copyable
+        ? '\n  権限を確認するか、ウイルス対策やバックアップツールなどこのファイルを掴んでいる'
+          + '別プロセスがあれば終了したうえで、先ほどと同じ swap コマンドをもう一度実行してください'
+        : '\n  この状態が続くあいだは控えを取れません。先に原因を解いてください')
+      // 控えを取れないのが「上書きされる側」の事情なら、別の名前を選べばそこは触らずに済む。
+      // 呼び出し元にしか分からないので文面ごと受け取る(ここで組み立てると、控えを取る対象が
+      // 現在の credentials の場合にも、効かない別名の案内を出すことになる)。
+      + (nextStep ? '\n  ' + nextStep : '')
       + '\n  控えを残せない以上、上書きは行っていません(元のファイルは手つかずです)');
   }
   try { fs.chmodSync(dest, 0o600); } catch {}
@@ -1092,7 +1113,11 @@ function writeSlot(name, cur, old) {
   // 側として必ず控えを取る。控えが取れなければ keepAside がそこで中止する。
   if (probeFile(file).exists) {
     const prev = old !== undefined ? old : readCredsOrNull(file);
-    if (!(prev && sameCreds(cur.json, prev.json))) keepAside(file, name);
+    // 控えを取れないのはこのスロットの側の事情(壊れている・掴まれている)なので、別の名前を
+    // 選べばそこには触れずに退避できる。原因の解消を待たなくても進める唯一の手なので添える。
+    if (!(prev && sameCreds(cur.json, prev.json))) {
+      keepAside(file, name, '別の名前で退避すれば ' + name + ' には触れずに済みます: swap save <別名>');
+    }
   }
   // 控えは取れたのにスロットへ書けないことがある(退避先を他プロセスが開いていると
   // rename が EPERM)。keepAside の copyFileSync と CREDENTIALS の書き込みには理由と対処を
@@ -1166,9 +1191,21 @@ function saveCurrent(explicitName, force, forceCmd, pre, afterCmd) {
     if (!force.unreadable) {
       // 「時間をおいて再実行」を verdict で出し分けていた頃の名残を残さない。もう一度打てば
       // 直る種類の失敗はここで吸収され、直らなければ次の行の --force が常に脱出路になる。
+      // --force が脱出路になるのは控えを取れるときだけ。開くことすらできないファイル
+      // (copyable: false)では、その先の keepAside が copyFileSync を同じ理由で落とし、
+      // その失敗が「もう一度実行してください」と案内するため、2 つのコマンドを往復し続ける
+      // ことになる。控えを取れない以上「中身を確認したうえで進む」も成り立たないので、
+      // 原因の解消を先に促す(saveFirstText が同じ状態に出している文面と揃える)。
       fail('現在の credentials を読めません(' + why.label + ')'
-        + '\n  もう一度実行しても同じなら、中身を確認したうえで、そのまま先へ進めます:'
-        + '\n    ' + forceCmd);
+        + (why.copyable
+          ? '\n  もう一度実行しても同じなら、中身を確認したうえで、そのまま先へ進めます:'
+            + '\n    ' + forceCmd
+          : '\n  ' + CREDENTIALS + ' を開けないあいだは控えも取れないため、--force を付けても'
+            + '同じところで止まります。先にこのパスを開ける状態に戻してください'
+            // ここで `/login` を脱出路として出さない。中身を確認できていない以上、未退避の
+            // refreshToken が残っている可能性を否定できず、勧めたとおり打つとそれを捨てさせる
+            // (29ef72b で塞いだ経路)。パスさえ開けば控えも切り替えも通る。
+        ));
     }
     // 読めない中身はスロットに入れない。復元に使えないうえ、そこに入っている有効な退避を
     // 潰してしまう(--force の意図は「読めない現在を諦めて進む」であって「有効な退避を
@@ -1210,7 +1247,11 @@ function saveCurrent(explicitName, force, forceCmd, pre, afterCmd) {
 // 中止される事故になっていた。cmdSwap の restoreCmd 参照)。
 // インデントは呼び出し元 2 箇所とも '  ' 固定なので引数にはせず定数にする。
 const REPORT_INDENT = '  ';
-function reportOtherSlots(saved, returnCmd) {
+// returnNote は「戻すコマンドが存在しない」ときにコマンドの代わりへ出す注記。呼び出し側から
+// 渡すのは、この関数が cmdSwap(切り替え直後)と cmdSave(何も復元していない)の両方から
+// 呼ばれるため。returnCmd が null であることだけを根拠にここで文面を決めると、退避しかして
+// いない cmdSave にも「いま復元したアカウントの内容で上書きされます」を出すことになる。
+function reportOtherSlots(saved, returnCmd, returnNote) {
   const indent = REPORT_INDENT;
   const stale = saved.stale || [];
   const drifted = saved.drifted || null;
@@ -1233,13 +1274,12 @@ function reportOtherSlots(saved, returnCmd) {
   if (returnCmd) {
     console.log(indent + '    ' + returnCmd
       + '   (先に戻さないと、いま復元したアカウントの内容で上書きされます)');
-  } else {
+  } else if (returnNote) {
     // 戻すコマンドが無い(退避名がサブコマンドと衝突していて、打てる形が存在しない)。手順は
     // 出せないが、警告まで一緒に消すと下の `swap save` をそのまま打ってよいように見える。
     // それが書き込むのは現在のログイン = いま復元したアカウントなので、戻さないまま打つと
-    // 元の内容が失われる。戻し方は直前の「元に戻すには」で改名を案内済み。
-    console.log(indent + '    (先に元へ戻さないと、いま復元したアカウントの内容で'
-      + '上書きされます。戻し方は上の「元に戻すには」を参照してください)');
+    // 元の内容が失われる。
+    console.log(indent + '    ' + returnNote);
   }
   // 名前は挙がっている全部に出す。先頭 1 つだけを出していた頃は、同じアカウントを複数の名前で
   // 退避している人(この関数がまさに想定している状況)が案内どおり打っても残りが取り残され、
@@ -1974,7 +2014,11 @@ function cmdSwap(target, force) {
   try {
     writeAtomic(CREDENTIALS, next.raw);
   } catch (e) {
-    fail('認証情報の差し替えに失敗しました(' + (e.code || e.message) + ')'
+    // 直前の console.log は stdout に出ている。degraded だった場合そこにしか無い「中身の控え」の
+    // パスを、process.exit がパイプ越しに切ってしまうことがある(fail が守るのは stderr だけ)。
+    // 控えの場所を見失うと、読めなかった現在のログインを取り戻す手掛かりが消えるので、ここは
+    // 文面だけ出して自然に抜ける。
+    failText('認証情報の差し替えに失敗しました(' + (e.code || e.message) + ')'
       + '\n  ' + CREDENTIALS + ' を書き換えられません。'
       + dirIsFileHint(e, path.dirname(CREDENTIALS),
         '稼働中の Claude Code など、このファイルを掴んでいるプロセスを終了するか、'
@@ -1983,7 +2027,12 @@ function cmdSwap(target, force) {
       + (saved && saved.name
         ? '(現在のログインは ' + saved.name + ' へ退避済みで、失われたものはありません)'
         : '')
+      + (saved && saved.degraded && saved.kept
+        ? '\n  読めなかった現在の内容の控え: ' + saved.kept
+        : '')
       + '\n  原因を取り除いてから、もう一度 `swap ' + target + (force ? ' --force' : '') + '` を実行してください');
+    process.exitCode = 1;
+    return;
   }
   // ここから先は差し替えが済んでいる = 認証はもう切り替わっている。来歴を書けなかった
   // からといって中止すると、生の例外だけを見た利用者が「切り替わらなかった」と読んで
@@ -2019,7 +2068,12 @@ function cmdSwap(target, force) {
 
   // 取り残された他スロットの案内は切り替えの「あと」に出す。切り替え前に出していた頃は
   // 案内の意味が反対になっていた(reportOtherSlots のコメント参照)。戻る手順を添えて渡す。
-  if (saved && saved.name) reportOtherSlots(saved, backCmd);
+  // 戻す手順が出せないのはここ(切り替え済み)だけなので、注記もここで組み立てて渡す。
+  if (saved && saved.name) {
+    reportOtherSlots(saved, backCmd, backCmd ? null
+      : '(先に元へ戻さないと、いま復元したアカウントの内容で上書きされます。'
+        + '戻し方は上の「元に戻すには」を参照してください)');
+  }
 }
 
 function usage() {
