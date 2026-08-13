@@ -137,6 +137,25 @@ const DISPATCHED_NAMES = new Set(['save', 'help', '-h', '--help']);
 // より危険な /login のやり直しへ誘導していた。実装するときはこの名前を上へ移すだけでよい。
 const RESERVED_ONLY_NAMES = new Set(['warmup']);
 const RESERVED_NAMES = new Set([...DISPATCHED_NAMES, ...RESERVED_ONLY_NAMES]);
+
+// `swap <name>` を「打てるコマンド」として案内してよいか。validateName は新規作成しか
+// 弾かない(既存ファイルがあれば素通しする)ので、予約語チェックより前に作られた
+// accounts/save.json のようなスロットは今も一覧に残り、退避先として自動で選ばれもする。
+// その名前をそのまま案内すると、打った人には復元ではなく save サブコマンドが走り、
+// 切り替わっていないのに exit 0 で終わる(ラッパーは戻したつもりで戻れていない)。
+// 案内文へスロット名を埋め込む箇所は必ずここを通す。判定は cmdStatus の「復元できない
+// 名前の退避があります」と同じ集合を見る(同じ規則を別の場所へ書き写すと、片方だけ直る)。
+function restorableByName(name) {
+  return !DISPATCHED_NAMES.has(name);
+}
+
+// 復元できない名前のスロットに残された唯一の抜け道。ファイルは無事なので、改名すれば
+// そのまま復元できる(/login のやり直しは要らない)。cmdStatus と同じ内容を、案内 1 件ぶんの
+// 文面としてここから出す。
+function renameToRestoreText(name) {
+  return 'swap のサブコマンドと同じ名前なので `swap ' + name + '` では復元できません'
+    + '(accounts/' + name + '.json を別の名前へ改名してください)';
+}
 const DAY_MS = 86400000;
 
 // fail は「戻らない」前提で各所から呼ばれているので、exitCode を立てて return する形には
@@ -344,7 +363,24 @@ function readCurrentForGuard() {
   // 読み直しても取れなければ、その隙にまた掴まれたということ。理由を取り直して「読めない」
   // として扱う(null のまま進めると、上に書いたガードの素通しが再発する)。
   const again = readCredsOrNull(CREDENTIALS);
-  return again ? { cur: again, why: null } : { cur: null, why: unreadableReason(CREDENTIALS) };
+  if (again) return { cur: again, why: null };
+  // 3 度目の理由をそのまま返すと、その瞬間だけ読めたときに verdict が 'usable' で戻り、
+  // 呼び出し側が「読めません(いまは健全に読めています)」という自己矛盾した案内を出す。
+  // 4a5e753 が消したのは一過性が 1 度きりの場合で、2 度続くとこの経路から戻ってくる。
+  // ここまで来た事実は「読めたり読めなかったりする」なので、そう名乗らせる。中身について
+  // 分かったこと(控えを取れる/refreshToken が残っている)は probe で確かめた事実なので保つ。
+  const last = unreadableReason(CREDENTIALS);
+  if (last.verdict !== 'usable') return { cur: null, why: last };
+  return {
+    cur: null,
+    why: {
+      label: '読めたり読めなかったりします(他のプロセスが断続的に掴んでいる可能性があります)',
+      // 中身を最後まで確認できていない以上 unusable ではない(控えを消させない側に倒す)。
+      verdict: 'unreadable',
+      copyable: last.copyable,
+      hasToken: last.hasToken,
+    },
+  };
 }
 
 // 残した控えをどう扱えばよいかの案内。verdict から 1 箇所で決める。この判断が cmdSwap と
@@ -1281,7 +1317,7 @@ function cmdStatus() {
   // 使い回す(前は判定と表示で別々に全スロットを読んでいた)。
   const savedCreds = new Map(saved.map(n => [n, readCredsOrNull(accountFile(n))]));
   const outdated = outdatedSlots(cur, curSlot, savedCreds);
-  const unreachable = saved.filter(n => DISPATCHED_NAMES.has(n));
+  const unreachable = saved.filter(n => !restorableByName(n));
   const reservedOnly = saved.filter(n => RESERVED_ONLY_NAMES.has(n));
   console.log('\n退避済み (' + ACCOUNTS_DIR + '):');
   if (savedError) {
@@ -1304,9 +1340,16 @@ function cmdStatus() {
   // 中に落ちるとここに残る。中身は平文のトークンで、退避の一覧にも控えの集計にも現れないため、
   // 知らせるのはこの status だけ。消してよいかは中身を見ないと決められない(唯一のコピーで
   // ありうる)ので、判断材料だけ出して削除は促さない(keptNote と同じ扱い)。
-  if (savedPartial && savedPartial.length > 0) {
+  // 同じ後始末漏れは現在の credentials 側にも起きる(切り替えの最終段は writeAtomic(CREDENTIALS))。
+  // savedPartial は accounts/ の readdir なので ~/.claude/.credentials.json.tmp を構造上拾えないが、
+  // 場所が違うだけで残るものは同じ平文トークンなので同じ枠で知らせる。probeFile を使うのは、
+  // 読めないだけのファイルを「無い」に倒して見逃さないため。
+  const livePartial = CREDENTIALS + '.tmp';
+  const partialPaths = (savedPartial || []).map(f => path.join(ACCOUNTS_DIR, f));
+  if (probeFile(livePartial).exists) partialPaths.push(livePartial);
+  if (partialPaths.length > 0) {
     console.log('\n書きかけのまま残っているファイルがあります(平文のトークンを含みます):');
-    for (const f of savedPartial) console.log('  ' + path.join(ACCOUNTS_DIR, f));
+    for (const f of partialPaths) console.log('  ' + f);
     console.log('  退避が済んでいるかを確かめたうえで、不要なら削除してください');
   }
   if (outdated.size > 0) {
@@ -1544,6 +1587,10 @@ function cmdSwap(target, force) {
       // 案内どおり打っているのに止まることがある)。見出し行を挟むことで、スロットごとに
       // 独立した選択肢だと分かる形にする。
       const lines = saved.map((name) => {
+        // 中身より先に名前を見る。読めるかどうかに関わらず、この名前では復元が走らないので、
+        // 「打てるコマンド」として出してはいけない(status は同じスロットを「復元できない名前の
+        // 退避」と警告しており、ここで swap <name> を勧めると案内どうしが正面から矛盾する)。
+        if (!restorableByName(name)) return '    ' + name + ':\n      ' + renameToRestoreText(name);
         const c = readCredsOrNull(accountFile(name));
         // 読めないスロットは「打てば必ず通る」と請け合えない。列挙から外し、存在だけ伝える。
         if (!c) return '    ' + name + ':\n      読めないため案内できません';
@@ -1564,7 +1611,10 @@ function cmdSwap(target, force) {
       // 元の案内のまま(/login を挟む以外に進みようがない)。
       let hint = '\n  まだ何も退避されていません。先に `swap save` で現在のアカウントを退避してください';
       if (cur) {
-        const g = saveFirstText(!curSlotOf, false, false, curSlotOf);
+        // curUnsavable は cur が読めているこの分岐では常に null(readCurrentForGuard が
+        // 両立させない)。省いても値は変わらないが、呼び出しごとに引数の数が違うと
+        // 「渡し忘れ」と「渡す必要がない」を見分けられなくなるので明示する。
+        const g = saveFirstText(!curSlotOf, false, false, curSlotOf, curUnsavable);
         if (g.needed) {
           hint = '\n  まだ何も退避されていません。先に `' + g.cmd
             + '` で現在のアカウントを退避してください' + g.why;
@@ -1721,8 +1771,16 @@ function cmdSwap(target, force) {
   //   restoreBackCmd … 切り替えたあと元へ戻す向き(そのときの現在は next で、復元先は cur の内容)
   const restoreCmd = 'swap ' + target
     + (needsForceToRestore(cur ? cur.json : null, next.json, curUnsavable) ? ' --force' : '');
-  const restoreBackCmd = (name) => 'swap ' + name
-    + (needsForceToRestore(next.json, cur ? cur.json : null) ? ' --force' : '');
+  // 名前がサブコマンドと衝突しているスロットへは、打って戻れる形が存在しない。ここで文字列を
+  // 返すと「元に戻すには: swap save」を案内することになり、そのとおり打った人は退避を走らせて
+  // 切り替わったまま exit 0 で終わる(戻したつもりで戻れていない)。打てる形が無いことを
+  // null で表し、改名の手順は呼び出し側に出させる(reportOtherSlots は returnCmd 無しの
+  // 場合を既に持っている)。curUnsavable は cur が読めているこの経路では常に null だが、
+  // 省くと needsForceToRestore の引数の意味が呼び出しごとに変わって見えるので渡しておく。
+  const restoreBackCmd = (name) => restorableByName(name)
+    ? 'swap ' + name
+      + (needsForceToRestore(next.json, cur ? cur.json : null, curUnsavable) ? ' --force' : '')
+    : null;
   // 唯一の呼び出し元(下の「すでに復元済み」案内)は常に名前を省いて呼ぶ(退避名は
   // saveCurrent が来歴/subscriptionType から決めるので、ここでは決め打ちできない)。
   const saveCmd = 'swap save' + (planned ? ' --force' : '');
@@ -1742,8 +1800,14 @@ function cmdSwap(target, force) {
   const needsName = !!cur && !curSlotOf;
   const sameAsTarget = !!cur && curSlotOf === target;
   const saveBlocked = !!(cur && curSlotOf && overwriteGate(cur, curSlotOf, curSlot).blocked);
+  // curUnsavable を省いていた頃は、現在の credentials を開けない状態(cur が null なので
+  // needsName / sameAsTarget / saveBlocked が 3 つとも false になる)で saveFirst が立たず、
+  // 案内が裸の `swap <target> --force` に退化していた。そのとおり打つと keepAside が控えを
+  // 取れずに中止し、「もう一度実行してください」へ落ちる無限リトライになる。すぐ上の
+  // needsForceToRestore には同じ curUnsavable を渡して --force を要求しているので、
+  // 理由の説明だけが欠ける食い違いでもあった。
   const { needed: saveFirst, cmd: saveFirstCmd, why: saveFirstWhy } =
-    saveFirstText(needsName, sameAsTarget, saveBlocked, curSlotOf);
+    saveFirstText(needsName, sameAsTarget, saveBlocked, curSlotOf, curUnsavable);
   const forceHint = saveFirst
     ? '\n  現在のログインはそのままです。先に退避してから、承知のうえで復元してください:'
       + '\n    ' + saveFirstCmd
@@ -1932,6 +1996,10 @@ function cmdSwap(target, force) {
   const backCmd = saved && saved.name ? restoreBackCmd(saved.name) : null;
   if (backCmd) {
     console.log('  元に戻すには: ' + backCmd);
+  } else if (saved && saved.name) {
+    // 退避そのものは済んでいるので失われた内容は無く、塞がっているのは戻す手順だけ。
+    // 黙って行を省くと「戻せる」と誤解したまま切り替えを済ませてしまうので、改名を案内する。
+    console.log('  元に戻すには: ' + renameToRestoreText(saved.name));
   }
 
   // 取り残された他スロットの案内は切り替えの「あと」に出す。切り替え前に出していた頃は
