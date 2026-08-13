@@ -1233,6 +1233,13 @@ function reportOtherSlots(saved, returnCmd) {
   if (returnCmd) {
     console.log(indent + '    ' + returnCmd
       + '   (先に戻さないと、いま復元したアカウントの内容で上書きされます)');
+  } else {
+    // 戻すコマンドが無い(退避名がサブコマンドと衝突していて、打てる形が存在しない)。手順は
+    // 出せないが、警告まで一緒に消すと下の `swap save` をそのまま打ってよいように見える。
+    // それが書き込むのは現在のログイン = いま復元したアカウントなので、戻さないまま打つと
+    // 元の内容が失われる。戻し方は直前の「元に戻すには」で改名を案内済み。
+    console.log(indent + '    (先に元へ戻さないと、いま復元したアカウントの内容で'
+      + '上書きされます。戻し方は上の「元に戻すには」を参照してください)');
   }
   // 名前は挙がっている全部に出す。先頭 1 つだけを出していた頃は、同じアカウントを複数の名前で
   // 退避している人(この関数がまさに想定している状況)が案内どおり打っても残りが取り残され、
@@ -1586,24 +1593,32 @@ function cmdSwap(target, force) {
       // 次のスロットへ切り替えようとすると、直前の切り替えのせいで判定の前提が変わり、
       // 案内どおり打っているのに止まることがある)。見出し行を挟むことで、スロットごとに
       // 独立した選択肢だと分かる形にする。
-      const lines = saved.map((name) => {
+      // 打てるコマンドを出せたかを行ごとに持ち回る。見出しは「いずれか1つを選んでください」と
+      // 択一を促すので、選べる行が 1 つも無いまま出すと、無い選択肢を探させることになる
+      // (全スロットが読めない場合に前からあった穴で、復元できない名前を弾くぶん当たりやすくなる)。
+      const entries = saved.map((name) => {
         // 中身より先に名前を見る。読めるかどうかに関わらず、この名前では復元が走らないので、
         // 「打てるコマンド」として出してはいけない(status は同じスロットを「復元できない名前の
         // 退避」と警告しており、ここで swap <name> を勧めると案内どうしが正面から矛盾する)。
-        if (!restorableByName(name)) return '    ' + name + ':\n      ' + renameToRestoreText(name);
+        if (!restorableByName(name)) return { runnable: false, body: renameToRestoreText(name) };
         const c = readCredsOrNull(accountFile(name));
         // 読めないスロットは「打てば必ず通る」と請け合えない。列挙から外し、存在だけ伝える。
-        if (!c) return '    ' + name + ':\n      読めないため案内できません';
+        if (!c) return { runnable: false, body: '読めないため案内できません' };
         const sameAsTarget = !!cur && curSlotOf === name;
         const restore = 'swap ' + name
           + (needsForceToRestore(cur ? cur.json : null, c.json, curUnsavable) ? ' --force' : '');
         const g = saveFirstText(needsName, sameAsTarget, saveBlocked, curSlotOf, curUnsavable);
-        if (!g.needed) return '    ' + name + ':\n      ' + restore;
-        return '    ' + name + ':\n      ' + g.cmd + '\n      ' + restore + g.why;
-      });
+        const body = g.needed ? g.cmd + '\n      ' + restore + g.why : restore;
+        return { runnable: true, body };
+      }).map((e, i) => ({ ...e, line: '    ' + saved[i] + ':\n      ' + e.body }));
+      const heading = entries.some(e => e.runnable)
+        ? '\n  利用可能なスロットと、実際に打てるコマンド(いずれか1つを選んでください):'
+        // 退避はあるのに 1 つも復元できない。行き止まりではなく、各行に抜け道(改名・原因の解消)を
+        // 書いてあるので、そちらを読ませる。
+        : '\n  退避はありますが、いま復元できるものはありません。理由と対処は各行のとおりです:';
       fail('退避されていません: ' + target
-        + '\n  利用可能なスロットと、実際に打てるコマンド(いずれか1つを選んでください):'
-        + '\n' + lines.join('\n'));
+        + heading
+        + '\n' + entries.map(e => e.line).join('\n'));
     } else {
       // 素の `swap save` は、現在のログインの状態によっては退避の段で止まりうる(名前を
       // 決められない/credentials が読めない)。forceHint と同じ saveFirstText の判定で
