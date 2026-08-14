@@ -1176,9 +1176,17 @@ function saveInto(cur, name, forceOverwrite, afterCmd) {
 // pre は呼び出し元が既に読んだ credentials。渡すのは CREDENTIALS を二度読まないため
 // (二度読むと、判定に使ったバイト列と実際に退避するバイト列がずれる。稼働中の別セッションが
 //  その隙にトークンを更新すると、ガードを通した内容とは別物がスロットに入る)。
+// null と undefined は区別する。null は「呼び出し元が読もうとして読めなかった」で、その
+// 呼び出し元(cmdSwap)では cur に依存する復元ガードが 4 つとも素通りしている。ここで
+// `pre || read...` と読み直して成功すると、ガードを一度も通っていない切り替えが、退避だけ
+// 済ませて先へ進んでしまう(来歴が復元元を指していれば、そのスロットを現在のログインで
+// 上書きしたうえで、読み込み済みの旧内容をマシン全体へ書き戻す)。読めなかったという
+// 呼び出し元の判断をここで覆さず、下の「読めない」経路 = --force を要求するか控えだけ
+// 残して退避を諦める既存のガードに合流させる。undefined は「まだ誰も読んでいない」
+// (cmdSave)なので、これまでどおりここで読む。
 // afterCmd は上書きガードで止まったときに案内へ添える「続きの一手」(failOverwrite 参照)。
 function saveCurrent(explicitName, force, forceCmd, pre, afterCmd) {
-  const cur = pre || readCredsOrNull(CREDENTIALS);
+  const cur = pre === undefined ? readCredsOrNull(CREDENTIALS) : pre;
 
   if (!cur) {
     // 「無い」ときだけ未ログインとして退避を省く。existsSync は権限やロックで stat が失敗
@@ -1437,13 +1445,19 @@ function cmdStatus() {
     console.log('  取り違えて上書きしたときは、ここから accounts/<name>.json へ戻せます');
   }
   if (replaced.staleToken > 0) {
-    // accessToken が無いので accounts/<name>.json へ戻してもそのままでは復元できないが、
-    // refreshToken は交換すればまた使える。「復元に使えない控え」に混ぜて「消して構いません」
-    // と案内すると、救えたはずの資格情報をその案内どおり消させることになる。
-    console.log('\n復元には使えないが refreshToken が残っている控え: ' + replaced.staleToken
+    // そのままでは accounts/<name>.json へ戻しても復元できないが、交換すればまた使える
+    // トークンが残っている。「復元に使えない控え」に混ぜて「消して構いません」と案内すると、
+    // 救えたはずの資格情報をその案内どおり消させることになる。
+    // どのトークンが残っているかは名指ししない。この件数には JSON として読めた控え
+    // (accessToken が無く refreshToken が残っていると確定している)と、書き込みの途中で
+    // 切り詰められて読めない控え(rawHasRecoverableToken がバイト列から refreshToken か
+    // accessToken のどちらかを見つけただけ)の両方が入る。後者を「refreshToken が残って
+    // います」と言い切ると、accessToken だけが残った控えについて、交換という存在しない
+    // 復旧手段を探させることになる。
+    console.log('\n復元には使えないがトークンが残っている控え: ' + replaced.staleToken
       + ' 件 (' + REPLACED_DIR + ')');
-    console.log('  accessToken が無いため accounts/<name>.json へ戻してもそのままでは復元できませんが、'
-      + 'refreshToken は交換すればまた使えます。消さないでください');
+    console.log('  そのままでは accounts/<name>.json へ戻しても復元できませんが、'
+      + '残っているトークンは交換すればまた使えることがあります。消さないでください');
   }
   if (replaced.unreadable > 0) {
     // 読み取り自体に失敗した控え。ウイルス対策やバックアップツールが掴んでいる
@@ -1543,11 +1557,13 @@ function saveFirstText(needsName, sameAsTarget, saveBlocked, curSlotOf, curUnsav
   const why = curUnsavable
     ? (curUnsavable.copyable
       // 開けてはいる(バイト列は読めた)。スロットへは入らないが控えは確実に取れるので、
-      // そこまでを約束する。refreshToken に触れてよいのは、実際に残っていると確かめた
-      // ときだけ(rawHasRecoverableToken の判定を hasToken として受け取っている)。
+      // そこまでを約束する。トークンに触れてよいのは、実際に残っていると確かめたときだけ
+      // (rawHasRecoverableToken の判定を hasToken として受け取っている)。名前は挙げない:
+      // この hasToken はパースを通らないバイト列に refreshToken か accessToken のどちらかを
+      // 見つけただけで、どちらだったかまでは確かめていない。
       ? '\n  (現在の credentials はスロットへ退避できません: ' + curUnsavable.label
         + '。--force を付けると ' + REPLACED_DIR + ' に控えだけが残ります'
-        + (curUnsavable.hasToken ? '。控えに refreshToken が残るので、あとから取り出せます' : '')
+        + (curUnsavable.hasToken ? '。控えにトークンが残るので、あとから取り出せます' : '')
         + ')'
       // 開くことすらできない。控えは copyFileSync が同じ理由で落ちるので取れない。
       // ここで控えを約束すると、案内どおり打った人が「控えを取れませんでした」で行き止まる。

@@ -1005,7 +1005,7 @@ console.log('swap');
   check('refreshToken だけの控えは「復元に使えない控え」に数えない',
     !/^復元に使えない控え/m.test(r.out), r.out + r.err);
   check('refreshToken だけの控えは別項目で件数を出す',
-    /refreshToken が残っている控え: 1 件/.test(r.out), r.out + r.err);
+    /トークンが残っている控え: 1 件/.test(r.out), r.out + r.err);
   check('消さないでほしいことを明示する', /消さないでください/.test(r.out), r.out + r.err);
 }
 {
@@ -1024,9 +1024,14 @@ console.log('swap');
     !/^復元に使えない控え/m.test(r.out), r.out + r.err);
   check('「上書きで退けた旧内容」にも数えない(JSON としては読めていない)',
     !/上書きで退けた旧内容/.test(r.out), r.out + r.err);
-  check('refreshToken が残っている控えとして別項目で件数を出す',
-    /refreshToken が残っている控え: 1 件/.test(r.out), r.out + r.err);
+  check('トークンが残っている控えとして別項目で件数を出す',
+    /トークンが残っている控え: 1 件/.test(r.out), r.out + r.err);
   check('消さないでほしいことを明示する', /消さないでください/.test(r.out), r.out + r.err);
+  // この件数には accessToken だけが残った控えも入る(すぐ下のテストが確かめている形)ので、
+  // 集計の文面では refreshToken と名指ししない。ここで残っているのが実際に refreshToken でも、
+  // 件数表示は両方を束ねたものである以上、名指しは他方について嘘になる。
+  check('集計の文面では refreshToken と名指ししない',
+    !/refreshToken が残っている控え/.test(r.out), r.out + r.err);
 }
 {
   const home = sandbox('bad-name', { current: creds('pro') });
@@ -2381,7 +2386,9 @@ const TRUNCATED_CURRENT =
   const out = (({ out: o, err }) => o + err)(runSwap(home, ['alpha']));
   check('壊れた現在では控えを残す手順を先に案内する',
     out.includes('swap save --force') && out.includes('控え'), out);
-  check('控えに refreshToken が残ることまで伝える', out.includes('refreshToken'), out);
+  // 元は out.includes('refreshToken') だったが、出力のどこかにその語があれば通る形なので
+  // 案内の文面が退化しても気づけない。約束している当の一文を名指しで見る。
+  check('控えにトークンが残ることまで伝える', out.includes('控えにトークンが残る'), out);
 }
 
 {

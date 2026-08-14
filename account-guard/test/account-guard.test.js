@@ -1150,7 +1150,12 @@ console.log('account-guard');
   check('refreshToken だけ残る場合も拒否する', decision(res) === 'deny', JSON.stringify(res));
   check('refreshToken だけ残る場合は「失われる認証情報はない」と断言しない',
     !/失われる認証情報はない/.test(reason), reason);
-  check('refreshToken が残っていることを理由として示す', /refreshToken/.test(reason), reason);
+  // 文面はトークンの名前を挙げない。この分岐には JSON として読めた中身(refreshToken が
+  // 残っていると確定できる)と、生バイト列から拾っただけの中身(refreshToken か accessToken の
+  // どちらかまでしか分からない)の両方が来るため。検査は「何が残っているか」の断定ではなく、
+  // 失って困るものが残っていると伝えているかを見る。
+  check('失って困るトークンが残っていることを理由として示す',
+    /交換すればまた使えるトークンが残っています/.test(reason), reason);
   check('先に /login すると失われることを伝える', /`\/login` すると/.test(reason), reason);
   // swap 側はこの中身も「読めない現在」として扱う(hasUsableCredentials が false)。
   // --force を付けずに案内すると、案内どおり打っても必ず中止される。
@@ -1180,7 +1185,13 @@ console.log('account-guard');
     !/失われる認証情報はない/.test(reason), reason);
   check('未ログイン側の文言(消える退避はありません)も流用しない',
     !/消える退避はありません/.test(reason), reason);
-  check('refreshToken が残っていることを理由として示す', /refreshToken/.test(reason), reason);
+  check('失って困るトークンが残っていることを理由として示す',
+    /交換すればまた使えるトークンが残っています/.test(reason), reason);
+  // こちらは JSON 構文エラー = rawHasRecoverableToken が生バイト列から拾っただけの経路。
+  // 拾えたのが accessToken だけの控え(書き込みの途中で切れた形)もここに来るので、
+  // refreshToken と名指しすると、交換という存在しない復旧手段を探させることになる。
+  check('生の中身から拾ったトークンを refreshToken と名指ししない',
+    !/refreshToken/.test(reason), reason);
   check('先に /login すると失われることを伝える', /`\/login` すると/.test(reason), reason);
 }
 
