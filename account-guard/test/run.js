@@ -25,75 +25,88 @@ const { spawnSync } = require('child_process');
 const TMP = path.join(__dirname, '.tmp');
 const only = process.argv[2];
 
-if (only || process.env.SWAP_SCRIPT) {
-  const reasons = [];
-  if (only) reasons.push(`フィルタ指定 "${only}"`);
-  if (process.env.SWAP_SCRIPT) reasons.push('SWAP_SCRIPT 指定');
-  console.log(`test/.tmp の全削除をスキップ(${reasons.join(' / ')})。前回実行の孤児が残っていても今回は一掃されない(issue #8)。`);
-} else {
-  // force: true だけでは足りない場面がある: 孤児プロセス(issue #8 参照)が .tmp 配下を
-  // カレントディレクトリにしていたりファイルハンドルを開いたままだと、Windows は
-  // force: true でも EBUSY / EPERM を投げて rmSync ごと失敗する。しかもこれは「まさに
-  // この掃除が必要な場面」(=孤児が残っている場面)そのものなので、ここで無言で
-  // クラッシュするとランナーが 1 本もテストを走らせずに落ち、原因が読めないメッセージだけが残る。
-  // maxRetries/retryDelay は Windows のハンドル解放が非同期に少し遅れて終わることがある
-  // ことへの保険(実体は消えているのにハンドルの解放待ちで一瞬だけ触れない、という
-  // レースを吸収する)。それでも失敗したら孤児プロセスの残存を明示して案内する。
-  try {
-    fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
-  } catch (e) {
-    console.error(`test/.tmp の削除に失敗した: ${e.message}`);
-    console.error('孤児プロセスが test/.tmp 配下をカレントディレクトリにしているか、ファイルを開いたままの可能性がある(issue #8)。');
-    console.error('Windows での確認: `Get-Process node` で残存プロセスを確認し、`Stop-Process -Id <PID> -Force` で終了させてから再実行する。');
-    process.exit(1);
+function main() {
+  if (only || process.env.SWAP_SCRIPT) {
+    const reasons = [];
+    if (only) reasons.push(`フィルタ指定 "${only}"`);
+    if (process.env.SWAP_SCRIPT) reasons.push('SWAP_SCRIPT 指定');
+    console.log(`test/.tmp の全削除をスキップ(${reasons.join(' / ')})。前回実行の孤児が残っていても今回は一掃されない(issue #8)。`);
+  } else {
+    // force: true だけでは足りない場面がある: 孤児プロセス(issue #8 参照)が .tmp 配下を
+    // カレントディレクトリにしていたりファイルハンドルを開いたままだと、Windows は
+    // force: true でも EBUSY / EPERM を投げて rmSync ごと失敗する。しかもこれは「まさに
+    // この掃除が必要な場面」(=孤児が残っている場面)そのものなので、ここで無言で
+    // クラッシュするとランナーが 1 本もテストを走らせずに落ち、原因が読めないメッセージだけが残る。
+    // maxRetries/retryDelay は Windows のハンドル解放が非同期に少し遅れて終わることがある
+    // ことへの保険(実体は消えているのにハンドルの解放待ちで一瞬だけ触れない、という
+    // レースを吸収する)。それでも失敗したら孤児プロセスの残存を明示して案内する。
+    try {
+      fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    } catch (e) {
+      console.error(`test/.tmp の削除に失敗した: ${e.message}`);
+      console.error('孤児プロセスが test/.tmp 配下をカレントディレクトリにしているか、ファイルを開いたままの可能性がある(issue #8)。');
+      console.error('Windows での確認: `Get-Process node` で残存プロセスを確認し、`Stop-Process -Id <PID> -Force` で終了させてから再実行する。');
+      // process.exit ではなく exitCode + return で抜ける。harness.js:23-26 と同じ理由で、
+      // Windows では stdout がパイプ(CI のログ収集等)のとき書き込みが非同期になり、
+      // 直後に process.exit を呼ぶと直前の console.error が切れて届かないことがある。
+      process.exitCode = 1;
+      return;
+    }
   }
+
+  const files = fs.readdirSync(__dirname)
+    .filter((f) => f.endsWith('.test.js'))
+    .filter((f) => (only ? f.includes(only) : true))
+    .sort();
+
+  if (!files.length) {
+    console.error(only ? `${only} に一致するテストがない。` : 'test/*.test.js が見つからない。');
+    process.exitCode = 1;
+    return;
+  }
+
+  const failed = [];
+  for (const f of files) {
+    console.log(`\n=== ${f} ===`);
+    // 直列に走らせる。偽 HOME は別々だが、git init や外部プロセスを使うので
+    // 並列にして出力が混ざるより読める方を取る。
+    //
+    // stdin は 'ignore' にする。テストファイル自身は stdin を読まないが、継承したままだと
+    // このランナーの stdin(端末や CI のパイプ)がそのままぶら下がる。spawnSync の stdio 指定は
+    // input と違って実際に効くので、ここで閉じておく(各ラッパーが使う execFileSync は元から
+    // stdio を 3 つとも pipe で開くため、子が親の TTY を握ることはない)。
+    // ファイル単位の timeout。各ラッパー(execGuardScript 等)が個々の子プロセスに 30 秒の
+    // 保険を掛けているが、それでは捕まえられない場所(テスト本体のループや fs の待ち)で
+    // 固まる余地は残る。CI でハングしたまま job のタイムアウトまで枠を焼くのを避けるため、
+    // ここでも締める。account-guard には *.test.js がちょうど 5 本あるので、全ファイルが
+    // timeout しても 5 × 120000ms = 10 分に収まるよう 2 分に取ってある(3 分だと 15 分になり
+    // job 側の timeout-minutes: 15 と等しくなってしまい、checkout や setup-node の分だけ
+    // 確実に超えて、ランナー自身の集計(「失敗: …」)が出る前に GitHub に殺される)。CI 実測は
+    // 3 ツール + セットアップ込みの全体で約 2 分、最長ファイルでも 1 分未満で、2 分にはその
+    // 実測に対しても 2 倍の余裕がある。
+    const r = spawnSync(process.execPath, [path.join(__dirname, f)], {
+      stdio: ['ignore', 'inherit', 'inherit'],
+      windowsHide: true,
+      timeout: 120000,
+      killSignal: 'SIGKILL',
+    });
+    // signal で終了したときは status が null になる。timeout はその代表例だが、OOM killer や
+    // 外部からの kill でも signal は入るので、timeout と断定はできない。単なる異常終了と
+    // 区別できないと「なぜか失敗した」で終わってしまうので、理由をここで出す。
+    if (r.signal) console.log(`  (${f} は signal で強制終了: ${r.signal})`);
+    // spawn 自体に失敗したとき(ENOENT・EAGAIN 等)は status も signal も無く、理由が
+    // r.error にしか出ない。拾わないと末尾の「失敗:」にファイル名が並ぶだけになる。
+    if (r.error) console.log(`  (${f} は起動に失敗: ${r.error.message})`);
+    if (r.status !== 0) failed.push(f);
+  }
+
+  console.log('');
+  if (failed.length) {
+    console.log(`失敗: ${failed.join(', ')}`);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`${files.length} ファイル すべて PASS`);
 }
 
-const files = fs.readdirSync(__dirname)
-  .filter((f) => f.endsWith('.test.js'))
-  .filter((f) => (only ? f.includes(only) : true))
-  .sort();
-
-if (!files.length) {
-  console.error(only ? `${only} に一致するテストがない。` : 'test/*.test.js が見つからない。');
-  process.exit(1);
-}
-
-const failed = [];
-for (const f of files) {
-  console.log(`\n=== ${f} ===`);
-  // 直列に走らせる。偽 HOME は別々だが、git init や外部プロセスを使うので
-  // 並列にして出力が混ざるより読める方を取る。
-  //
-  // stdin は 'ignore' にする。テストファイル自身は stdin を読まないが、継承したままだと
-  // このランナーの stdin(端末や CI のパイプ)がそのままぶら下がる。spawnSync の stdio 指定は
-  // input と違って実際に効くので、ここで閉じておく(各ラッパーが使う execFileSync は元から
-  // stdio を 3 つとも pipe で開くため、子が親の TTY を握ることはない)。
-  // ファイル単位の timeout。各ラッパー(execGuardScript 等)が個々の子プロセスに 30 秒の
-  // 保険を掛けているが、それでは捕まえられない場所(テスト本体のループや fs の待ち)で
-  // 固まる余地は残る。CI でハングしたまま job のタイムアウトまで枠を焼くのを避けるため、
-  // ここでも締める。CI 実測は 3 ツール + セットアップ込みの全体で約 2 分、最長ファイルでも
-  // 1 分未満。job 側の timeout-minutes: 15 より十分小さく取り、ハングしてもランナー自身が
-  // 集計(「失敗: …」)を出せるようにする。
-  const r = spawnSync(process.execPath, [path.join(__dirname, f)], {
-    stdio: ['ignore', 'inherit', 'inherit'],
-    windowsHide: true,
-    timeout: 180000,
-    killSignal: 'SIGKILL',
-  });
-  // signal で終了したときは status が null になる。timeout はその代表例だが、OOM killer や
-  // 外部からの kill でも signal は入るので、timeout と断定はできない。単なる異常終了と
-  // 区別できないと「なぜか失敗した」で終わってしまうので、理由をここで出す。
-  if (r.signal) console.log(`  (${f} は signal で強制終了: ${r.signal})`);
-  // spawn 自体に失敗したとき(ENOENT・EAGAIN 等)は status も signal も無く、理由が
-  // r.error にしか出ない。拾わないと末尾の「失敗:」にファイル名が並ぶだけになる。
-  if (r.error) console.log(`  (${f} は起動に失敗: ${r.error.message})`);
-  if (r.status !== 0) failed.push(f);
-}
-
-console.log('');
-if (failed.length) {
-  console.log(`失敗: ${failed.join(', ')}`);
-  process.exit(1);
-}
-console.log(`${files.length} ファイル すべて PASS`);
+main();
