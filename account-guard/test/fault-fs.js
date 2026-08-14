@@ -20,11 +20,13 @@ const fs = require('fs');
 // 呼んでいるのに意図的に外してあるものが 2 つある。「一覧は網羅している」とだけ書いて
 // chmodSync が抜けていた頃は、writeAtomic の chmod 失敗経路(下記)が注入不能なことに
 // 誰も気づけなかったので、外した理由まで書き残す。
-//   fs.writeSync  … failText が stderr(fd 2)へ直接書くためだけに使う。ここを失敗させると、
-//                    注入した故障そのものの説明が画面に出なくなり、何を確かめたのか読めなくなる。
-//   fs.existsSync … credentials.js が使うが、内部で例外を握りつぶす API なので throw を
-//                    注入しても現実には起きない状態を作ることになる(swap.js が existsSync を
-//                    避けて probeFile を使っているのも、この握りつぶしが理由)。
+//   fs.writeSync  … swap.js の failText が stderr(fd 2)へ直接書くためだけに使う。ここを
+//                    失敗させると、注入した故障そのものの説明が画面に出なくなり、何を確かめた
+//                    のか読めなくなる。
+//   fs.existsSync … account-guard.js が status の表示にだけ使うフォールバック。内部で例外を
+//                    握りつぶす API なので throw を注入しても現実には起きない状態を作ることに
+//                    なる(swap.js と credentials.js が existsSync を避けて probeFile を使って
+//                    いるのも、この握りつぶしが理由)。
 // chmodSync を含めるのは、writeAtomic の chmod が try の内側にあり、失敗すると tmp を消して
 // 書き込みごと中止する = 退避が起きなかった経路になるため(keepAside 側の chmod は
 // 握りつぶしなので、そちらは注入しても何も変わらないことの確認になる)。

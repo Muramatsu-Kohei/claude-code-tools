@@ -203,25 +203,43 @@ console.log(`  (${CASES} ケース, ${((Date.now() - startedAt) / 1000).toFixed(
     path.join(__dirname, '..', 'credentials.js'),
     path.join(__dirname, '..', 'account-guard.js'),
   ];
-  // 意図的な除外(fault-fs.js の WRAPPED_CALLS 直上のコメントと同じ理由を持つ)。
-  //   writeSync  … failText が stderr へ直接書くためだけに使う。故障を注入すると、
-  //                注入そのものの説明が画面から消えて何を確かめたのか読めなくなる。
-  //   existsSync … credentials.js が使うが、内部で例外を握りつぶす API なので throw を
-  //                注入しても現実には起きない状態を作ることになる。
-  const INTENTIONAL_EXCLUSIONS = new Set(['writeSync', 'existsSync']);
+  // 意図的な除外はファイル単位で持つ。ファイルを問わない 1 つの集合にしていた頃は、ある
+  // ファイルのために書いた除外が全ファイルに効いてしまい、たとえば swap.js の書き込み経路に
+  // fs.existsSync が入っても検査が素通りした。それは probeFile 規則が防いでいる「読めない
+  // だけのファイルを『無い』に倒し、控えを取らないまま上書きする」経路そのもので、
+  // chmodSync を見落としたのとまったく同じ形の穴になる。
+  const INTENTIONAL_EXCLUSIONS = new Map([
+    // failText が stderr(fd 2)へ直接書くためだけに使う。ここを失敗させると、注入した故障
+    // そのものの説明が画面から消えて、何を確かめたのか読めなくなる。
+    ['swap.js', new Set(['writeSync'])],
+    // status の表示にだけ使うフォールバック。内部で例外を握りつぶす API なので、throw を
+    // 注入しても現実には起きない状態を作ることになる。
+    ['account-guard.js', new Set(['existsSync'])],
+    // credentials.js は existsSync を呼んでいない。probeFile の説明コメントが「fs.existsSync を
+    // 使わない」理由を書いており、その文字列を下の正規表現が拾うだけ。コメントを削ってから
+    // 拾う手もあるが、削りすぎれば本物の呼び出しを見逃す(危険側に倒れる)ので、拾いすぎた
+    // ぶんをこうして名指しで除外する。
+    ['credentials.js', new Set(['existsSync'])],
+  ]);
   const CALL_RE = /fs\.(\w+Sync)\(/g;
-  const found = new Set();
+  const wrapped = new Set(WRAPPED_CALLS);
+  // どのファイルの何が漏れたかまで出す。名前だけを挙げていた頃は、除外がファイル単位に
+  // なっていない以上どのみち区別できなかったが、分けた今は「swap.js の existsSync」と
+  // 「account-guard.js の existsSync」が別物として報告されなければ意味がない。
+  const drifted = [];
   for (const file of IMPL_FILES) {
+    const base = path.basename(file);
+    const allowed = INTENTIONAL_EXCLUSIONS.get(base) || new Set();
     const src = fs.readFileSync(file, 'utf8');
     let m;
     CALL_RE.lastIndex = 0;
-    while ((m = CALL_RE.exec(src))) found.add(m[1]);
+    while ((m = CALL_RE.exec(src))) {
+      if (!wrapped.has(m[1]) && !allowed.has(m[1])) drifted.push(base + ': ' + m[1]);
+    }
   }
-  const wrapped = new Set(WRAPPED_CALLS);
-  const drifted = [...found].filter((name) => !wrapped.has(name) && !INTENTIONAL_EXCLUSIONS.has(name));
-  check('実装側の fs.*Sync 呼び出しは WRAPPED_CALLS か意図的な除外リストのどちらかに含まれる',
+  check('実装側の fs.*Sync 呼び出しは WRAPPED_CALLS か、そのファイルの除外に含まれる',
     drifted.length === 0,
-    'WRAPPED_CALLS に無く、除外リストにも無い呼び出し: ' + drifted.join(', '));
+    'WRAPPED_CALLS に無く、そのファイルの除外にも無い呼び出し: ' + [...new Set(drifted)].join(', '));
 }
 
 report();
