@@ -65,6 +65,12 @@ const BASE = path.join(__dirname, '.tmp', 'reachable');
 // 感度検証: swap.js を 1 箇所だけ壊した変異版を test/.tmp/ 配下(git 管理外)に作り、それを
 // 指して実行すれば FAIL が出るはずで、出なければ抽出ルールや初期状態の偏りが甘く、このテストが
 // 空回りしている証拠になる。既定値は本物の swap.js なので、この口があっても通常の実行は変わらない。
+//
+// 変異版を置くときは credentials.js も同じディレクトリにコピーすること。swap.js は
+// require('./credentials') で隣を読むので、swap.js だけ置くと起動直後に落ち、全ケースで
+// 選択肢が 0 件になる。しかもその状態でも緑になる(実測: 152/260 → 0/260 に落ちても
+// 672 PASS → 520 PASS で FAIL は 0)ため、変異を入れたつもりで何も検査していないことに
+// 気づけない。集計行の「選択肢が1件以上抽出できたケース」を必ず見ること。
 const SWAP = process.env.SWAP_SCRIPT ? path.resolve(process.env.SWAP_SCRIPT) : path.join(__dirname, '..', 'swap.js');
 fs.rmSync(BASE, { recursive: true, force: true });
 
@@ -207,10 +213,9 @@ function pickInitialOp(rng, state, i) {
 // --- 子プロセスの起動(fault.test.js と同じ形。故障注入はしない) ---
 function runSwap(home, argv) {
   const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
-  // swap.js は stdin を読まないが、input を渡さないと stdio[0] が親の stdin を継承し、
-  // 待ちが発生したときに孤児プロセスとして test/.tmp に残ってしまう(issue #8)。
-  // 空文字で明示的に閉じ、timeout を保険にする(fault.test.js と同じ形)。
-  const opts = { encoding: 'utf8', env, input: '', timeout: 30000, killSignal: 'SIGKILL' };
+  // execFileSync は stdio を pipe で開くので、swap.js が stdin を読まなくても子は親の
+  // TTY を継承しない。timeout は issue #8(原因未解明のハング)の検出網(fault.test.js と同じ形)。
+  const opts = { encoding: 'utf8', env, timeout: 30000, killSignal: 'SIGKILL' };
   try {
     const out = execFileSync(process.execPath, [SWAP, ...argv], opts);
     return { code: 0, out, err: '' };

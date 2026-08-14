@@ -91,12 +91,9 @@ function execSwapScript(script, argv = [], { cwd, env } = {}) {
   const opts = { encoding: 'utf8' };
   if (cwd !== undefined) opts.cwd = cwd;
   opts.env = env || { ...process.env, NO_COLOR: '1' };
-  // swap.js 自体は stdin を読まないが、account-guard.js と同じ execFileSync の下地なので
-  // 挙動を揃えておく(input を渡す呼び出しは今のところ無いが、将来 stdin を使う経路が
-  // 増えたときに継承由来のハングを踏まないための予防でもある)。
-  opts.input = '';
-  // ハングしたら殺して FAIL に変える(issue #8: test/.tmp の孤児プロセスが次回実行の
-  // stdin 待ちを引き起こしていた事故の再発防止)。
+  // ハングしたら殺して FAIL に変える(issue #8: test/.tmp に残った孤児プロセスが次回実行を
+  // 巻き込んだ事故の検出網。何がハングを起こすのかは未解明なので、これは原因を潰す対策では
+  // なく、再発したときに黙って固まらないための保険)。
   opts.timeout = 30000;
   opts.killSignal = 'SIGKILL';
   try {

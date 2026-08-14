@@ -138,10 +138,9 @@ function runSwap(home, argv, fault) {
   const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1', NODE_OPTIONS: '--require ' + FAULT_FS };
   if (fault) env.SWAP_FAULT = JSON.stringify(fault);
   else delete env.SWAP_FAULT;
-  // swap.js は stdin を読まないが、input を渡さないと stdio[0] が親の stdin を継承する。
-  // 継承したまま何らかの理由で待ちが発生すると孤児プロセスが test/.tmp に残り、次回実行を
-  // 巻き込んでハングさせる(issue #8)。空文字で明示的に閉じ、timeout を保険にする。
-  const opts = { encoding: 'utf8', env, input: '', timeout: 30000, killSignal: 'SIGKILL' };
+  // execFileSync は stdio を pipe で開くので、swap.js が stdin を読まなくても子は親の
+  // TTY を継承しない。timeout は issue #8(原因未解明のハング)の検出網。
+  const opts = { encoding: 'utf8', env, timeout: 30000, killSignal: 'SIGKILL' };
   try {
     const out = execFileSync(process.execPath, [SWAP, ...argv], opts);
     return { code: 0, out, err: '' };

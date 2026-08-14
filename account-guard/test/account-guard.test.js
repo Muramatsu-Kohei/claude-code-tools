@@ -57,17 +57,28 @@ const configPath = (home) => path.join(home, '.claude', 'account-guard', 'config
 function execGuardScript(scriptPath, { argv = [], env, cwd, input } = {}) {
   const opts = { env, encoding: 'utf8' };
   if (cwd !== undefined) opts.cwd = cwd;
-  // account-guard.js は hook として stdin から JSON を読む設計なので、input を渡さない
-  // 呼び出しでも stdin を明示的に閉じる(空文字を渡せば stdio[0] が pipe になり、子は
-  // 親の TTY を継承せず即座に EOF を受け取る)。継承したままだと EOF が来ず、親の stdin を
-  // 待ち続けて永久にハングする(issue #8: test/.tmp の孤児プロセスがこれで残っていた)。
+  // account-guard.js は hook として stdin から JSON を読む設計。execFileSync は stdio を
+  // 3 つとも pipe で開くので、input を渡さない呼び出しでも子は親の TTY を継承せず、
+  // 何も書かれないまま即座に EOF を受け取る(空文字を渡しても spawnSync は truthy 判定で
+  // 無視するので同じ)。
   if (input !== undefined) opts.input = JSON.stringify(input);
-  else opts.input = '';
-  // 上記の対策後も万一ハングが再発したら、ここで確実に殺して FAIL に変える(CI で
-  // ハングしたまま検出できない事態を避けるための保険)。
+  // issue #8(test/.tmp の孤児プロセス)の原因は上記の EOF 挙動ではなく未解明のまま。
+  // timeout はその原因不明のハングを検出するための網であり、CI で検出できず放置される
+  // 事態を避けるための保険。
   opts.timeout = 30000;
   opts.killSignal = 'SIGKILL';
-  return execFileSync(process.execPath, [scriptPath, ...argv], opts);
+  try {
+    return execFileSync(process.execPath, [scriptPath, ...argv], opts);
+  } catch (e) {
+    // timeout で殺された場合、e.status は null で e.code に 'ETIMEDOUT' が入る。呼び出し元
+    // (run() / runCrash() など)は try/catch を持たず「非ゼロ終了なら例外がそのまま飛んで
+    // テストが落ちる」ことに依存しているので、ETIMEDOUT 以外はそのまま投げ直す。ここで
+    // 潰すとどのスクリプトが固まったか分からなくなるので、起動していた対象を添えて包む。
+    if (e.code === 'ETIMEDOUT') {
+      throw new Error(`子プロセスが timeout(${opts.timeout}ms)で強制終了された: ${scriptPath} ${argv.join(' ')}`);
+    }
+    throw e;
+  }
 }
 
 // execGuardScript の生の stdout を、フックの JSON 出力として解釈する。空出力は
