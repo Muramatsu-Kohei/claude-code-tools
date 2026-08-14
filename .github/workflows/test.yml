@@ -37,14 +37,6 @@ jobs:
           # なお Node 20 自体は既に EOL に入っている。ローカルを上げる際はここも一緒に上げる。
           node-version: '20'
 
-      # claude-worklog と account-guard のテストは git init で偽リポジトリを作る。ランナーには
-      # commit の identity が設定されておらず、commit する経路に入ると落ちる。ローカルでは
-      # global 設定があるので気づけないため、CI 側で先に埋めておく。
-      - name: git identity
-        run: |
-          git config --global user.email "ci@example.com"
-          git config --global user.name "CI"
-
       - name: account-guard
         working-directory: account-guard
         run: node test/run.js
