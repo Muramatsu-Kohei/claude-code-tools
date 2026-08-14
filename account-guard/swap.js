@@ -199,7 +199,14 @@ function validateName(name) {
       + '\n  使えるのは英数字とハイフン(-)、アンダースコア(_)だけです'
       + '\n  別の名前で `swap save <名前>` を実行し直してください');
   }
-  if (RESERVED_NAMES.has(name) && !probeFile(accountFile(name)).exists) {
+  // 大小を無視して照合する。Windows と macOS のファイルシステムは大小を区別しないので、
+  // `swap save Warmup` は、このガードが作らせまいとしている accounts/warmup.json そのものを
+  // 作る(canonicalSlotName が大小を畳む以上、以後 `swap warmup` もそれを指す)。
+  // 区別して見ていた頃は、予約の意味がひと文字の大小で消えていた。
+  // restorableByName は逆に区別したままにしてある。あちらが揃えるべき相手は main() の
+  // サブコマンド判定で、そちらが大小を区別する以上、`swap Save` は今もスロットの復元として
+  // 通る = 「打てるコマンド」として案内してよい。判定の目的が違うので同じにはしない。
+  if (RESERVED_NAMES.has(name.toLowerCase()) && !probeFile(accountFile(name)).exists) {
     fail('その名前は swap のサブコマンドと同じなので使えません: ' + name
       + '\n  作れたとしても `swap ' + name + '` はサブコマンドとして解釈されるため、'
       + 'そのスロットを復元する手段がなくなります'
@@ -972,13 +979,15 @@ function dropCurrentSlot(e) {
   try {
     fs.unlinkSync(CURRENT_FILE);
   } catch (unlinkError) {
-    // 消せずに残ったファイルが害になるのは、それを readCurrentSlot が読めるときだけ。読めない
-    // 残骸は来歴として効かず(readCurrentSlot が null を返し、未記録と同じに落ちる)、名前を
-    // 省いた退避が別スロットを狙うこともない。残っただけで警告していた頃は、.current が
+    // 消せずに残ったファイルが害になるのは、次の名前を省いた退避がそれを来歴として使うときだけ。
+    // 判定は readCurrentSlot にそのまま任せる。残っただけで警告していた頃は、.current が
     // ディレクトリになっている環境(unlink も read も EISDIR で落ちる)で、実害の無い残骸に
     // ついて「名前を省いた退避は別のアカウントのスロットを上書きします」と事実に反する警告を
     // 出し、存在しない問題を追わせていた。
-    if (unlinkError.code !== 'ENOENT') stale = probeFile(CURRENT_FILE).readable;
+    // 「読めるか」で見ていたのでは足りない。readCurrentSlot は読めたうえで、中身が名前として
+    // 妥当で、指す先のスロットが実在することまで確かめて初めて名前を返す。読めるが中身が
+    // 壊れている、あるいは指す先を既に消した .current は、条件を狭めただけの同じ誤警告になる。
+    if (unlinkError.code !== 'ENOENT') stale = readCurrentSlot() !== null;
   }
   return '来歴を記録できませんでした(' + (e.code || e.message) + ': ' + CURRENT_FILE + ')'
     + '\n  ' + dirIsFileHint(e, path.dirname(CURRENT_FILE),
@@ -1437,7 +1446,10 @@ function cmdStatus() {
   const savedCreds = new Map(saved.map(n => [n, readCredsOrNull(accountFile(n))]));
   const outdated = outdatedSlots(cur, curSlot, savedCreds);
   const unreachable = saved.filter(n => !restorableByName(n));
-  const reservedOnly = saved.filter(n => RESERVED_ONLY_NAMES.has(n));
+  // ここも大小を無視する(validateName と同じ理由)。ディスク上の綴りで照合していた頃は、
+  // 大小違いで作られたスロットに対してだけ「いずれ復元できなくなる」の予告が出ず、予約が
+  // 守ろうとしていた当のスロットが無警告のまま実装日を迎えることになっていた。
+  const reservedOnly = saved.filter(n => RESERVED_ONLY_NAMES.has(n.toLowerCase()));
   console.log('\n退避済み (' + ACCOUNTS_DIR + '):');
   if (savedError) {
     // 「0 件」と書くと、控えがあるのに無いと誤認させる(読めない ≠ 無い)。
