@@ -20,6 +20,9 @@ const { makeHarness } = require('./harness');
 
 const BASE = path.join(__dirname, '.tmp', 'swap');
 const SWAP = path.join(__dirname, '..', 'swap.js');
+// 故障注入(SWAP_FAULT)を使うテストだけがこれを NODE_OPTIONS 経由で子プロセスに渡す。
+// 仕組みは test/fault.test.js と同じ(fault-fs.js のコメント参照)。
+const FAULT_FS = path.join(__dirname, 'fault-fs.js');
 fs.rmSync(BASE, { recursive: true, force: true });
 
 const DAY = 86400000;
@@ -102,8 +105,10 @@ function homeEnv(home) {
   return { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
 }
 
-function runSwap(home, argv = []) {
-  return execSwapScript(SWAP, argv, { env: homeEnv(home) });
+// extraEnv は故障注入(SWAP_FAULT・NODE_OPTIONS)など、通常は使わない環境変数を子プロセスに
+// 追加で渡したいときだけ埋める。既存の呼び出しは省略したままで従来どおり動く。
+function runSwap(home, argv = [], extraEnv = {}) {
+  return execSwapScript(SWAP, argv, { env: { ...homeEnv(home), ...extraEnv } });
 }
 
 // 中止の不変条件を確かめるため、home 配下の .claude ツリーを丸ごと比較できる形にする。
@@ -2872,6 +2877,50 @@ const TRUNCATED_CURRENT =
   const r = runSwap(home, []);
   check('大小違いの予約名スロットにも「いずれ復元できなくなる」を出す',
     /いずれ復元できなくなる名前の退避があります: Warmup/.test(r.out), r.out + r.err);
+}
+
+// --- 消せなかった来歴が、指す先を消された残骸でも「残っている」と警告しない ---
+// 上のテスト(EISDIR で読めない残骸)は readCurrentSlot の「読めない」経路(p.readable === false)
+// しか通らない。dropCurrentSlot のコメントが指摘するもう一つの経路 ── 読めるし中身も名前として
+// 妥当だが、指す先の accounts/<name>.json を既に消してしまった .current ── は別物で、
+// readCurrentSlot は probeFile(CURRENT_FILE).readable では素通りし、accountFile(name) の実在
+// チェック(条件 3)で初めて null に落ちる。「読めるか」だけを見ていた旧版(stale =
+// probeFile(CURRENT_FILE).readable)はここを区別できず、この経路でも誤って警告していた。
+//
+// 状況の作り方(実測で確認済み):
+//   1. .current の中身を実在しないスロット名(ghost)にする。readCurrentSlot は読めるが
+//      accounts/ghost.json が無いので null を返す(＝来歴としては既に効いていない)。
+//   2. テストプロセス自身が .current を 'r' で開いたまま子プロセスの swap を起動すると、
+//      writeCurrentSlot の renameSync が Windows では EPERM で落ちる(ハンドル保持でも
+//      unlinkSync は libuv が FILE_SHARE_DELETE で開くため成功してしまうので、rename 側で
+//      落とす必要がある)。
+//   3. dropCurrentSlot 自身の unlinkSync(.current) だけを SWAP_FAULT で EPERM に落とす。
+//      1 回目は writeAtomic の finally が .current.tmp に対して呼ぶ unlink(これは素通しで
+//      成功させてよい)なので、match: ".current" のもとで nth: 2 を狙う。
+{
+  const home = sandbox('dropcurrentslot-stale-points-to-deleted-slot', {
+    current: creds('team', { token: 'cur' }),
+    slot: 'ghost', // accounts/ghost.json は作らない = 読めるが指す先が無い来歴
+  });
+  const fd = fs.openSync(slotPath(home), 'r'); // .current を開いたままにして rename を EPERM で落とす
+  let r;
+  try {
+    r = runSwap(home, ['save', 'mypro'], {
+      NODE_OPTIONS: '--require ' + FAULT_FS,
+      SWAP_FAULT: JSON.stringify({
+        call: 'unlinkSync', kind: 'throw', code: 'EPERM', match: '.current', nth: 2,
+      }),
+    });
+  } finally {
+    fs.closeSync(fd); // 閉じ忘れるとサンドボックスの後始末(rmSync)が失敗する
+  }
+  check('来歴を記録できなかったので成功終了しない', r.code === 1, r.out + r.err);
+  check('退避先への書き込み自体は済んでいる(来歴だけが書けない)',
+    tokenOf(acctPath(home, 'mypro')) === 'cur', r.out + r.err);
+  check('来歴を記録できなかったこと自体は伝える',
+    (r.out + r.err).includes('来歴を記録できませんでした'), r.out + r.err);
+  check('指す先を消された残骸を実害があるかのように警告しない',
+    !(r.out + r.err).includes('古い来歴が残ったままです'), r.out + r.err);
 }
 
 report();
