@@ -1105,8 +1105,16 @@ function failOverwrite(name, old, provenance, different, afterCmd) {
 // 「同じ資格情報だから控えは要らない」と判断した直後に、別の中身を控えなしで潰す)。
 // 省略時は自分で読む。控えを取る条件の判断はこの関数の中だけに残し、呼び出し側の記憶には
 // 任せない(任せた結果、かつての別名スロット同期が控えを 1 本も残さず上書きしていた)。
+// 戻り値は、このスロットに入っていた旧内容を退けた控えのパス(退けなかったときは null)。
+// 捨てずに返すのは、退けた事実をその場の出力に出すため。上書きガードは
+// 「.current がこのスロットを指していて、プラン種別も同じ」なら通す(同じアカウントの
+// トークン更新がその大半なので、そこで毎回止めると使えない)が、その条件は別アカウントへ
+// /login しただけでも成り立つ。そのとき退けたことを誰も言わないと、利用者が気づくのは
+// 後日そのスロットを復元して別アカウントに戻ったときになる。ここは既に !sameCreds を
+// 判定済み = 中身が違うと分かっている唯一の場所なので、判断材料はここにしかない。
 function writeSlot(name, cur, old) {
   const file = accountFile(name);
+  let replaced = null;
   // existsSync では「権限が足りず stat できない」「別プロセスが掴んでいる」も false になり、
   // そのとき控えを 1 本も取らないまま下の writeAtomic が上書きしていた。probeFile は ENOENT の
   // ときだけ exists を false にするので、読めないスロットは「失って困る中身があるかもしれない」
@@ -1116,7 +1124,7 @@ function writeSlot(name, cur, old) {
     // 控えを取れないのはこのスロットの側の事情(壊れている・掴まれている)なので、別の名前を
     // 選べばそこには触れずに退避できる。原因の解消を待たなくても進める唯一の手なので添える。
     if (!(prev && sameCreds(cur.json, prev.json))) {
-      keepAside(file, name, '別の名前で退避すれば ' + name + ' には触れずに済みます: swap save <別名>');
+      replaced = keepAside(file, name, '別の名前で退避すれば ' + name + ' には触れずに済みます: swap save <別名>');
     }
   }
   // 控えは取れたのにスロットへ書けないことがある(退避先を他プロセスが開いていると
@@ -1133,6 +1141,7 @@ function writeSlot(name, cur, old) {
         + '終了するか、読み取り専用属性を外してください')
       + '\n  退避は完了していません。現在のログインはそのままです');
   }
+  return replaced;
 }
 
 // 退避の実体。読み込み済みの cur をそのまま書くのは、CREDENTIALS を二度読むと
@@ -1153,7 +1162,7 @@ function saveInto(cur, name, forceOverwrite, afterCmd) {
   const drifted = driftedProvenance(cur, name, g.prevSlot);
   // 上で読んだ old をそのまま渡す。writeSlot に読み直させると、同じファイルを 1 回の退避で
   // 二度読むうえ、identical(上書きの可否)と控えの要否が別々の読み込み結果で決まる。
-  writeSlot(name, cur, g.old);
+  const replaced = writeSlot(name, cur, g.old);
   // 退避そのものは済んでいる。来歴だけ書けずに生の例外で終わると、退避できたのかどうかが
   // 読めず、やり直して同じスロットをもう一度上書きさせることになる。中止はするが(来歴の
   // 無い状態で切り替えまで進めない)、何が済んだかは必ず伝える。
@@ -1163,11 +1172,12 @@ function saveInto(cur, name, forceOverwrite, afterCmd) {
     fail('退避は済みましたが、' + dropCurrentSlot(e)
       + '\n  退避先: ' + accountFile(name));
   }
-  return { stale, drifted };
+  return { stale, drifted, replaced };
 }
 
 // 現在ログイン中の認証情報を accounts/ に退避する。
-// 戻り値は { name, stale } / 読めない場合は { degraded:true, kept } / 未ログインなら null。
+// 戻り値は { name, stale, drifted, replaced } / 読めない場合は { degraded:true, kept } /
+// 未ログインなら null。replaced は退避先に入っていた旧内容を退けた控えのパス(writeSlot 参照)。
 // force は 2 つの別々の判断を分けて渡す。まとめて 1 つの --force にすると、復元側の都合
 // (失効済みを承知で復元したい)で付けた --force が、退避側の上書きガードまで黙って外す。
 //   unreadable … 現在の credentials が読めなくても、控えだけ残して先へ進む
@@ -1233,8 +1243,24 @@ function saveCurrent(explicitName, force, forceCmd, pre, afterCmd) {
   // 名前が確定したここでも通す(subscriptionType が将来 `save` や `warmup` になれば、
   // 復元する手段の無いスロットがこの経路から静かに作られる)。二重に呼んでも副作用はない。
   validateName(name);
-  const { stale, drifted } = saveInto(cur, name, force.overwrite, afterCmd);
-  return { name, stale, drifted };
+  const { stale, drifted, replaced } = saveInto(cur, name, force.overwrite, afterCmd);
+  return { name, stale, drifted, replaced };
+}
+
+// 退避先に入っていた旧内容を退けたときの案内。cmdSave と cmdSwap の両方が同じ saveCurrent
+// 経由で上書きしうるので、文面はここに集める(片方だけ直して食い違う事故がこのファイルで
+// 繰り返し起きている)。
+// 「別のアカウントを潰した」とは断定しない。同じアカウントのトークンが更新されただけでも
+// 旧内容は退くし、その 2 つをこのツールは見分けられない(staleSlots が同じ理由で断定を
+// 避けている)。事実だけ出して、取り違えていた場合の戻し方を添える。
+// cmdStatus の「上書きで退けた旧内容: N 件」だけでは足りない。件数は次に status を打った
+// ときにしか出ず、どの操作でどのスロットの何を退けたのかも辿れないので、上書きに気づく
+// のが「復元したら別のアカウントに戻った」時点まで遅れる。
+function reportReplaced(saved) {
+  if (!saved || !saved.replaced) return;
+  console.log('  入っていた旧内容は控えに退けました: ' + saved.replaced);
+  console.log('  取り違えて上書きしていたときは、この控えを ' + accountFile(saved.name)
+    + ' へ戻せます');
 }
 
 // 今回の退避で取り残されうる他スロットの案内。勝手に揃えないと決めた以上、黙って放置もしない
@@ -1380,7 +1406,18 @@ function cmdStatus() {
     console.log('  一覧を読めません(' + savedError + ')');
     console.log('  同じ名前のファイルが置かれていないか、ディレクトリの権限を確認してください');
   } else if (saved.length === 0) {
-    console.log('  なし。`swap save` で現在のアカウントを退避してください');
+    // 次に打てるコマンドは現在のログインの状態で変わる。cur を見ずに `swap save` だけを
+    // 勧めていた頃は、数行上で自分が「未ログイン」と出した直後に、打てば「現在 credentials が
+    // ありません」で止まるコマンドを案内していた。status は状況確認の唯一の入り口なので、
+    // ここが行き止まりだと初回の利用者が最初に当たる案内が空振りする。
+    // 読めない場合(exists && !cur)は理由を上の行が既に出しているので繰り返さない。素の
+    // `swap save` はその理由で必ず止まるため、退避を促す前に原因の解消へ回す。
+    console.log('  なし。' + (cur
+      ? '`swap save` で現在のアカウントを退避してください'
+      : exists
+        ? '現在の credentials を読めないため、いまは退避できません(上の理由を解消してから'
+          + ' `swap save`)'
+        : 'Claude Code で `/login` してから `swap save` で退避してください'));
   } else {
     for (const name of saved) {
       const c = savedCreds.get(name);
@@ -1526,6 +1563,7 @@ function cmdSave(name, force) {
             + ' `swap save` をやり直してください'));
   }
   console.log('退避しました: ' + saved.name + ' -> ' + accountFile(saved.name));
+  reportReplaced(saved);
   reportOtherSlots(saved, null);
 }
 
@@ -1660,6 +1698,20 @@ function cmdSwap(target, force) {
         const c = readCredsOrNull(accountFile(name));
         // 読めないスロットは「打てば必ず通る」と請け合えない。列挙から外し、存在だけ伝える。
         if (!c) return { runnable: false, body: '読めないため案内できません' };
+        // 中身が現在のログインと同じスロットは、打っても「すでに同じ内容でログインしています」で
+        // 何も起きない(exit 0 の no-op)。下の sameAsTarget は名前の一致しか見ないため、この
+        // スロットにも `swap save <別名>` → `swap <name> --force` の 2 手が「実際に打てる
+        // コマンド」として出ていた。案内どおり打つと、同じ中身の重複スロットを 1 つ作ったうえで
+        // no-op に着地する。択一の選択肢として出す以上、選んで前進しないものは外す。
+        // ここで行き止まりにしないために、別のアカウントを増やす道を対処として添える
+        // (退避が 1 件だけでそれが現在のログインなら、切り替え先は /login でしか作れない)。
+        if (cur && sameCreds(cur.json, c.json)) {
+          return {
+            runnable: false,
+            body: '現在このスロットでログイン中です(切り替え先になりません)。別のアカウントを'
+              + '使うには、Claude Code で `/login` してから `swap save <別名>` で退避してください',
+          };
+        }
         const sameAsTarget = !!cur && curSlotOf === name;
         const restore = 'swap ' + name
           + (needsForceToRestore(cur ? cur.json : null, c.json, curUnsavable) ? ' --force' : '');
@@ -1678,9 +1730,15 @@ function cmdSwap(target, force) {
     } else {
       // 素の `swap save` は、現在のログインの状態によっては退避の段で止まりうる(名前を
       // 決められない/credentials が読めない)。forceHint と同じ saveFirstText の判定で
-      // 実際に打てる形にする。未ログインなら退避できるものが無く具体化しようがないので、
-      // 元の案内のまま(/login を挟む以外に進みようがない)。
-      let hint = '\n  まだ何も退避されていません。先に `swap save` で現在のアカウントを退避してください';
+      // 実際に打てる形にする。
+      // 既定の文面は「cur も curUnsavable も無い」= credentials が存在しない真の未ログイン
+      // 向け。ここで `swap save` だけを勧めていた頃は、案内どおり打つと「現在 credentials が
+      // ありません(未ログイン)」で止まり、退避するものが無いという事実にも、先に /login が
+      // 要ることにも触れないまま行き止まりになっていた(退避できるものが無いので具体化
+      // しようがない、という判断でこの文面のままにしてあったが、具体化できないのは
+      // 「退避コマンド」だけで、次の一手そのものは /login と決まっている)。
+      let hint = '\n  まだ何も退避されていません。Claude Code で `/login` してから'
+        + ' `swap save` で退避してください(いま `swap save` を打っても「未ログイン」で止まります)';
       if (cur) {
         // curUnsavable は cur が読めているこの分岐では常に null(readCurrentForGuard が
         // 両立させない)。省いても値は変わらないが、呼び出しごとに引数の数が違うと
@@ -2020,6 +2078,7 @@ function cmdSwap(target, force) {
     console.log('  ' + keptNote(why.verdict));
   } else {
     console.log('退避: ' + saved.name);
+    reportReplaced(saved);
   }
 
   // ここで落ちる原因は、たいてい Windows で移動先を他プロセスが掴んでいること
