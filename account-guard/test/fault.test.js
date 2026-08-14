@@ -138,11 +138,29 @@ function runSwap(home, argv, fault) {
   const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1', NODE_OPTIONS: '--require ' + FAULT_FS };
   if (fault) env.SWAP_FAULT = JSON.stringify(fault);
   else delete env.SWAP_FAULT;
+  // execFileSync は stdio を pipe で開くので、swap.js が stdin を読まなくても子は親の
+  // TTY を継承しない。timeout は issue #8(原因未解明のハング)の検出網。
+  const opts = { encoding: 'utf8', env, timeout: 30000, killSignal: 'SIGKILL' };
   try {
-    const out = execFileSync(process.execPath, [SWAP, ...argv], { encoding: 'utf8', env });
+    const out = execFileSync(process.execPath, [SWAP, ...argv], opts);
     return { code: 0, out, err: '' };
   } catch (e) {
-    return { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
+    // 終了ステータスが無いまま死んだ場合(e.status が null / undefined)は、呼び出し側の
+    // 「非ゼロ終了 = 想定どおり失敗した」という判定に混ぜてはいけない。timeout(ETIMEDOUT)
+    // のほかに maxBuffer 超過(ENOBUFS)・外部や OOM による kill も同じ形で来るので、
+    // code ではなく status の有無で判別する。ここで 1 や -1 に潰すと基盤の異常が
+    // PASS として集計される。
+    if (e.status == null) {
+      const why = e.code === 'ETIMEDOUT'
+        ? `timeout(${opts.timeout}ms)で強制終了された`
+        : `終了コードを残さずに落ちた(code=${e.code || '不明'} signal=${e.signal || 'なし'})`;
+      // stderr は末尾 3 行だけ添える(全部出すと ENOBUFS で ~1MB がログに流れる)。
+      // cause で stdout を含む元の例外を残す(issue #8 の原因究明の材料にするため)。
+      const tail = (e.stderr || '').trim().split('\n').slice(-3).join('\n');
+      const msg = `子プロセスが${why}: ${SWAP} ${argv.join(' ')}`;
+      throw new Error(tail ? `${msg}\n  stderr(末尾): ${tail}` : msg, { cause: e });
+    }
+    return { code: e.status, out: e.stdout || '', err: e.stderr || '' };
   }
 }
 

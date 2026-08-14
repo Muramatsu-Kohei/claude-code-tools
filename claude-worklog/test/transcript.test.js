@@ -77,10 +77,15 @@ check('B: start.tp は null', recs.find((r) => r.k === 'start' && r.sid === sidB
 check('D: 後追い確定でも turns=2', endD && endD.stats.turns === 2, endD && `reason=${endD.reason} turns=${endD.stats.turns}`);
 
 // --- ケースC: summarize --transcript が会話ログを引けるか(--dry-run で送信内容を見る) ---
+// summarize は stdin を読まないが、execFileSync は stdio を pipe で開くので子は親の TTY を
+// 継承せず問題にならない。timeout は孤児プロセスが残る事故(issue #8、原因未解明)の検出網。
 const digest = execFileSync(process.execPath, [
   WORKLOG, 'summarize', '--project', REPO_KEY, '--session', sidA,
   '--cwd', CWD, '--transcript', tpA, '--dry-run',
-], { encoding: 'utf8', cwd: CWD, env: { ...process.env, USERPROFILE: home, HOME: home }, windowsHide: true });
+], {
+  encoding: 'utf8', cwd: CWD, env: { ...process.env, USERPROFILE: home, HOME: home }, windowsHide: true,
+  timeout: 30000, killSignal: 'SIGKILL',
+});
 check('C: digest にユーザーの指示が含まれる', digest.includes('これを直して'));
 
 // --- 変更2: リポジトリ単位のキー(T2 / F5) ---

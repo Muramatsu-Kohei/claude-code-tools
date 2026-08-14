@@ -91,11 +91,31 @@ function execSwapScript(script, argv = [], { cwd, env } = {}) {
   const opts = { encoding: 'utf8' };
   if (cwd !== undefined) opts.cwd = cwd;
   opts.env = env || { ...process.env, NO_COLOR: '1' };
+  // ハングしたら殺して FAIL に変える(issue #8: test/.tmp に残った孤児プロセスが次回実行を
+  // 巻き込んだ事故の検出網。何がハングを起こすのかは未解明なので、これは原因を潰す対策では
+  // なく、再発したときに黙って固まらないための保険)。
+  opts.timeout = 30000;
+  opts.killSignal = 'SIGKILL';
   try {
     const out = execFileSync(process.execPath, [script, ...argv], opts);
     return { code: 0, out, err: '' };
   } catch (e) {
-    return { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
+    // 終了ステータスが無いまま死んだ場合(e.status が null / undefined)は、呼び出し側の
+    // 「非ゼロ終了 = 想定どおり失敗した」という判定に混ぜてはいけない。timeout(ETIMEDOUT)
+    // のほかに maxBuffer 超過(ENOBUFS)・外部や OOM による kill も同じ形で来るので、
+    // code ではなく status の有無で判別する。ここで 1 や -1 に潰すと基盤の異常が
+    // PASS として集計される。
+    if (e.status == null) {
+      const why = e.code === 'ETIMEDOUT'
+        ? `timeout(${opts.timeout}ms)で強制終了された`
+        : `終了コードを残さずに落ちた(code=${e.code || '不明'} signal=${e.signal || 'なし'})`;
+      // stderr は末尾 3 行だけ添える(全部出すと ENOBUFS で ~1MB がログに流れる)。
+      // cause で stdout を含む元の例外を残す(issue #8 の原因究明の材料にするため)。
+      const tail = (e.stderr || '').trim().split('\n').slice(-3).join('\n');
+      const msg = `子プロセスが${why}: ${script} ${argv.join(' ')}`;
+      throw new Error(tail ? `${msg}\n  stderr(末尾): ${tail}` : msg, { cause: e });
+    }
+    return { code: e.status, out: e.stdout || '', err: e.stderr || '' };
   }
 }
 

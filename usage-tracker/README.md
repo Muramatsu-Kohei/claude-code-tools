@@ -178,8 +178,12 @@ $ node migrate-account.js --acct team             # 付与する(バックアッ
 node transcript/sessions.js
 node transcript/turncost.js
 node transcript/breakdown.js
-node test/transcript.test.js   # 回帰テスト(偽 HOME を使うので実データは読まない)
+node test/run.js               # test/*.test.js を一括実行(偽 HOME を使うので実データは読まない)
+node test/run.js transcript    # 名前の一部で絞って実行
+node test/transcript.test.js   # 1 ファイルだけ実行したいとき
 ```
+
+`test/run.js` は起動時に `test/.tmp/` を丸ごと消して、前回実行の孤児(ハングしたまま残ったプロセスが握っていたファイル)を一掃する。ただし名前で絞った実行では全削除をスキップする(別スイートを並列に流しているとき、そのサンドボックスを巻き添えで消さないため)。掃除したいときは引数なしで全実行すること。
 
 共通処理は `transcript/lib.js`(走査・コスト換算・コンテキスト長)、モデル別単価テーブルは `transcript/pricing.js` にある。単価表に無いモデルは $0 として集計した上で、実行の最後に名前と件数を警告する(新モデルが黙って集計から漏れるのを防ぐため)。
 

@@ -31,6 +31,9 @@ function projectKey(p) {
 function repoRoot() {
   return normPath(execFileSync('git', ['rev-parse', '--show-toplevel'], {
     cwd: TOOL_DIR, encoding: 'utf8', windowsHide: true,
+    // git は stdin を読まないのでハングの実害は薄いが、孤児プロセスが残る事故(issue #8)の
+    // 検出網として timeout だけは掛けておく
+    timeout: 30000, killSignal: 'SIGKILL',
   }).trim());
 }
 
@@ -65,16 +68,36 @@ function runner(home, defaultCwd) {
     const env = {
       ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1', ...(opts.env || {}),
     };
+    // worklog.js は session-start/session-end で stdin から同期的にフック JSON を読む
+    // (worklog.js:504)。ここで input を渡さない呼び出しは stdio[0] を 'ignore' にして
+    // 明示的に閉じているので EOF 待ちにはならないが、テストの書き方を誤ってフック系の
+    // コマンドで input を渡し忘れる余地は残る。timeout はその保険(issue #8 と同じ構造)。
+    const timeout = 30000;
     try {
       const out = execFileSync(process.execPath, [WORKLOG, ...args], {
         input: opts.input, encoding: 'utf8', cwd: opts.cwd || defaultCwd, env,
         stdio: [opts.input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
-        windowsHide: true,
+        windowsHide: true, timeout, killSignal: 'SIGKILL',
       });
       return { code: 0, out, err: '' };
     } catch (e) {
+      // 終了ステータスが無いまま死んだ場合(e.status が null / undefined)は、呼び出し側の
+      // 「非ゼロ終了 = 想定どおり失敗した」という判定に混ぜてはいけない。timeout(ETIMEDOUT)
+      // のほかに maxBuffer 超過(ENOBUFS)・外部や OOM による kill も同じ形で来るので、
+      // code ではなく status の有無で判別する。ここで -1 に潰すと基盤の異常が
+      // PASS として集計される。
+      if (e.status == null) {
+        const why = e.code === 'ETIMEDOUT'
+          ? `timeout(${timeout}ms)で強制終了された`
+          : `終了コードを残さずに落ちた(code=${e.code || '不明'} signal=${e.signal || 'なし'})`;
+        // stderr は末尾 3 行だけ添える(全部出すと ENOBUFS で ~1MB がログに流れる)。
+        // cause で stdout を含む元の例外を残す(issue #8 の原因究明の材料にするため)。
+        const tail = (e.stderr || '').trim().split('\n').slice(-3).join('\n');
+        const msg = `子プロセスが${why}: ${WORKLOG} ${args.join(' ')}`;
+        throw new Error(tail ? `${msg}\n  stderr(末尾): ${tail}` : msg, { cause: e });
+      }
       // 非 0 終了もテスト対象(引数エラーの確認)なので投げずに返す
-      return { code: e.status == null ? -1 : e.status, out: e.stdout || '', err: e.stderr || '' };
+      return { code: e.status, out: e.stdout || '', err: e.stderr || '' };
     }
   };
 }

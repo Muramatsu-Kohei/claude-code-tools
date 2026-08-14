@@ -1,0 +1,63 @@
+# 5 つのツールのうち、テストがある 3 つを回す。
+# npm 依存がゼロ(全テストが Node 標準モジュールだけで書かれている)なので install ステップは
+# 要らない。テストはいずれも USERPROFILE/HOME を偽ホームに差し替えて動くため、ランナー上の
+# 実データを読むことはない。claude-statusline と claude-window-keeper はテストが無いので対象外
+# (後者は PowerShell + タスクスケジューラが実体なので、書くとしても windows ランナーが要る)。
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# テストを回すだけで、リポジトリへの書き込みも API 呼び出しもしない。GITHUB_TOKEN の
+# 既定権限はリポジトリ設定次第で書き込みまで付きうるので、ここで読み取りに絞っておく。
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # windows を使うのは、対象ツールが Windows 前提(.cmd・PowerShell・%USERPROFILE%・
+    # ドライブレター付きパス)だから。ubuntu で試したところ 1521 件中 59 件が落ちた
+    # (account-guard のパス判定 56 件と、swap の故障注入 3 件)。いずれもツールの不具合ではなく
+    # 実行環境の前提の違いで、緑にするにはテスト側を書き換えるしかない。実際の利用環境が
+    # Windows である以上、そちらに CI を合わせるのが筋。public リポジトリなので Windows
+    # ランナーでも Actions は無料(実行時間の倍率課金がかかるのは private のみ)。
+    runs-on: windows-latest
+    # ハングしたまま Actions の実行時間を焼き続けないための上限。1 ツールの実測は 1 分未満
+    # なので 15 分あれば通常実行が引っかかることはない(テスト側にもランナー・子プロセスの
+    # 二段でタイムアウトを入れてあり、これは最後の砦)。
+    #
+    # この上限はツールごとに効くので、1 job = 1 ツールにしてあることが前提になっている。
+    # 3 ツールを 1 job で直列に回していたときは、ファイル単位の timeout(120 秒)が全 11 本ぶん
+    # 積み上がると最大 22 分になり、ハング時にこの 15 分が先に来て job ごと殺され、ランナー自身の
+    # 集計行(「失敗: …」)が出ないまま終わる恐れがあった。分けたことで最長の account-guard でも
+    # 5 本 × 2 分 = 10 分に収まる。
+    timeout-minutes: 15
+
+    strategy:
+      # 1 ツールが落ちても残りを打ち切らない。1 回の実行で 3 ツールぶんの結果が出揃うように
+      # する(直列だった頃に各ステップへ入れていた if: !cancelled() がこれに置き換わる)。
+      fail-fast: false
+      matrix:
+        # ディレクトリ名がそのまま working-directory になる。テストを持つツールを増やしたら
+        # ここに足す。
+        tool: [account-guard, claude-worklog, usage-tracker]
+
+    steps:
+      # v4 系は action 自体が Node 20 ランタイムで動く実装で、ランナー側から非推奨の
+      # 警告が出る(Node 24 に強制的に載せ替えられて動いてはいる)。警告を消すため v7 系に上げる。
+      # これは action の実装が動くランタイムの話で、下の node-version(テストを実行する
+      # Node のバージョン)とは別物。
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # ローカルの開発環境(fnm default = v24.19.0)に合わせる。上げるときはローカルも
+          # 揃えること。EOL だった 20 から移したもので、固定前に matrix [20, 24] を一時的に
+          # 入れて両版の緑を確認済み(どちらも 1521 / 157 / 20 件で FAIL なし)。
+          node-version: '24'
+
+      - name: ${{ matrix.tool }}
+        working-directory: ${{ matrix.tool }}
+        run: node test/run.js

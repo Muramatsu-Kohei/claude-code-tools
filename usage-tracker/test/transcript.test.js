@@ -10,7 +10,10 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const lib = require('../transcript/lib');
 
-const BASE = path.join(__dirname, '.tmp');
+// .tmp 直下ではなく自分専用のサブディレクトリを使う(account-guard / claude-worklog と同じ規約)。
+// テストファイルが1本しかない間は実害が出ないが、2本目が増えた瞬間に他スイートのサンドボックスを
+// 実行中に消す事故が再現する(account-guard/test/account-guard.test.js:15-18 参照)。
+const BASE = path.join(__dirname, '.tmp', 'transcript');
 const TRANSCRIPT = path.join(__dirname, '..', 'transcript');
 fs.rmSync(BASE, { recursive: true, force: true });
 
@@ -37,13 +40,33 @@ function writeTranscript(home, project, id, recs) {
 // 偽 HOME を向けてスクリプトを実行する。非 0 終了も検証対象なので投げずに返す
 function run(script, home) {
   const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+  // 孤児プロセスが残る事故(issue #8)の検出網として timeout を掛ける。stdin は既に
+  // 'ignore' で閉じているのでこのスクリプト自体がハングする経路は無いはずだが、
+  // 念のための保険。
+  const timeout = 30000;
   try {
     const out = execFileSync(process.execPath, [path.join(TRANSCRIPT, script)], {
       encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+      timeout, killSignal: 'SIGKILL',
     });
     return { code: 0, out, err: '' };
   } catch (e) {
-    return { code: e.status == null ? -1 : e.status, out: e.stdout || '', err: e.stderr || '' };
+    // 終了ステータスが無いまま死んだ場合(e.status が null / undefined)は、呼び出し側の
+    // 「非ゼロ終了 = 想定どおり失敗した」という判定に混ぜてはいけない。timeout(ETIMEDOUT)
+    // のほかに maxBuffer 超過(ENOBUFS)・外部や OOM による kill も同じ形で来るので、
+    // code ではなく status の有無で判別する。ここで -1 に潰すと基盤の異常が
+    // PASS として集計される。
+    if (e.status == null) {
+      const why = e.code === 'ETIMEDOUT'
+        ? `timeout(${timeout}ms)で強制終了された`
+        : `終了コードを残さずに落ちた(code=${e.code || '不明'} signal=${e.signal || 'なし'})`;
+      // stderr は末尾 3 行だけ添える(全部出すと ENOBUFS で ~1MB がログに流れる)。
+      // cause で stdout を含む元の例外を残す(issue #8 の原因究明の材料にするため)。
+      const tail = (e.stderr || '').trim().split('\n').slice(-3).join('\n');
+      const msg = `子プロセスが${why}: ${script}`;
+      throw new Error(tail ? `${msg}\n  stderr(末尾): ${tail}` : msg, { cause: e });
+    }
+    return { code: e.status, out: e.stdout || '', err: e.stderr || '' };
   }
 }
 

@@ -1,18 +1,25 @@
 // テストランナー。test/*.test.js を順に子プロセスで走らせ、終了コードを集計する。
 // 使い方: node test/run.js [名前の一部]
 //
-// (account-guard/test/run.js と同じ構造・流儀に揃えてある)
+// (claude-worklog/test/run.js と同じ構造・流儀に揃えてある)
 //
-// 起動時に test/.tmp/ を丸ごと消す(lib.js の tmpDir() が各テストファイルの専用サブ
-// ディレクトリをこの配下に掘るため)。個々のテストファイルは自分専用のサブディレクトリ
-// (.tmp/add・.tmp/scope 等)だけを消す設計なので、.tmp 全体を消すのはここが正しい置き場所。
-// これにより前回実行の孤児(ハングしたまま残ったプロセスが握っていたファイル。何がハングを
-// 起こすのかは未解明)を毎回一掃できる(issue #8)。
+// 起動時に test/.tmp/ を丸ごと消す(作り直しは各テストが自分のサブディレクトリを
+// recursive で掘るときに一緒に行われるので、ここでは消すだけでよい)。個々のテストファイルは自分専用の
+// サブディレクトリ(.tmp/guard・.tmp/swap 等)だけを消す設計になっていて、.tmp 全体は
+// 消さない(account-guard.test.js:15-18 参照。以前は各ファイルが .tmp 全体を消していたため、
+// 同時に走らせた別スイートのサンドボックスを巻き添えで消す事故があった)。ここでランナーが
+// 全テストの前に 1 度だけ丸ごと消すのが正しい置き場所で、これにより前回実行の孤児
+// (ハングしたまま残ったプロセスが握っていたファイル。何がハングを起こすのかは未解明)を
+// 毎回一掃できる(issue #8)。
 //
-// ただしフィルタ(process.argv[2])指定時は全削除をスキップする。フィルタ指定は
-// 「別スイートを並列実行中」を意味しうるため、他方のサンドボックスを巻き添えで消す事故を
-// 避ける(account-guard.test.js:15-18 が記録した事故と同型)。この場合は全実行時の
-// 孤児掃除(issue #8)が効かないままになるので、その旨をログに出す。
+// ただしフィルタ(process.argv[2])指定時と SWAP_SCRIPT 指定時は全削除をスキップする。
+// フィルタ指定は「別スイートを並列実行中」を意味しうる(例: swap と fault を並列に流すと、
+// 片方の起動時削除がもう片方のサンドボックスを巻き添えにする — account-guard.test.js:15-18 が
+// 記録した事故そのもの)。SWAP_SCRIPT は変異テスト手順が .tmp に変異版 swap.js を置いて指す
+// 仕組みで、ここで消すとその変異版ごと消えてしまう。この env は reachable.test.js と
+// fault.test.js の 2 本が読むので、片方の感度だけを見たいときは名前で絞ること(絞らないと
+// もう片方も変異版に対して走り、手順が意図していない結果が混ざる)。
+// この場合は全実行時の孤児掃除(issue #8)が効かないままになるので、その旨をログに出す。
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
@@ -23,8 +30,11 @@ const only = process.argv[2];
 function main() {
   // .tmp を消せなかったかどうか。最後に「すべて PASS なのに非ゼロ終了」の理由を出すために持つ。
   let cleanupFailed = false;
-  if (only) {
-    console.log(`test/.tmp の全削除をスキップ(フィルタ指定 "${only}")。前回実行の孤児が残っていても今回は一掃されない(issue #8)。`);
+  if (only || process.env.SWAP_SCRIPT) {
+    const reasons = [];
+    if (only) reasons.push(`フィルタ指定 "${only}"`);
+    if (process.env.SWAP_SCRIPT) reasons.push('SWAP_SCRIPT 指定');
+    console.log(`test/.tmp の全削除をスキップ(${reasons.join(' / ')})。前回実行の孤児が残っていても今回は一掃されない(issue #8)。`);
   } else {
     // force: true だけでは足りない場面がある: 孤児プロセス(issue #8 参照)が .tmp 配下を
     // カレントディレクトリにしていたりファイルハンドルを開いたままだと、Windows は
@@ -45,10 +55,9 @@ function main() {
       // それを使うスイートに閉じる。掴んでいるのが孤児とは限らず(Defender のスキャンや
       // エクスプローラの一時ロックでも EBUSY は出る)、そのたびに 1 本も走らないのは代償が
       // 大きい。ただし消せなかった事実は非ゼロ終了として残す(警告だけだと CI のログに埋もれ、
-      // issue #8 の再現を見落とす)。process.exit を使わないのは、Windows では stdout がパイプ
-      // (CI のログ収集等)のとき書き込みが非同期になり、直後に exit すると直前の console.error が
-      // 切れて届かないことがあるため(3 ツール共通の作法で、同じ理由のコメントが
-      // account-guard/test/harness.js にもある)。
+      // issue #8 の再現を見落とす)。process.exit を使わないのは harness.js:23-26 と同じ理由で、
+      // Windows では stdout がパイプ(CI のログ収集等)のとき書き込みが非同期になり、直後に
+      // exit すると直前の console.error が切れて届かないことがある。
       cleanupFailed = true;
       process.exitCode = 1;
     }
@@ -73,12 +82,12 @@ function main() {
     //
     // stdin は 'ignore' にする。テストファイル自身は stdin を読まないが、継承したままだと
     // このランナーの stdin(端末や CI のパイプ)がそのままぶら下がる。spawnSync の stdio 指定は
-    // input と違って実際に効くので、ここで閉じておく(lib.js の runner() も同じく stdio で
-    // 閉じている)。
-    // ファイル単位の timeout。runner() が個々の子プロセスに 30 秒の保険を掛けているが、
-    // それでは捕まえられない場所(テスト本体のループや fs の待ち)で固まる余地は残る。CI で
-    // ハングしたまま job のタイムアウトまで枠を焼くのを避けるため、ここでも締める。
-    // このディレクトリの *.test.js は 5 本なので、全ファイルが timeout しても
+    // input と違って実際に効くので、ここで閉じておく(各ラッパーが使う execFileSync は元から
+    // stdio を 3 つとも pipe で開くため、子が親の TTY を握ることはない)。
+    // ファイル単位の timeout。各ラッパー(execGuardScript 等)が個々の子プロセスに 30 秒の
+    // 保険を掛けているが、それでは捕まえられない場所(テスト本体のループや fs の待ち)で
+    // 固まる余地は残る。CI でハングしたまま job のタイムアウトまで枠を焼くのを避けるため、
+    // ここでも締める。このディレクトリの *.test.js は 5 本なので、全ファイルが timeout しても
     // 5 × 120000ms = 10 分に収まるよう 2 分に取ってある(3 分だと 15 分になり job 側の
     // timeout-minutes: 15 と等しくなってしまい、checkout や setup-node の分だけ確実に超えて、
     // ランナー自身の集計(「失敗: …」)が出る前に GitHub に殺される)。CI は 1 job = 1 ツールで
@@ -96,9 +105,9 @@ function main() {
     if (r.signal) {
       console.log(`  (${f} は signal で強制終了: ${r.signal})`);
       // Windows には process group kill が無く、ここで死ぬのは直下の子(このテストファイル)だけ。
-      // テストが起こした孫(worklog.js や、その先の detached な要約プロセス)は生き残り、.tmp を
-      // 掴んだまま孤児になる — この網が捕まえたい場面で、自分が issue #8 の状態を作ってしまう。
-      // 次回実行が理由の読めない EBUSY で止まる前に、ここで名指ししておく。
+      // テストが execFileSync で起こした孫(swap.js 等)は生き残り、.tmp を掴んだまま孤児になる
+      // — この網が捕まえたい場面で、自分が issue #8 の状態を作ってしまう。次回実行が理由の
+      // 読めない EBUSY で止まる前に、ここで名指ししておく。
       console.log('   孫プロセスが残って test/.tmp を掴んでいる可能性がある(issue #8)。`Get-Process node` で確認し、残っていれば `Stop-Process -Id <PID> -Force` で終了させること。');
     }
     // spawn 自体に失敗したとき(ENOENT・EAGAIN 等)は status も signal も無く、理由が

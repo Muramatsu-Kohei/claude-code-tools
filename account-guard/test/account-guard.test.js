@@ -57,8 +57,37 @@ const configPath = (home) => path.join(home, '.claude', 'account-guard', 'config
 function execGuardScript(scriptPath, { argv = [], env, cwd, input } = {}) {
   const opts = { env, encoding: 'utf8' };
   if (cwd !== undefined) opts.cwd = cwd;
+  // account-guard.js は hook として stdin から JSON を読む設計。execFileSync は stdio を
+  // 3 つとも pipe で開くので、input を渡さない呼び出しでも子は親の TTY を継承せず、
+  // 何も書かれないまま即座に EOF を受け取る(空文字を渡しても spawnSync は truthy 判定で
+  // 無視するので同じ)。
   if (input !== undefined) opts.input = JSON.stringify(input);
-  return execFileSync(process.execPath, [scriptPath, ...argv], opts);
+  // issue #8(test/.tmp の孤児プロセス)の原因は上記の EOF 挙動ではなく未解明のまま。
+  // timeout はその原因不明のハングを検出するための網であり、CI で検出できず放置される
+  // 事態を避けるための保険。
+  opts.timeout = 30000;
+  opts.killSignal = 'SIGKILL';
+  try {
+    return execFileSync(process.execPath, [scriptPath, ...argv], opts);
+  } catch (e) {
+    // 終了ステータスが無いまま死んだ場合(e.status が null / undefined)は timeout
+    // (ETIMEDOUT)以外に maxBuffer 超過(ENOBUFS)・外部や OOM による kill も同じ形で来る。
+    // 呼び出し元(run() / runCrash() など)は try/catch を持たず「非ゼロ終了なら例外が
+    // そのまま飛んでテストが落ちる」ことに依存しているので、status がある異常終了は
+    // そのまま投げ直す。status が無いときだけ、起動していた対象を添えて包む(潰すと
+    // どのスクリプトが固まったか分からなくなる)。
+    if (e.status == null) {
+      const why = e.code === 'ETIMEDOUT'
+        ? `timeout(${opts.timeout}ms)で強制終了された`
+        : `終了コードを残さずに落ちた(code=${e.code || '不明'} signal=${e.signal || 'なし'})`;
+      // stderr は末尾 3 行だけ添える(全部出すと ENOBUFS で ~1MB がログに流れる)。
+      // cause で stdout を含む元の例外を残す(issue #8 の原因究明の材料にするため)。
+      const tail = (e.stderr || '').trim().split('\n').slice(-3).join('\n');
+      const msg = `子プロセスが${why}: ${scriptPath} ${argv.join(' ')}`;
+      throw new Error(tail ? `${msg}\n  stderr(末尾): ${tail}` : msg, { cause: e });
+    }
+    throw e;
+  }
 }
 
 // execGuardScript の生の stdout を、フックの JSON 出力として解釈する。空出力は
