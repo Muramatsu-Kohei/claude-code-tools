@@ -220,14 +220,18 @@ function runSwap(home, argv) {
     const out = execFileSync(process.execPath, [SWAP, ...argv], opts);
     return { code: 0, out, err: '' };
   } catch (e) {
-    // timeout で殺された場合、e.status は null で e.code に 'ETIMEDOUT' が入る。ここで
-    // code: 1 に潰すと呼び出し側の `r.code === 1`(想定内の失敗)と区別が付かず、
-    // ハングが PASS として集計されてしまう。timeout は基盤の異常なので assertion の
-    // 合否に混ぜず、その場で投げて止める。
-    if (e.code === 'ETIMEDOUT') {
-      throw new Error(`子プロセスが timeout(${opts.timeout}ms)で強制終了された: ${SWAP} ${argv.join(' ')}`);
+    // 終了ステータスが無いまま死んだ場合(e.status が null / undefined)は、呼び出し側の
+    // 「非ゼロ終了 = 想定どおり失敗した」という判定に混ぜてはいけない。timeout(ETIMEDOUT)
+    // のほかに maxBuffer 超過(ENOBUFS)・外部や OOM による kill も同じ形で来るので、
+    // code ではなく status の有無で判別する。ここで 1 や -1 に潰すと基盤の異常が
+    // PASS として集計される。
+    if (e.status == null) {
+      const why = e.code === 'ETIMEDOUT'
+        ? `timeout(${opts.timeout}ms)で強制終了された`
+        : `終了コードを残さずに落ちた(code=${e.code || '不明'} signal=${e.signal || 'なし'})`;
+      throw new Error(`子プロセスが${why}: ${SWAP} ${argv.join(' ')}`);
     }
-    return { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
+    return { code: e.status, out: e.stdout || '', err: e.stderr || '' };
   }
 }
 
