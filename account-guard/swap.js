@@ -905,6 +905,17 @@ function canonicalSlotName(name) {
 // 来歴が読めないことは 1 回の実行で 6 箇所から検出されうる(readCurrentSlot の呼び出し数)。
 // そのたびに出すと本題の案内が埋もれるので、最初の 1 回だけ知らせる。
 let currentSlotWarned = false;
+// 「未記録」と「読めない」は readCurrentSlot がどちらも null を返すが、呼び出し元が出すべき
+// 案内は正反対になる(未記録なら退避すれば作れる。読めないならファイルを読める状態に戻す
+// 以外に直す手が無い)。区別を捨てていたせいで、来歴が読めないだけの状態で
+//   ・「来歴が未記録です。`swap save <name>` で退避すると記録されます」(直らない案内)
+//   ・status の `*` 印と「現在のログインと内容が違います」の警告が理由も告げずに消える
+// という食い違いが同時に起きていた(stderr には「読めません」と出しているのに)。
+// 戻り値をオブジェクトに変えると呼び出し 6 箇所すべてに波及して退行させやすいので、
+// 読めなかったという事実だけをここに持つ。1 回の実行の中で状態は変わらない前提
+// (probeFile が同じファイルを何度見ても同じ答えを返す範囲)。
+let currentSlotUnreadable = false;
+function currentSlotIsUnreadable() { return currentSlotUnreadable; }
 function warnCurrentUnreadable(code) {
   if (currentSlotWarned) return;
   currentSlotWarned = true;
@@ -923,6 +934,7 @@ function readCurrentSlot() {
   if (!p.readable) {
     // 読めない来歴を「無い」と同じに扱わない。名前を決められないことは伝わるべきで、
     // 黙って別名を作らせない(呼び出し元は null を「決められない」として扱う)。
+    currentSlotUnreadable = true;
     warnCurrentUnreadable(p.code);
     return null;
   }
@@ -960,7 +972,13 @@ function dropCurrentSlot(e) {
   try {
     fs.unlinkSync(CURRENT_FILE);
   } catch (unlinkError) {
-    if (unlinkError.code !== 'ENOENT') stale = true;
+    // 消せずに残ったファイルが害になるのは、それを readCurrentSlot が読めるときだけ。読めない
+    // 残骸は来歴として効かず(readCurrentSlot が null を返し、未記録と同じに落ちる)、名前を
+    // 省いた退避が別スロットを狙うこともない。残っただけで警告していた頃は、.current が
+    // ディレクトリになっている環境(unlink も read も EISDIR で落ちる)で、実害の無い残骸に
+    // ついて「名前を省いた退避は別のアカウントのスロットを上書きします」と事実に反する警告を
+    // 出し、存在しない問題を追わせていた。
+    if (unlinkError.code !== 'ENOENT') stale = probeFile(CURRENT_FILE).readable;
   }
   return '来歴を記録できませんでした(' + (e.code || e.message) + ': ' + CURRENT_FILE + ')'
     + '\n  ' + dirIsFileHint(e, path.dirname(CURRENT_FILE),
@@ -1303,9 +1321,11 @@ function reportOtherSlots(saved, returnCmd, returnNote) {
   console.log(indent + '  退避のあとトークンが更新されたのなら、これらは古くなっています。'
     + 'このツールを通さずに /login したのなら、別アカウントの最新の退避です'
     + '(このツールでは見分けられません)');
-  console.log(indent + '  前者だと分かっているときだけ更新してください'
-    + '(後者なら、そのアカウントの退避を潰します):');
+  // 戻すコマンドは stale・drifted のどちらを更新する場合でも先に要るので、更新手順の見出しより
+  // 前に 1 回だけ出す(見出しの下に置いていた頃は、stale が 1 件も無く drifted だけのときに
+  // 「更新してください:」の下が戻すコマンドだけになり、何を更新するのか読めなくなっていた)。
   if (returnCmd) {
+    console.log(indent + '  更新するなら、先にこれを打ってください:');
     console.log(indent + '    ' + returnCmd
       + '   (先に戻さないと、いま復元したアカウントの内容で上書きされます)');
   } else if (returnNote) {
@@ -1315,12 +1335,30 @@ function reportOtherSlots(saved, returnCmd, returnNote) {
     // 元の内容が失われる。
     console.log(indent + '    ' + returnNote);
   }
+  // 更新コマンドを stale と drifted で分ける。根拠の強さが違うものを同じ一覧に並べると、
+  // どちらの根拠でそこに載っているのかが読み手に見分けられない。
+  // stale は refreshToken の一致で「いま押し出した旧内容と同じものを持つ」と裏が取れており、
+  // 更新して失われるのは押し出した旧内容と同じもの(控えも .replaced に残る)。
+  // drifted の根拠は来歴だけで、README の初回手順(swap save → 別アカウントで /login →
+  // swap save <別名>)をそのまま踏むだけでも発火する。そこで挙がるのは、もう一方のアカウントの
+  // 唯一の新鮮なバックアップであることがある。staleSlots がまさにこの理由で来歴ベースの報告を
+  // やめた(そのコメント参照)のに、こちらの一覧で同じ案内を復活させていた。
   // 名前は挙がっている全部に出す。先頭 1 つだけを出していた頃は、同じアカウントを複数の名前で
   // 退避している人(この関数がまさに想定している状況)が案内どおり打っても残りが取り残され、
   // 後でそちらを復元した時点でローテート前のトークンに戻っていた。防ごうとしている事象を
   // 案内の側で作っていたことになる。
-  for (const n of names) {
-    console.log(indent + '    swap save ' + n + ' --force');
+  if (stale.length) {
+    console.log(indent + '  前者だと分かっているときだけ更新してください'
+      + '(後者なら、そのアカウントの退避を潰します):');
+    for (const n of stale) {
+      console.log(indent + '    swap save ' + n + ' --force');
+    }
+  }
+  if (drifted) {
+    console.log(indent + '  ' + drifted + ' の根拠は来歴だけで、内容が古いという証明はありません'
+      + '(2 つ目のアカウントを別の名前で退避しただけでもここに出ます)。中身を確かめて、'
+      + '古いと分かったときだけ更新してください:');
+    console.log(indent + '    swap save ' + drifted + ' --force');
   }
 }
 
@@ -1427,6 +1465,14 @@ function cmdStatus() {
         + (c ? expiryNote(c.json) : '  [読めません]')
         + (outdated.has(name) ? '  [現在のログインと内容が違います]' : ''));
     }
+    // 来歴を読めないと curSlot が null になり、`*` 印も outdatedSlots の判定も丸ごと落ちる
+    // (outdatedSlots は curSlot が無ければ空集合を返す)。黙って消すと「印が無い = 現在の
+    // ログインに対応する退避は無い」「警告が無い = どれも最新」と読めてしまう。status は
+    // 退化に気づく唯一の入り口なので、判定できなかったことは判定結果より先に伝える。
+    if (currentSlotIsUnreadable()) {
+      console.log('  (来歴を読めないため、現在のログインを指す `*` と'
+        + '「現在のログインと内容が違います」の判定は出せていません)');
+    }
   }
   // 書きかけのまま残ったファイル。writeAtomic の後始末は例外経路にしか効かないので、書き込み
   // 中に落ちるとここに残る。中身は平文のトークンで、退避の一覧にも控えの集計にも現れないため、
@@ -1516,7 +1562,15 @@ function cmdStatus() {
       + '原因を調べ終えたら消して構いません');
   }
   if (!curSlot && cur && saved.length > 0) {
-    console.log('\n来歴が未記録です。`swap save <name>` で退避すると、以後どのスロット由来かを記録します');
+    // 「未記録」と言い切れるのは、読めた結果として記録が無いときだけ。読めないだけの状態で
+    // これを出すと、同じ実行が stderr に出している「来歴(.current)を読めません」と正面から
+    // 食い違ううえ、勧めた `swap save <name>` を打っても記録は直らない(書き込みは同じ
+    // ファイルに対して同じ理由で落ちる)。直せる手だけを出す。
+    console.log(currentSlotIsUnreadable()
+      ? '\n来歴(.current)を読めないため、どのスロット由来かを判定できません'
+        + '\n  上の理由を解消するか、' + CURRENT_FILE + ' を削除すれば未記録の状態に戻せます'
+        + '(次の `swap save <name>` で記録し直されます)'
+      : '\n来歴が未記録です。`swap save <name>` で退避すると、以後どのスロット由来かを記録します');
   }
 }
 
@@ -2159,11 +2213,15 @@ function usage() {
   swap <name> --force  復元先が失効済み・判別不能・同一プランでも中止せずに切り替える
                        現在の credentials が読めない場合も、控えを残して進む
                        (退避先に別のアカウントが入っている場合は上書きせずに中止する。
-                        それを許すのは swap save <name> --force だけ)
+                        それを許すのは swap save [<name>] --force だけ)
   swap save [<name>]   現在のアカウントを退避するだけ(切り替えない)
                        名前を省略すると来歴(前回のスロット名)か subscriptionType を使う
-  swap save <name> --force
+  swap save [<name>] --force
                        別の認証情報が入っているスロットでも上書きする
+                       名前を省くと退避先は上の規則で決まるため、「読めない現在の
+                       credentials を諦めて進む」つもりで付けた --force が、
+                       たまたま同じ名前になった別アカウントのスロットを上書きしうる
+                       (旧内容の控えは残るので戻せる)
 
 退避先: ${ACCOUNTS_DIR}
 現在のログインがどのスロット由来かは ${CURRENT_FILE} に記録します。
