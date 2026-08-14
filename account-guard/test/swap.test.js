@@ -2847,4 +2847,31 @@ const TRUNCATED_CURRENT =
     r.out.includes('名前を省くと退避先は上の規則で決まるため'), r.out);
 }
 
+// --- 予約名の照合は大小を無視する ---
+// Windows と macOS のファイルシステムは大小を区別しないので、`swap save Warmup` が作るのは
+// このガードが作らせまいとしている accounts/warmup.json そのもの(canonicalSlotName が大小を
+// 畳む以上、以後 `swap warmup` もそれを指す)。ディスク上の綴りで照合していた頃は、予約の
+// 意味がひと文字の大小で消えていた。
+{
+  const home = sandbox('reserved-name-warmup-mixed-case', {
+    current: creds('pro', { token: 'tok' }),
+  });
+  const r = runSwap(home, ['save', 'Warmup']);
+  check('大小違いでも予約名は新しい退避先に使わせない',
+    r.code === 1 && /サブコマンドと同じ/.test(r.err), r.out + r.err);
+  check('中止したのでファイルも作らない', !fs.existsSync(acctPath(home, 'Warmup')), r.err);
+}
+{
+  // status の予告も同じ照合で見ている。ここが大小を区別していたため、大小違いで作られた
+  // スロットにだけ「いずれ復元できなくなる」が出ず、予約が守ろうとしていた当のスロットが
+  // 無警告のまま実装日を迎えることになっていた(そのときには復元の引数の形が消えている)。
+  const home = sandbox('reserved-only-name-mixed-case', {
+    current: creds('pro', { token: 'pro-tok' }),
+    accounts: { Warmup: creds('team', { token: 'warmup-tok' }) },
+  });
+  const r = runSwap(home, []);
+  check('大小違いの予約名スロットにも「いずれ復元できなくなる」を出す',
+    /いずれ復元できなくなる名前の退避があります: Warmup/.test(r.out), r.out + r.err);
+}
+
 report();
