@@ -12,7 +12,13 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # windows を使うのは、対象ツールが Windows 前提(.cmd・PowerShell・%USERPROFILE%・
+    # ドライブレター付きパス)だから。ubuntu で試したところ 1521 件中 59 件が落ちた
+    # (account-guard のパス判定 56 件と、swap の故障注入 3 件)。いずれもツールの不具合ではなく
+    # 実行環境の前提の違いで、緑にするにはテスト側を書き換えるしかない。実際の利用環境が
+    # Windows である以上、そちらに CI を合わせるのが筋。public リポジトリなので Windows
+    # ランナーでも Actions は無料(実行時間の倍率課金がかかるのは private のみ)。
+    runs-on: windows-latest
     # ハングしたまま Actions の実行時間を焼き続けないための上限。全体の実測は 2 分弱なので
     # 15 分あれば通常実行が引っかかることはない(テスト側にもランナー・子プロセスの
     # 二段でタイムアウトを入れてあり、これは最後の砦)。
