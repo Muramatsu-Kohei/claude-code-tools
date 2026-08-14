@@ -109,7 +109,11 @@ function execSwapScript(script, argv = [], { cwd, env } = {}) {
       const why = e.code === 'ETIMEDOUT'
         ? `timeout(${opts.timeout}ms)で強制終了された`
         : `終了コードを残さずに落ちた(code=${e.code || '不明'} signal=${e.signal || 'なし'})`;
-      throw new Error(`子プロセスが${why}: ${script} ${argv.join(' ')}`);
+      // stderr は末尾 3 行だけ添える(全部出すと ENOBUFS で ~1MB がログに流れる)。
+      // cause で stdout を含む元の例外を残す(issue #8 の原因究明の材料にするため)。
+      const tail = (e.stderr || '').trim().split('\n').slice(-3).join('\n');
+      const msg = `子プロセスが${why}: ${script} ${argv.join(' ')}`;
+      throw new Error(tail ? `${msg}\n  stderr(末尾): ${tail}` : msg, { cause: e });
     }
     return { code: e.status, out: e.stdout || '', err: e.stderr || '' };
   }

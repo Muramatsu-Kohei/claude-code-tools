@@ -70,12 +70,21 @@ function execGuardScript(scriptPath, { argv = [], env, cwd, input } = {}) {
   try {
     return execFileSync(process.execPath, [scriptPath, ...argv], opts);
   } catch (e) {
-    // timeout で殺された場合、e.status は null で e.code に 'ETIMEDOUT' が入る。呼び出し元
-    // (run() / runCrash() など)は try/catch を持たず「非ゼロ終了なら例外がそのまま飛んで
-    // テストが落ちる」ことに依存しているので、ETIMEDOUT 以外はそのまま投げ直す。ここで
-    // 潰すとどのスクリプトが固まったか分からなくなるので、起動していた対象を添えて包む。
-    if (e.code === 'ETIMEDOUT') {
-      throw new Error(`子プロセスが timeout(${opts.timeout}ms)で強制終了された: ${scriptPath} ${argv.join(' ')}`);
+    // 終了ステータスが無いまま死んだ場合(e.status が null / undefined)は timeout
+    // (ETIMEDOUT)以外に maxBuffer 超過(ENOBUFS)・外部や OOM による kill も同じ形で来る。
+    // 呼び出し元(run() / runCrash() など)は try/catch を持たず「非ゼロ終了なら例外が
+    // そのまま飛んでテストが落ちる」ことに依存しているので、status がある異常終了は
+    // そのまま投げ直す。status が無いときだけ、起動していた対象を添えて包む(潰すと
+    // どのスクリプトが固まったか分からなくなる)。
+    if (e.status == null) {
+      const why = e.code === 'ETIMEDOUT'
+        ? `timeout(${opts.timeout}ms)で強制終了された`
+        : `終了コードを残さずに落ちた(code=${e.code || '不明'} signal=${e.signal || 'なし'})`;
+      // stderr は末尾 3 行だけ添える(全部出すと ENOBUFS で ~1MB がログに流れる)。
+      // cause で stdout を含む元の例外を残す(issue #8 の原因究明の材料にするため)。
+      const tail = (e.stderr || '').trim().split('\n').slice(-3).join('\n');
+      const msg = `子プロセスが${why}: ${scriptPath} ${argv.join(' ')}`;
+      throw new Error(tail ? `${msg}\n  stderr(末尾): ${tail}` : msg, { cause: e });
     }
     throw e;
   }

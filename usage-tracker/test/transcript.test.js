@@ -10,7 +10,10 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const lib = require('../transcript/lib');
 
-const BASE = path.join(__dirname, '.tmp');
+// .tmp 直下ではなく自分専用のサブディレクトリを使う(account-guard / claude-worklog と同じ規約)。
+// テストファイルが1本しかない間は実害が出ないが、2本目が増えた瞬間に他スイートのサンドボックスを
+// 実行中に消す事故が再現する(account-guard/test/account-guard.test.js:15-18 参照)。
+const BASE = path.join(__dirname, '.tmp', 'transcript');
 const TRANSCRIPT = path.join(__dirname, '..', 'transcript');
 fs.rmSync(BASE, { recursive: true, force: true });
 
@@ -57,7 +60,11 @@ function run(script, home) {
       const why = e.code === 'ETIMEDOUT'
         ? `timeout(${timeout}ms)で強制終了された`
         : `終了コードを残さずに落ちた(code=${e.code || '不明'} signal=${e.signal || 'なし'})`;
-      throw new Error(`子プロセスが${why}: ${script}`);
+      // stderr は末尾 3 行だけ添える(全部出すと ENOBUFS で ~1MB がログに流れる)。
+      // cause で stdout を含む元の例外を残す(issue #8 の原因究明の材料にするため)。
+      const tail = (e.stderr || '').trim().split('\n').slice(-3).join('\n');
+      const msg = `子プロセスが${why}: ${script}`;
+      throw new Error(tail ? `${msg}\n  stderr(末尾): ${tail}` : msg, { cause: e });
     }
     return { code: e.status, out: e.stdout || '', err: e.stderr || '' };
   }
