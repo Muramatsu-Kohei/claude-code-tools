@@ -1,0 +1,47 @@
+# 5 つのツールのうち、テストがある 3 つを回す。
+# npm 依存がゼロ(全テストが Node 標準モジュールだけで書かれている)なので install ステップは
+# 要らない。テストはいずれも USERPROFILE/HOME を偽ホームに差し替えて動くため、ランナー上の
+# 実データを読むことはない。claude-statusline と claude-window-keeper はテストが無いので対象外
+# (後者は PowerShell + タスクスケジューラが実体なので、書くとしても windows ランナーが要る)。
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # ハングしたまま Actions の実行時間を焼き続けないための上限。全体の実測は 2 分弱なので
+    # 15 分あれば通常実行が引っかかることはない(テスト側にもランナー・子プロセスの
+    # 二段でタイムアウトを入れてあり、これは最後の砦)。
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # ローカルの開発環境(v20.13.1)に合わせる。上げるときはローカルも揃えること。
+          node-version: '20'
+
+      # claude-worklog と account-guard のテストは git init で偽リポジトリを作る。ランナーには
+      # commit の identity が設定されておらず、commit する経路に入ると落ちる。ローカルでは
+      # global 設定があるので気づけないため、CI 側で先に埋めておく。
+      - name: git identity
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+
+      - name: account-guard
+        working-directory: account-guard
+        run: node test/run.js
+
+      - name: claude-worklog
+        working-directory: claude-worklog
+        run: node test/run.js
+
+      - name: usage-tracker
+        working-directory: usage-tracker
+        run: node test/transcript.test.js
