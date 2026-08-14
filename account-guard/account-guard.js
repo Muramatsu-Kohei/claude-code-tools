@@ -23,32 +23,107 @@
 // 巻き添えにはしない。判定できたものだけを拒否し、それ以外は通常の権限フローに委ねる。
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
-const HOME = process.env.USERPROFILE || process.env.HOME || '.';
-const CREDENTIALS = path.join(HOME, '.claude', '.credentials.json');
-const CONFIG = path.join(HOME, '.claude', 'account-guard', 'config.json');
+// HOME として使える値か。空文字・空白のみは「無い」のと同じに扱う。os.homedir() や
+// 環境変数は「存在するが空文字」を返すことがある(Windows で実測)。素通しにすると
+// この先のパスが cwd 相対に解決され、設定の無い場所では保護ルールが 0 件になって
+// 無言で全部通ってしまう(credentials.js 側にも同じ検証がある)。
+function usableHome(v) {
+  return typeof v === 'string' && v.trim() !== '' ? v : null;
+}
 
-// アカウントを判別できなかったときの値。collect.js と同じ規約。
-const ACCOUNT_UNKNOWN = 'unknown';
+// credentials の場所と読み方は swap.js と共有する(credentials.js のコメント参照)。
+//
+// require を素通しで書かないのは、これがトップレベルで投げると末尾の catch
+// (異常終了を受け止めて保護側へ倒す仕組み)より先にプロセスが死ぬため。フックは
+// 標準出力に何も出さないまま exit 1 で終わり、Claude Code はブロックせず処理を続ける。
+// つまり credentials.js を隣に置き忘れた構成では、保護が丸ごと外れたことに誰も
+// 気づけないまま素通しになる。読めなくても「判別不能」として動き続けるほうが安全。
+//
+// require が成功しても中身までは保証されない。account-guard.js を置いたディレクトリに
+// 無関係な・古い credentials.js が同名で存在すると require 自体は成功するが、HOME 等が
+// 期待する形でないことがあり、そのまま使うとこの先の path.join(HOME, ...) がトップレベルで
+// 例外を投げて同じ無言 fail-open を起こす。必要なエクスポートの形を検証し、欠けていれば
+// 「読み込めなかった」場合とまったく同じ経路(下の catch)に合流させる。
+let credentials = null;
+// 読めなかった理由は捨てない。ここで落ちると「正しいアカウントでログインしているのに
+// 全部 deny される」状態になり、原因は隣のファイルなのに拒否メッセージが /login を促すと、
+// 何度ログインし直しても直らない袋小路に入る(拒否の文面で真因を出すために使う)。
+let credentialsLoadError = null;
+try {
+  const loaded = require('./credentials');
+  if (
+    !loaded
+    || !usableHome(loaded.HOME)
+    || typeof loaded.CREDENTIALS !== 'string' || !loaded.CREDENTIALS
+    || typeof loaded.ACCOUNT_UNKNOWN !== 'string' || !loaded.ACCOUNT_UNKNOWN
+    || typeof loaded.currentAccount !== 'function'
+    // readCredentials / hasUsableCredentials は credentialsState() が使う。ここで検証して
+    // おかないと、欠けている場合に credentialsState() の catch が拾って「credentials が
+    // 壊れている」という別の案内に落ち、真因(credentials.js の形式不正)がどこにも出なくなる。
+    // hasUsableCredentials を見落としていた頃は、それだけを欠く版が隣にあると、健全な
+    // credentials に対して「失われる認証情報はない」と断言して /login を勧めていた
+    // (まだ退避していないアカウントなら、その時点で refreshToken が失われる)。
+    || typeof loaded.readCredentials !== 'function'
+    || typeof loaded.hasUsableCredentials !== 'function'
+    // hasRecoverableToken も同じ理由で必須。欠ける版が隣にあると credentialsState() の
+    // catch が拾って「読み取れなかった」の案内に落ち、真因が出ないまま文面だけが変わる。
+    || typeof loaded.hasRecoverableToken !== 'function'
+    // probeFile は「ファイルが無い」と「あるのに読めない」を分ける唯一の場所。欠ける版が
+    // 隣にあると loggedOut の判定が TypeError で落ち、下に書いてあるのと同じ無言 fail-open の
+    // 経路(denyMessage を組み立てられないまま reportCrash に抜ける)に入る。
+    || typeof loaded.probeFile !== 'function'
+    // rawHasRecoverableToken は credentialsState() が生の中身を分類するのに使う。ここが
+    // 抜けていた頃は、欠ける版が隣にあると credentialsState() が TypeError で落ち、
+    // denyMessage を組み立てられないまま main() を抜けて reportCrash に到達していた。
+    // reportCrash は cwd しか見ないので、対象パス指定の違反は無出力(exit 0)で許可されていた
+    // ——このブロックが防ぐはずの無言 fail-open そのもの。swap.js は最初から検証しており、
+    // 二者のリストがドリフトしていた(下のテストで両者が呼ぶメンバーを機械的に照合する)。
+    || typeof loaded.rawHasRecoverableToken !== 'function'
+  ) {
+    throw new Error('credentials.js の形式が不正です(HOME / CREDENTIALS / ACCOUNT_UNKNOWN / currentAccount / readCredentials / hasUsableCredentials / hasRecoverableToken / rawHasRecoverableToken のいずれかが欠けています)');
+  }
+  credentials = loaded;
+} catch (e) {
+  // 単体配置・コピー漏れ・権限・形式不正。下のフォールバックで拒否側に倒す
+  credentialsLoadError = e;
+}
+
+// HOME の導出だけは自前でも持つ(テストが USERPROFILE / HOME を差し替えるため、
+// os.homedir() ではなく環境変数を先に見る。credentials.js と同じ規約)。
+// credentials.js から受け取った値も usableHome に通す。上の検証で弾いているので通常は
+// 有効なはずだが、二重チェックの費用は無視できるほど小さく、検証漏れの経路を一本化できる。
+//
+// 最後の砦を '.' にしないのは credentials.js と同じ理由で、こちらではさらに重い:
+// 両方の環境変数を持たない・空文字な環境で config がカレントディレクトリ配下として
+// 解決されると、ルールが 1 つも読めず、保護ツリーへの操作が黙って許可される
+// (exit 0・出力なし)。credentialsLoadError を足して塞いだはずの「保護が無言で外れる」を、
+// HOME 側から作っていた。
+const HOME = usableHome(credentials && credentials.HOME)
+  || usableHome(process.env.USERPROFILE)
+  || usableHome(process.env.HOME)
+  || usableHome(os.homedir());
+
+// 環境変数も os.homedir() も使える値を返さない、極端に壊れた環境。相対パスへ逃げると
+// 上と同じ無言 fail-open を再現するので逃げない。CONFIG はダミー値にして path.join の
+// トップレベル即死だけ避け、以降は homeUnresolved で強制的に拒否側へ倒す(loadConfig 参照)。
+const homeUnresolved = !HOME;
+const ACCOUNT_UNKNOWN = credentials ? credentials.ACCOUNT_UNKNOWN : 'unknown';
+// credentials.js が無ければ誰のログインかを知る手段が無い。ACCOUNT_UNKNOWN は判定側が
+// 拒否に倒す値なので、保護ツリーへの操作は deny され、設定漏れに気づける。
+const currentAccount = credentials ? credentials.currentAccount : () => ACCOUNT_UNKNOWN;
+
+const CONFIG = path.join(homeUnresolved ? '(home-unresolved)' : HOME, '.claude', 'account-guard', 'config.json');
 
 // 既定では何も保護しない。守るべきツリーは環境ごとに違ううえ、実在するパスを
 // 公開リポジトリに焼き込みたくないため、設定ファイルで明示させる。
 // 設定していない状態に気づけるよう `status` サブコマンドで確認できるようにしてある。
 const DEFAULT_RULES = [];
 
-// 現在ログイン中のアカウント。トークン本体には触れないし記録もしない。
-// credentials に uuid やメールアドレスのような identity フィールドは存在しないため、
-// プラン種別で代用している(2026-08 時点で実測済み)。
-function currentAccount() {
-  try {
-    const t = JSON.parse(fs.readFileSync(CREDENTIALS, 'utf8'))?.claudeAiOauth?.subscriptionType;
-    return typeof t === 'string' && t ? t : ACCOUNT_UNKNOWN;
-  } catch {
-    // 未ログイン・権限不足・将来の構造変更のいずれか。判別不能として扱う。
-    return ACCOUNT_UNKNOWN;
-  }
-}
+// 現在ログイン中のアカウントの取得(currentAccount)は credentials.js にある。
+// トークン本体には触れないし記録もしない。
 
 // パスを比較可能な形に揃える。区切りをスラッシュに統一し、ドライブ文字の大小と
 // 末尾スラッシュの差を吸収する。JSON.stringify を通した文字列ではバックスラッシュが
@@ -244,6 +319,10 @@ function targetStrings(toolName, toolInput, cwd, trees = []) {
 // 全ての保護が無言で消えていた。設定していないのは意図した状態だが、壊れているのは
 // 事故であって、素通しにしてよい理由がない。冒頭の方針どおり後者は拒否側に倒す。
 function loadConfig() {
+  // HOME を導出できていない場合、CONFIG はダミー値でしかなく、どこを読んでも意味がない。
+  // ここで確定的に broken 扱いにする(素通しにすると保護が無言で外れるのは他の broken と同じ)。
+  if (homeUnresolved) return { rules: DEFAULT_RULES, broken: true, homeUnresolved: true };
+
   let text;
   try {
     text = fs.readFileSync(CONFIG, 'utf8');
@@ -290,18 +369,63 @@ function isConfigRepair(input) {
   return Boolean(abs) && normalize(abs) === normalize(CONFIG);
 }
 
+// HOME を導出できないときの逃げ道。この状態では CONFIG がダミー値なので isConfigRepair は
+// 決して成立せず(絶対パスとダミー相対パスが一致することはない)、修復操作まで拒否されて
+// Claude Code の中から手が出せなくなる。上の isConfigRepair が無いと全停止する、というのと
+// 同じ理由で、ここにも逃げ道が要る。
+//
+// 通すのはフック登録を外す操作だけにする。HOME が不明でも `.claude/settings.json` で終わる
+// 絶対パスかどうかは文字列として判定できる。この状態では保護ツリーも特定できていない
+// (=何も保護できていない)ので、これを通すことで保護の穴が増えることはない。
+function isHookDisable(input) {
+  const tool = input.tool_name;
+  if (tool !== 'Read' && tool !== 'Edit' && tool !== 'Write') return false;
+  const target = input.tool_input?.file_path;
+  if (typeof target !== 'string' || !target) return false;
+  const abs = resolveFrom(input.cwd, target);
+  return Boolean(abs) && /[\\/]\.claude[\\/]settings(\.local)?\.json$/.test(normalize(abs));
+}
+
+// 設定が壊れていても通す逃げ道。判定は violation()(通常経路)と reportCrash()(ガード自身が
+// 例外で落ちた経路)の両方が必要とするので、ここ 1 箇所にまとめる。
+//
+// 以前は両関数がそれぞれ同じ条件を別の書き方(!isConfigRepair(...) && !(...) / isConfigRepair(...)
+// || (...))で持っていて、HOME 未解決とガード自身の異常終了が重なった場合だけドリフトが表面化した。
+// main() 側(violation)には settings.json の逃げ道があるのに reportCrash 側だけ isConfigRepair
+// しか見ておらず、その組み合わせでだけ「Claude Code の中から復旧する手段が 1 つも無い」状態が
+// 残っていた(CONFIG が HOME 未解決時のダミー相対パスになるため isConfigRepair は決して成立しない)。
+function isEscapeHatch(input, config) {
+  return isConfigRepair(input) || (config.homeUnresolved && isHookDisable(input));
+}
+
 // このツール呼び出しが保護ツリーに触れるか判定し、触れるなら拒否理由を返す。
 // 触れない、または現在のアカウントが許可されているなら null。
 function violation(input, account, config) {
   const cwd = input.cwd || process.cwd();
 
   // 設定が壊れているときは、どのツリーを守るべきかが分からない。素通しにすると
-  // 保護が丸ごと外れるので、修復操作を除いて拒否する。
-  if (config.broken && !isConfigRepair(input)) {
-    return { broken: true, tree: CONFIG, reason: '設定ファイルを読めません', allow: [] };
+  // 保護が丸ごと外れるので、修復操作を除いて拒否する。HOME 未解決もこの扱いに合流するが、
+  // そのときは CONFIG がダミー値で isConfigRepair が成立しないため、代わりに
+  // フック解除(settings.json の編集)を逃げ道にする。
+  if (config.broken && !isEscapeHatch(input, config)) {
+    return {
+      broken: true,
+      tree: CONFIG,
+      reason: config.homeUnresolved ? 'HOME を特定できません' : '設定ファイルを読めません',
+      allow: [],
+      homeUnresolved: !!config.homeUnresolved,
+    };
   }
 
   const targets = targetStrings(input.tool_name, input.tool_input, cwd, config.rules.map((r) => r.tree));
+
+  // 案内する swap は Bash 経由なので、cwd が拒否対象ツリーの内側だとその呼び出し自体が
+  // 同じ判定に当たって拒否される。当たったルールが cwd を含むとは限らない(別の保護ツリーに
+  // 居ながら、このツリーのファイルを触ることがある)ため、ヒットしたルールだけでなく
+  // 全ルールから探す。ここを「ヒットしたルール = cwd のツリー」と決め打ちしていたせいで、
+  // 保護ツリーが 2 つ以上ある構成では注記が出ず、案内どおり打つと同じ deny に戻っていた。
+  const cwdRule = config.rules.find((r) => !r.allow.includes(account) && isInsideTree(cwd, r.tree));
+  const cwdTree = cwdRule ? cwdRule.tree : null;
 
   for (const rule of config.rules) {
     if (rule.allow.includes(account)) continue;
@@ -311,6 +435,7 @@ function violation(input, account, config) {
         tree: rule.tree,
         reason: `作業ディレクトリが ${rule.tree} 配下にあります`,
         allow: rule.allow,
+        cwdTree: rule.tree,
       };
     }
     if (targets.some((s) => mentionsTree(s, rule.tree))) {
@@ -318,25 +443,289 @@ function violation(input, account, config) {
         tree: rule.tree,
         reason: `操作の対象が ${rule.tree} 配下です`,
         allow: rule.allow,
+        // cwd はこのツリーの内側ではないが、別の保護ツリーの内側かもしれない。
+        cwdTree,
       };
     }
   }
   return null;
 }
 
+// credentials ファイルが存在していても、書き込み途中の中断やディスク不足で 0 バイト・
+// 破損していることがある。existsSync は true を返すので、それだけでは「未ログイン」と
+// 区別できない。実際に読めて、かつ復元に使える中身であるかまで確認する。
+//
+// JSON.parse が通るかだけを見ていたときは、`{}` や `{"claudeAiOauth":{}}` を「正常」と
+// 分類していた。swap.js は accessToken を必須にするので、正常と見なした先で案内する
+// `swap save <name>` が必ず失敗し、退避が無ければ行き止まりになる。判定は credentials.js の
+// hasUsableCredentials に一本化し、ガードと swap で基準がずれないようにする。
+//
+// 真偽ではなく 3 つに分けるのは、「読めなかった」を「中身が使えない」と同じ扱いにすると
+// 嘘の案内になるため。ウイルス対策やバックアップツールが一時的に掴んでいるだけ、ACL が
+// 一時的に変わっているだけ、書き込みの途中を読んだだけ、のいずれでも読み取りは失敗するが、
+// ファイルの中身は健全なまま(あるいは書き終われば健全になる)。それを「失われる認証情報は
+// ない」と断言して /login を勧めると、まだ退避していないアカウントの refreshToken がそこで
+// 消える(復旧はブラウザ OAuth のやり直し)。swap.js 側は同じ状況を捨ててよいとは扱わず、
+// `.unreadable-current-N.json` に控えを取ってから進む設計になっている。
+//   'usable'     … 読めて、復元にも使える
+//   'stale'      … 読めたが復元に使えない(accessToken が無い)。ただし refreshToken は残っている
+//   'unusable'   … 読めたが復元に使えず、refreshToken も無い。失って困るものは無い
+//   'unreadable' … 読み取れなかった。中身に価値があるかは判断できない
+// stale を unusable に混ぜていた頃は、accessToken だけが欠けた状態(書き込みの途中が典型)に
+// 対して「失われる認証情報はない」と断言して /login を勧めていた。refreshToken は交換すれば
+// また使えるので、そこで消せば復旧はブラウザ OAuth のやり直しになる。
+function credentialsState() {
+  let json;
+  try {
+    json = credentials.readCredentials(credentials.CREDENTIALS).json;
+  } catch (e) {
+    // ファイルに手が届かない(権限・他プロセスのロック・EBUSY)のは、中身が健全なまま
+    // 読めないだけのことがある。「失われる認証情報はない」と断言すると、まだ退避していない
+    // アカウントに /login させて refreshToken を消す。
+    if (!(e instanceof SyntaxError)) return 'unreadable';
+    // JSON として壊れているだけを根拠に unusable(失って困るものは無い)へ倒してはいけない。
+    // Claude Code がこのファイルを書き換えている最中に読むと、切り詰められた中身が
+    // JSON.parse に失敗する一方、切れた位置より手前には refreshToken がそのまま残っている。
+    // そこで /login を勧めると、未退避アカウントの唯一のコピーを上書きさせることになる
+    // (swap.js の unreadableReason は同じ状況を「/login はまだ試さないでください」と案内
+    //  しており、生きた credentials を見るガード側だけが逆を言っていた)。
+    // 判定は credentials.js の rawHasRecoverableToken に合流させ、ここでは書き起こさない。
+    return credentials.rawHasRecoverableToken(e.raw) ? 'stale' : 'unusable';
+  }
+  try {
+    if (credentials.hasUsableCredentials(json)) return 'usable';
+    return credentials.hasRecoverableToken(json) ? 'stale' : 'unusable';
+  } catch {
+    // 形式検証をすり抜けた版の hasUsableCredentials / hasRecoverableToken が投げた場合。
+    // 中身の判断はできないので、「失って困るものは無い」側には倒さない。
+    return 'unreadable';
+  }
+}
+
+// swap は Bash 経由の呼び出しになる。cwd が保護ツリーの内側だと、案内した swap コマンドの
+// 呼び出しそのものが violation() の cwd 判定に先に当たり、同じ deny を返す堂々巡りになる
+// (/login はスラッシュコマンドでフックを通らないため影響を受けない)。cwd の内外は
+// violation() が既に判定しているので、その結果をそのまま案内に使う
+// (コマンド文字列を見て swap を特別扱いする例外は作らない。パースは容易に迂回できるため)。
+// 逃げ道として `cd` を案内しないのは、コマンド文字列の中の cd がフックの判定に効かないため。
+// violation() が見るのは PreToolUse 入力の cwd(= セッションの作業ディレクトリ)なので、
+// `cd ~ && swap team` と書いても同じ deny が返る。セッション内から抜ける手は無く、ここを
+// 「cd してから実行」と書いていた頃は、Claude が何度打ち直しても同じ拒否に当たり続けた。
+function swapCwdNote(hit) {
+  if (!hit.cwdTree) return [];
+  return [
+    '',
+    `swap は Bash 経由の呼び出しのため、作業ディレクトリが ${hit.cwdTree} 配下のままだと同じ理由で`,
+    '拒否されます。コマンドの中で `cd` しても判定は変わりません(セッションの作業ディレクトリで',
+    '判定するため)。このセッションからは実行できないので、ツリーの外で開いた別のターミナルで',
+    '打つよう、ユーザーに依頼してください。',
+  ];
+}
+
+// swap は同梱の別ツールで、swap.cmd を PATH の通った場所に置く手動セットアップが要る
+// (README 参照)。ガードだけを入れた構成では `swap` は存在せず、それでも文面が /login を
+// 抑止していると、実行できる次の一手が 1 つも残らない。ガードを外す方向の回避を誘発するので、
+// swap が無い場合の逃げ道まで書く。
+const SWAP_MISSING_NOTE = [
+  '',
+  '`swap` が見つからない場合は、まだ設置していません(account-guard/README.md のセットアップ)。',
+  'その場合は勝手に `/login` せず、ユーザーに切り替えを依頼してください',
+  '(退避していないアカウントは `/login` の時点で失われます)。',
+];
+
+// 失って困る認証情報が無い状態(未ログイン/破損)で共通に使う案内。どちらも
+// `swap save <name>` は必ず失敗し、退避が 1 つも無ければ `swap <name>` も必ず失敗するので、
+// /login を抑止したままだと打つ手が無くなる。
+//
+// swap に --force を添えるのは、この経路では現在の credentials が読めないため。swap 側は
+// 「読めない現在を退避せずに上書きしてよいか」を --force で確かめるので、付けずに案内すると
+// 必ず中止される。ここでは失って困るものが無いことをガード側で確認済みなので、承知のうえで
+// 進む形にしておく(案内どおり打って止まるのは、案内していないのと同じ)。
+function noCredentialsAtStakeMessage(head, situation, hit, needForce) {
+  const restore = needForce ? '  swap <name> --force' : '  swap <name>        ';
+  return head.concat([
+    situation,
+    'この状態で失われる認証情報はないので、次のどちらかで復帰してください。',
+    restore + ' … 退避済みのアカウントがあれば復元する(`swap` で一覧を確認できます)',
+    '  /login              … 退避が無い場合はログインし直す(消える退避はありません)',
+    ...swapCwdNote(hit),
+    ...SWAP_MISSING_NOTE,
+    '回避しようとせず、ユーザーに許可アカウントでのログインが必要であることを伝えてください。',
+  ]).join('\n');
+}
+
 function denyMessage(hit, account) {
-  if (hit.broken) return brokenConfigMessage();
+  if (hit.broken) return hit.homeUnresolved ? homeUnresolvedMessage() : brokenConfigMessage();
 
   const allowed = hit.allow.length ? hit.allow.join(' / ') : '(許可アカウントの設定なし)';
-  return [
+  const head = [
     `[account-guard] ${hit.tree} は別アカウント専用のツリーです。`,
     `${hit.reason}が、現在ログイン中のアカウントは "${account}" です(許可: ${allowed})。`,
     '',
+  ];
+
+  // 判別不能の原因が「credentials.js を隣に置き忘れた・形式が壊れている」ときは、
+  // ログインし直しても直らない。ここで /login を促すと、正しいアカウントで入っている人に
+  // 効かない操作を繰り返させる。
+  if (account === ACCOUNT_UNKNOWN && credentialsLoadError) {
+    return head.concat([
+      'アカウントを判別できません。account-guard.js の隣にある credentials.js を読み込めなかったか、',
+      `想定した形式ではありませんでした`,
+      `(${path.join(__dirname, 'credentials.js')}: ${credentialsLoadError.code || credentialsLoadError.message})。`,
+      '',
+      'ログインの問題ではないため `/login` では直りません。account-guard.js だけを別の場所へ',
+      'コピーした場合は、正しい形式の credentials.js も同じディレクトリへ置いてください。',
+      '判別できない間は保護ツリーへの操作をすべて拒否します(素通しにすると保護が無言で外れるため)。',
+      // 他の deny 経路と同じ一文をここにも置く。設置ミスだと読んだ Claude が「ガードの都合だから」と
+      // 別経路(ツリー名を書かない Bash など)で読み直すと、保護の目的そのものが崩れる。
+      '回避しようとせず、ユーザーに状況を伝えてください。',
+    ]).join('\n');
+  }
+
+  // 未ログイン(credentials がそもそも無い)なら、失って困る認証情報も存在しない。
+  // このとき swap だけを案内すると打つ手が 1 つも残らない: `swap save <name>` は
+  // 「現在 credentials がありません」で、退避が 1 つも無ければ `swap <name>` も
+  // 「退避されていません」で、どちらも必ず失敗する。/login を抑止したまま行き止まりになる。
+  // ここも account では門番しない(下の state と同じ理由)。打つ手を決めるのは
+  // 「失って困る認証情報が現にあるか」で、ファイルが無ければアカウントの判別結果によらない。
+  // 「無い」ときだけ未ログインと断じる。existsSync は権限やロックで stat が失敗しても false を
+  // 返すため、読めないだけで中身は生きている credentials を「ログインしていません」と判定し、
+  // /login を抑止しないまま案内していた。案内どおり /login すれば、まだ退避していない
+  // アカウントの refreshToken はその時点で消える。判定は swap 側と同じ probeFile に合流させる。
+  const loggedOut = !!credentials && !credentials.probeFile(credentials.CREDENTIALS).exists;
+  if (loggedOut) {
+    // ファイルが無い場合、swap は「現在なし」として素直に復元へ進むので --force は要らない。
+    return noCredentialsAtStakeMessage(head, 'ログインしていません(認証情報のファイルがありません)。', hit, false);
+  }
+
+  // ファイルはあるが中身を確かめられた結果 accessToken が無い。存在の有無だけでは上の
+  // loggedOut と区別できず、下の「切り替え手順」に落ちて swap save を勧めてしまうが、それは
+  // 「現在の credentials を読めません」で必ず失敗し、退避も無ければ行き止まりになる。
+  // ここで残っているファイルの中身はもう使えないので、失って困るものは無い。
+  // swap 側は「読めない現在」を上書きする前に --force を要求するため、それも添える。
+  //
+  // 「読めなかった」をこちらに混ぜないのが要点(credentialsState のコメント)。読めない
+  // だけで中身が健全な場合まで「失われる認証情報はない」と断言すると、まだ退避していない
+  // アカウントに /login させて refreshToken を消すことになる。
+  //
+  // 判定を account === ACCOUNT_UNKNOWN で門番しないのは、subscriptionType だけ読めて
+  // accessToken が無い中身(書き込み途中が典型)では account が "pro" などに判別でき、
+  // 門番があると下の汎用文へ落ちるため。汎用文が案内する swap save / swap は swap 側の
+  // hasUsableCredentials に弾かれて必ず止まり、ガードと swap で基準がずれた袋小路に戻る。
+  // 打つ手を決めるのは「中身が使えるか」であって「どのアカウントか」ではない。
+  const state = !loggedOut && !!credentials && credentials.probeFile(credentials.CREDENTIALS).exists
+    ? credentialsState()
+    : null;
+  if (state === 'unusable') {
+    return noCredentialsAtStakeMessage(
+      head, '認証情報のファイルはありますが、復元に使える中身ではありません(accessToken がありません)。', hit, true
+    );
+  }
+
+  // 読めたが accessToken が無く、refreshToken だけが残っている。復元には使えないので
+  // swap の hasUsableCredentials は false になるが、refreshToken は交換すればまた使えるため、
+  // 「失われる認証情報はない」とは言えない(unusable と同じ扱いにしていた頃は、この状態で
+  // /login を勧めていた)。swap 側はこの中身も「読めない現在」として控えを取ってから進むので、
+  // どちらの手にも --force が要る(付けずに案内すると必ず中止される)。
+  if (state === 'stale') {
+    return head.concat([
+      // 「読めますが」と断定しない。この分岐には、accessToken だけが欠けた健全な JSON と、
+      // 書き込みの途中で切り詰められて JSON としては壊れている中身の両方が来る(後者を
+      // unusable に落として /login を勧めていたのが、資格情報を失う経路だった)。
+      // 同じ理由でトークンの名前も挙げない。前者は refreshToken が残っていると確定できるが、
+      // 後者について分かっているのは rawHasRecoverableToken がバイト列から refreshToken か
+      // accessToken のどちらかを見つけたことまでで、どちらだったかは確かめていない。
+      // accessToken だけが残った控えに「refreshToken は残っています」と言うと、存在しない
+      // 復旧手段を探させることになる(勧める手 ―― 控えを残す・先に /login しない ―― は
+      // どちらでも同じなので、名前を落としても案内の実効は変わらない)。
+      '認証情報のファイルはありますが、復元に使える中身として読み取れませんでした。',
+      'ただし交換すればまた使えるトークンが残っています。先に `/login` すると、',
+      'まだ退避していないアカウントはその時点で失われます(復旧はブラウザ OAuth のやり直しです)。',
+      '',
+      '退避済みの別アカウントへ切り替えるか、先に現在の中身の控えを残してください。',
+      '  swap save <name> --force … 現在の中身の控えを残したうえで退避を試みる',
+      '  swap <name> --force      … 退避済みの別アカウントへ切り替える(`swap` で一覧を確認できます)',
+      ...swapCwdNote(hit),
+      ...SWAP_MISSING_NOTE,
+      '回避しようとせず、ユーザーにアカウントの切り替えが必要であることを伝えてください。',
+    ]).join('\n');
+  }
+
+  // 読み取り自体に失敗した。中身が健全なまま手が届かないだけかもしれないので、
+  // 「失うものは無い」とは言わない。/login を最後の手段として残しつつ、まず控えを
+  // 取れる swap を先に案内する(swap 側は読めない現在も .replaced へ控えてから進む)。
+  if (state === 'unreadable') {
+    return head.concat([
+      '認証情報のファイルを読み取れませんでした(権限・他プロセスによるロック・書き込みの途中など)。',
+      '中身が健全なまま読めないだけの可能性があるため、失われるものが無いとは判断できません。',
+      '',
+      'まず、このファイルを掴んでいるプロセス(ウイルス対策・バックアップツール・稼働中の',
+      '別セッション)を終えてから、もう一度実行してください。それで読めるようになることがあります。',
+      '読めないままでも切り替えるなら、次の順で打ってください。',
+      '  swap save <name> --force … 読めない現在の控えを残したうえで退避を試みる',
+      // 2 手目にも --force が要る。控えを取っても CREDENTIALS 自体は読めないままなので、
+      // 付けずに案内すると swap 側の同じ判定で必ず中止され、案内どおり打つと止まる。
+      '  swap <name> --force      … 退避済みの別アカウントへ切り替える(`swap` で一覧を確認できます)',
+      // 控えは copyFileSync で取るので、ファイルに手が届かない種類の「読めない」では
+      // どちらの手も「控えを取れませんでした」で止まる。swap は控えを取れない限り上書き
+      // しない設計なので、その場合は swap で進む道が無い。手で控えを取る逃げ道まで書く。
+      'どちらも「控えを取れませんでした」で止まるなら、ファイルに手が届いていません',
+      '(権限・読み取り専用属性・掴んだままのプロセス)。この場合 swap では進めないので、',
+      `${credentials ? credentials.CREDENTIALS : '認証情報のファイル'} を手で別名コピーして`,
+      '控えを取ってから、ユーザーに `/login` を依頼してください。',
+      '先に `/login` すると、まだ退避していないアカウントの認証情報はその時点で消えます',
+      '(このファイルが健全だった場合、復旧はブラウザ OAuth のやり直しになります)。',
+      ...swapCwdNote(hit),
+      ...SWAP_MISSING_NOTE,
+      '回避しようとせず、ユーザーにアカウントの切り替えが必要であることを伝えてください。',
+    ]).join('\n');
+  }
+
+  return head.concat([
     account === ACCOUNT_UNKNOWN
-      ? 'アカウントを判別できませんでした。未ログインか、認証情報の形式が変わった可能性があります。'
+      ? 'アカウントを判別できませんでした。認証情報の形式が変わったか、読み取れない状態です。'
       : 'このツリーのコードを現在のアカウントに読み込ませないため、操作を拒否しました。',
-    '`/login` で正しいアカウントに切り替えてから操作してください。回避しようとせず、',
-    'ユーザーにアカウントの切り替えが必要であることを伝えてください。',
+    // 先に `/login` させない。/login は credentials を上書きするので、まだ swap で退避して
+    // いないアカウントはその場で失われ、復旧はブラウザ OAuth のやり直しになる
+    // (account-guard/README.md の「拒否されたときの挙動」と同じ順序をここでも案内する)。
+    // 未ログイン・破損で swap が効かない場合は上の分岐が /login を案内するので、ここは
+    // 行き止まりにならない(この経路には失って困る認証情報が現に存在する)。
+    'アカウントを切り替えてから操作してください。手順は次のとおりです。',
+    '  swap save <name>   … 現在のアカウントを先に退避する(まだ退避していない場合)',
+    '  swap <name>        … 退避済みの別アカウントへ切り替える',
+    '先に `/login` すると、まだ退避していないアカウントの認証情報はその時点で消えます。',
+    // 切り替え先をまだ一度も退避していないと、上の 2 手だけでは `swap <name>` が
+    // 「退避されていません」で止まり、そこから先へ進む道が文面のどこにも無くなる
+    // (直前で /login を否定しているため、案内だけを頼りに動くと堂々巡りになる)。
+    // /login 自体は禁止ではなく「退避より先に打つと失う」という順序の問題なので、
+    // 安全な順序(退避 → /login → 退避)を README の初回手順どおりに書いておく。
+    '切り替え先のアカウントをまだ一度も退避していない場合は、この順で進めてください。',
+    '  1. swap save <name>      … いまのアカウントを退避する(ここまで済めば失うものはありません)',
+    '  2. /login                … 切り替え先のアカウントでログインし直す',
+    '  3. swap save <別名>      … 切り替え先も退避する(以後は swap <name> だけで往復できます)',
+    ...swapCwdNote(hit),
+    ...SWAP_MISSING_NOTE,
+    '回避しようとせず、ユーザーにアカウントの切り替えが必要であることを伝えてください。',
+  ]).join('\n');
+}
+
+function homeUnresolvedMessage() {
+  return [
+    '[account-guard] ホームディレクトリを特定できないため、操作を拒否しました。',
+    'USERPROFILE / HOME のいずれも使える値を持たず、os.homedir() も空文字を返しています。',
+    'この状態では設定ファイルの場所も特定できず、どのツリーを保護すべきか判断できません。',
+    '',
+    '素通しにすると保護が無言で外れるため、安全側に倒しています。',
+    'USERPROFILE または HOME 環境変数に実在するホームディレクトリを設定してから、',
+    'もう一度実行してください。',
+    '',
+    // 逃げ道を文面にも書く。書かないと「全部拒否された」だけが伝わり、Claude Code の外へ
+    // 出るしかないと判断されてしまう(設定の場所が特定できない以上、通常の修復経路である
+    // config.json の編集はここでは成立しない)。
+    'この状態でも `.claude/settings.json` の読み書きだけは許可しています。環境変数を直せない',
+    '場合は、そこから account-guard のフック登録を外せば、ひとまず作業を続けられます',
+    '(保護は外れるので、直したあとに戻してください)。',
+    '回避しようとせず、ユーザーに状況を伝えてください。',
   ].join('\n');
 }
 
@@ -376,7 +765,51 @@ function main() {
   // 手元での確認用。フックからは呼ばれない。
   if (mode === 'status') {
     console.log(`アカウント: ${account}`);
-    console.log(`設定: ${CONFIG}${fs.existsSync(CONFIG) ? '' : ' (未作成 — 保護は無効)'}`);
+    // 判別不能の原因が credentials.js の置き忘れなら、ここで言わないと未ログインと区別が
+    // 付かない。deny メッセージ側でわざわざ塞いだ袋小路(/login を繰り返しても直らない)を、
+    // 確認用の入り口で踏ませないため。
+    if (credentialsLoadError && credentialsLoadError.code === 'HOME_UNRESOLVED') {
+      // credentials.js は読めている(=置き場所は合っている)。原因は環境変数なので、
+      // 下の「隣に置いてください」を出すと、既に隣にある正しいファイルをコピーし直せと
+      // 効かない指示を繰り返させることになる。swap.js が同じ例外を特別扱いしているのと
+      // 同じ理由で、ここでも分ける(案内する対処も homeUnresolvedMessage() に合わせる)。
+      console.log('  ホームディレクトリを特定できません'
+        + ' (USERPROFILE / HOME / os.homedir() のいずれも使える値を返していません)');
+      console.log('  credentials.js の置き場所は正しいので、コピーし直しても直りません。');
+      console.log('  USERPROFILE または HOME に実在するホームディレクトリを設定してください。');
+    } else if (credentialsLoadError) {
+      console.log(`  credentials.js を読み込めません (${path.join(__dirname, 'credentials.js')}: `
+        + `${credentialsLoadError.code || credentialsLoadError.message})`);
+      console.log('  未ログインではなく、判別する手段が無い状態です。`/login` では直りません。');
+      console.log('  account-guard.js の隣に credentials.js を置いてください。');
+    }
+    // HOME が解決できないときの CONFIG はダミーの相対パスで、実在しない。共通の書式に
+    // 任せると「未作成 — 保護は無効」と出るが、実態は逆でこの状態は全操作を拒否している。
+    // しかも「設定ファイル自身の編集以外は拒否」と案内しても、実在しないパスでは
+    // isConfigRepair が成立しないので、そのファイルを直しても何も通らない。status は
+    // 「全部拒否される」原因を調べに来る入り口なので、ここで行き止まりに入れてしまうと、
+    // ガードを外す方向の回避しか残らない。逃げ道は homeUnresolvedMessage() と揃える。
+    if (config.homeUnresolved) {
+      console.log('設定: ホームディレクトリを特定できないため、場所を決められません');
+      console.log('  (USERPROFILE / HOME / os.homedir() のいずれも使える値を返していません)');
+      console.log('保護は無効ではありません — この状態ではすべての操作を拒否しています(安全側)。');
+      console.log('  USERPROFILE または HOME に実在するホームディレクトリを設定すれば直ります。');
+      console.log('  直せない場合は .claude/settings.json から account-guard のフック登録を'
+        + '外してください(保護は外れるので、直したあとに戻してください)。');
+      return;
+    }
+    // 「未作成 — 保護は無効」と言い切れるのは、設定が本当に無いときだけ。existsSync は
+    // 読めないだけの設定も false にするので、broken(修復するまで全拒否 = 保護は最も強く
+    // 効いている)状態に対して「保護は無効」と正反対の表示を出していた。判定は probeFile に
+    // 合流させ、broken が分かっているときはそちらの表示に任せる(すぐ下で出す)。
+    // credentials.js を読み込めなかった構成では probeFile が使えない。そこで判定ごと諦めると、
+    // 設定が本当に無くても「未作成 — 保護は無効」が出なくなる。status は「なぜ拒否される/
+    // されない」を調べに来る入り口なので、精度は落ちても存在の有無だけは伝える
+    // (existsSync は読めないだけの設定も false にするが、その場合は config.broken 側の
+    // 表示がすぐ下で出るため、ここで取り違えたまま終わることはない)。
+    const configExists = credentials ? credentials.probeFile(CONFIG).exists : fs.existsSync(CONFIG);
+    const configMissing = !config.broken && !configExists;
+    console.log(`設定: ${CONFIG}${configMissing ? ' (未作成 — 保護は無効)' : ''}`);
     if (config.broken) {
       console.log('設定を読めません — 修復するまで、設定ファイル自身の編集以外は拒否します。');
       return;
@@ -449,21 +882,34 @@ function reportCrash(e) {
   const cwd = input.cwd || process.cwd();
 
   // 設定が壊れているなら、この経路でも main と同じく拒否側に倒す(修復操作だけは通す)。
+  // 逃げ道の判定は isEscapeHatch に集約してあり、main(violation)と揃う(過去にここだけ
+  // isConfigRepair しか見ずにドリフトした経緯は isEscapeHatch のコメント参照)。
   // 保護ルール未設定なら find が何も返さず、何も拒否しない。
+  const repairable = isEscapeHatch(input, config);
   const hit = config.broken
-    ? isConfigRepair(input)
+    ? repairable
       ? null
-      : { tree: CONFIG, broken: true }
+      : { tree: CONFIG, broken: true, homeUnresolved: !!config.homeUnresolved }
     : config.rules.find((r) => !r.allow.includes(account) && isInsideTree(cwd, r.tree));
   if (!hit) return;
 
   const detail = [
     `[account-guard] ガードが異常終了しました(原因: ${e && e.message})。`,
+    // HOME 未解決のときの CONFIG はダミー値なので、そのパスを「読めない設定ファイル」として
+    // 出すと存在しない場所を直しに行かせることになる。原因も逃げ道も違うので文面を分ける。
     hit.broken
-      ? `設定ファイル ${CONFIG} も読めないため、安全側に倒します。`
+      ? hit.homeUnresolved
+        ? 'ホームディレクトリを特定できず、設定ファイルの場所も決められないため、安全側に倒します。'
+        : `設定ファイル ${CONFIG} も読めないため、安全側に倒します。`
       : `作業ディレクトリが ${hit.tree} 配下にあるため、安全側に倒します。`,
     '',
     'ガード自体の不具合の可能性があります。保護ツリーの外での作業は影響を受けません。',
+    ...(hit.homeUnresolved
+      // 逃げ道は文面にも書く。書かないと「全部拒否された」だけが伝わり、Claude Code の
+      // 外へ出るしかないと判断される(homeUnresolvedMessage() と同じ理由)。
+      ? ['この状態でも `.claude/settings.json` の読み書きだけは許可しています。'
+        + '環境変数(USERPROFILE / HOME)を直せない場合は、そこからフック登録を外してください。']
+      : []),
     'ガードを戻すには Claude Code の外から:',
     '  git checkout -- account-guard/account-guard.js',
   ].join('\n');

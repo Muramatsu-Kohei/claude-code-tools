@@ -10,27 +10,37 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { makeHarness } = require('./harness');
 
-const BASE = path.join(__dirname, '.tmp');
+// .tmp 直下ではなく自分専用のサブディレクトリを使う。以前は .tmp 全体を消していたため、
+// swap.test.js のサンドボックス(.tmp/swap)まで巻き添えで消えた。2 つのスイートを同時に
+// 走らせると、片方が他方の HOME を実行中に削除して ENOENT の偽陽性が出る。
+const BASE = path.join(__dirname, '.tmp', 'guard');
 const GUARD = path.join(__dirname, '..', 'account-guard.js');
 fs.rmSync(BASE, { recursive: true, force: true });
 
-const state = { pass: 0, fail: 0 };
-// extra は失敗時の手掛かり。落ちた行だけでは原因が分からないことが多いので実出力を添える
-function check(label, cond, extra) {
-  if (cond) state.pass++; else state.fail++;
-  const tail = extra && !cond ? `\n      ${String(extra).replace(/\n/g, '\n      ')}` : '';
-  console.log(`  ${cond ? 'PASS' : 'FAIL'} ${label}${tail}`);
-}
+// state カウンタと check()・最後の集計は swap.test.js と共通なので harness.js に
+// 切り出してある(詳しい経緯はそちらのコメント参照)。
+const { check, report } = makeHarness();
 
-// subscriptionType だけを持つ最小の credentials を置く。raw / rawRules に文字列を渡すと
+// 正常にログインしている状態の credentials を置く。raw / rawRules に文字列を渡すと
 // 壊れたファイルを再現でき、「読めないときに拒否側へ倒れるか」を試せる。
+//
+// accessToken まで入れるのは、これが「正常なログイン」を代表するサンドボックスだから。
+// subscriptionType だけを書いていた頃は、判別はできるのに復元には使えない中身という
+// 実運用では起きにくい状態を全テストの既定にしていた。ガードが健全性を見るようになると
+// この既定が「失うものは無い」側の分岐へ落ち、通常の切り替え案内を検証しているつもりの
+// テストが別の文面を見ることになる。accessToken を欠く状態は raw で明示的に作る。
 function sandbox(name, { subscriptionType, rules, raw, rawRules } = {}) {
   const home = path.join(BASE, name);
   fs.mkdirSync(path.join(home, '.claude', 'account-guard'), { recursive: true });
   const cred = path.join(home, '.claude', '.credentials.json');
   if (raw !== undefined) fs.writeFileSync(cred, raw, 'utf8');
-  else if (subscriptionType) fs.writeFileSync(cred, JSON.stringify({ claudeAiOauth: { subscriptionType } }), 'utf8');
+  else if (subscriptionType) {
+    fs.writeFileSync(cred, JSON.stringify({
+      claudeAiOauth: { subscriptionType, accessToken: 'test-access-token' },
+    }), 'utf8');
+  }
   if (rawRules !== undefined) fs.writeFileSync(configPath(home), rawRules, 'utf8');
   else if (rules) fs.writeFileSync(configPath(home), JSON.stringify({ rules }), 'utf8');
   return home;
@@ -38,14 +48,35 @@ function sandbox(name, { subscriptionType, rules, raw, rawRules } = {}) {
 
 const configPath = (home) => path.join(home, '.claude', 'account-guard', 'config.json');
 
+// child_process 起動の共通下地。account-guard.js 本体を叩く経路(run())だけでなく、
+// 異常系を再現するための別スクリプト(CRASH / ALONE / BADSHAPE_GUARD / NOREAD_GUARD /
+// HOME 導出を壊す RUNNER 系)を起動するテストが多数あり、以前はそれぞれが execFileSync の
+// 呼び出しをコピーしていた。cwd の有無・env の作り方・追加の argv・stdin の有無だけが
+// 違う同じ形なので起動処理はここに一本化する。timeout を足す・空出力の扱いを変える、
+// といった変更を全経路に効かせたいときはここ 1 箇所を直せばよい。
+function execGuardScript(scriptPath, { argv = [], env, cwd, input } = {}) {
+  const opts = { env, encoding: 'utf8' };
+  if (cwd !== undefined) opts.cwd = cwd;
+  if (input !== undefined) opts.input = JSON.stringify(input);
+  return execFileSync(process.execPath, [scriptPath, ...argv], opts);
+}
+
+// execGuardScript の生の stdout を、フックの JSON 出力として解釈する。空出力は
+// 「通常フローに委ねる(何も拒否しない)」を表す null として扱う。
+function toResult(out) {
+  return out.trim() ? JSON.parse(out) : null;
+}
+
+// USERPROFILE/HOME を home に差し替えた環境変数の組み立て。ほとんどの呼び出しがこの形を
+// 必要とするのでここに寄せる(NO_COLOR は ANSI エスケープが reason の正規表現照合を
+// 壊すのを防ぐため)。HOME 導出そのものを壊すテストは homeEnv を使わず env を個別に組む。
+function homeEnv(home) {
+  return { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+}
+
 // フックとして呼び出し、stdout の JSON を返す。出力なし(= 通常フローに委ねる)は null。
 function run(home, input, argv = []) {
-  const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
-  const out = execFileSync(process.execPath, [GUARD, ...argv], {
-    env, input: JSON.stringify(input), encoding: 'utf8',
-  });
-  if (!out.trim()) return null;
-  return JSON.parse(out);
+  return toResult(execGuardScript(GUARD, { argv, env: homeEnv(home), input }));
 }
 
 const decision = (res) => res?.hookSpecificOutput?.permissionDecision ?? null;
@@ -59,6 +90,14 @@ console.log('account-guard');
   const res = run(home, { hook_event_name: 'PreToolUse', cwd: 'C:\\org-tree\\proj', tool_name: 'Read', tool_input: { file_path: 'src/main.py' } });
   check('保護ツリー内の cwd は拒否する', decision(res) === 'deny', JSON.stringify(res));
   check('拒否理由にツリー名が入る', /org-tree/.test(res?.hookSpecificOutput?.permissionDecisionReason || ''), JSON.stringify(res));
+  // 拒否の文面は実際に安全な手順を出すこと。先に `/login` させると、まだ swap で退避して
+  // いないアカウントの認証情報はその場で消え、復旧はブラウザ OAuth のやり直しになる
+  // (README の「拒否されたときの挙動」と同じ順序を、利用者が実際に読むこの文面でも守る)。
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('切り替えは退避してからだと案内する',
+    /swap save/.test(reason) && /先に `\/login` すると/.test(reason), reason);
+  check('/login を最初の一手として案内しない',
+    !/^`?\/login`? で正しいアカウントに切り替えて/m.test(reason), reason);
 }
 {
   const home = sandbox('deny-arg', { subscriptionType: 'pro', rules: ORG });
@@ -75,6 +114,141 @@ console.log('account-guard');
   const home = sandbox('deny-unknown', { raw: '{ broken', rules: ORG });
   const res = run(home, { hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read', tool_input: {} });
   check('アカウントを判別できないときは拒否側に倒す', decision(res) === 'deny', JSON.stringify(res));
+}
+{
+  // credentials ファイルそのものが無い(未ログイン)。JSON が壊れている deny-unknown とは
+  // 別経路だが、どちらもアカウントは判別不能(unknown)になる。denyMessage() はこの経路
+  // でだけ /login を案内してよい: `swap save <name>` は credentials が無ければ必ず失敗し、
+  // 退避が1つも無ければ `swap <name>` も必ず失敗するため、/login を抑止すると打つ手が
+  // 1つも残らない行き止まりになっていた(失って困る認証情報が無いので /login は安全)。
+  const home = sandbox('deny-loggedout', { rules: ORG });
+  const res = run(home, { hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read', tool_input: {} });
+  check('未ログインでも保護ツリーは拒否する', decision(res) === 'deny', JSON.stringify(res));
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  // 他の deny 経路にも「先に `/login` すると…消えます」という抑止の一文があるため、
+  // それと区別できる形(バッククォート無しで箇条書きの案内として出ている行)を見る。
+  check('未ログインなら /login を案内する(swap はどちらも失敗するため)',
+    /^\s*\/login\s+…/m.test(reason), reason);
+  check('/login で失うものが無いことも伝える', /消える退避はありません/.test(reason), reason);
+}
+{
+  // credentials ファイルはある(existsSync は true)が、0バイト・破損で読めない。
+  // 以前は existsSync だけで「未ログイン」を判定していたため、この状態は判別できず、
+  // 現在ログインが生きている前提の「切り替え手順」に落ちていた。しかし swap save は
+  // 「現在の credentials を読めません」で必ず失敗し、退避が1つも無ければ swap <name> も
+  // 必ず失敗するため、/login を抑止したまま行き止まりになる(失って困る認証情報は
+  // ファイルが既に壊れている時点で存在しないので、/login は安全)。
+  const home = sandbox('deny-corrupted', { rules: ORG });
+  // sandbox() は subscriptionType / raw のどちらも指定しないと credentials ファイル自体を
+  // 作らない(= 未ログイン扱いになる)ので、ここで直接、壊れた(空の)ファイルを置く。
+  fs.writeFileSync(path.join(home, '.claude', '.credentials.json'), '', 'utf8');
+
+  const res = run(home, { hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read', tool_input: {} });
+  check('credentials が壊れていても保護ツリーは拒否する', decision(res) === 'deny', JSON.stringify(res));
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('拒否理由が復元に使えない状態であることを言う(無言で終わっていない)',
+    /復元に使える中身ではありません/.test(reason), reason);
+  check('実際に打てる次の一手(swap / /login)を案内する',
+    /swap\s+<name>/.test(reason) && /^\s*\/login\s+…/m.test(reason), reason);
+  // swap 側は「読めない現在」を上書きする前に --force を要求する。付けずに案内すると
+  // 案内どおり打っても必ず中止され、行き止まりになる(ツール間の受け渡しで切れていた)。
+  check('復元の案内に --force が付いている(swap 側の要求と噛み合う)',
+    /swap\s+<name>\s+--force/.test(reason), reason);
+  check('現在のログインが生きている前提の警告(先に /login すると…消えます)は出さない',
+    !/先に `\/login` すると/.test(reason), reason);
+}
+{
+  // deny メッセージは次の一手として `swap save <name>` / `swap <name>` を案内するが、
+  // これは Bash ツール呼び出しになる。cwd が保護ツリー内なら violation() の cwd 判定が
+  // 先に当たるため、案内どおりに打つと同じコマンドがまた同じ理由で deny され、
+  // 同じ案内を繰り返す堂々巡りになっていた(コマンド文字列をパースして swap を特別扱いする
+  // 例外は作らず、案内文でセッション外から実行することを明示する方針で直す)。
+  const home = sandbox('deny-cwd-loop', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read', tool_input: { file_path: 'src/main.py' },
+  });
+  check('cwd が保護ツリー内なら拒否する(堂々巡りテストの前提)', decision(res) === 'deny', JSON.stringify(res));
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('swap は別のターミナルで実行するよう案内する(堂々巡りにしない)',
+    /別のターミナル/.test(reason), reason);
+  // 「ツリーの外に cd してから実行」と書いていた頃は、そのとおり打っても堂々巡りが続いた。
+  // 判定に使う cwd は PreToolUse 入力(= セッションの作業ディレクトリ)なので、コマンド内の
+  // cd は届かない。効かない手を勧めないことまで含めて回帰対象にする。
+  check('cd では抜けられないことまで書く', /`cd` しても判定は変わりません/.test(reason), reason);
+}
+{
+  // 対照: cwd がツリーの外で、引数のパスだけがツリー内を指す場合は、案内した swap は
+  // 同じ cwd からそのまま実行できる。誤って毎回この注意書きを出すと、本当に効く手順が
+  // 埋もれるので、この場合は出ないことも確かめる。
+  const home = sandbox('deny-arg-noloop', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Read',
+    tool_input: { file_path: 'C:/org-tree/proj/secret.py' },
+  });
+  check('cwd がツリー外なら拒否する(対照テストの前提)', decision(res) === 'deny', JSON.stringify(res));
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('cwd がツリー外なら swap の cwd 注意書きは出さない',
+    !/別のターミナル/.test(reason) && !/配下のままだと/.test(reason), reason);
+  // swap は同梱の別ツールで、PATH に置く手動セットアップが要る。ガードだけを入れた構成では
+  // 案内どおり打っても「'swap' は認識されていません」で終わり、文面は /login を抑止して
+  // いるので実行できる手が 1 つも残らない。逃げ道まで書いてあることを確かめる。
+  check('swap が未設置の場合の逃げ道まで案内する', /`swap` が見つからない場合/.test(reason), reason);
+}
+{
+  // cwd が「当たったルールとは別の」保護ツリーの内側にいる場合。ヒットしたルールだけを見て
+  // cd 注記の要否を決めていたため、保護ツリーが 2 つ以上ある構成では注記が出ず、案内どおり
+  // 打った swap が今度は cwd 側のルールに当たって同じ deny に戻る堂々巡りになっていた。
+  const TWO = [{ tree: 'C:/org-tree', allow: ['team'] }, { tree: 'D:/org-tree', allow: ['team'] }];
+  const home = sandbox('deny-cross-tree', { subscriptionType: 'pro', rules: TWO });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'D:/org-tree/work', tool_name: 'Read',
+    tool_input: { file_path: 'C:/org-tree/proj/secret.py' },
+  });
+  check('別ツリーの対象を触っても拒否する(前提)', decision(res) === 'deny', JSON.stringify(res));
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('cwd が別の保護ツリー内なら cwd 注記を出す', /別のターミナル/.test(reason), reason);
+  // 注記が指すのは「今いるツリー」であって、当たったルールのツリーではない。取り違えると
+  // どのツリーから出れば実行できるのかが伝わらない。
+  check('cwd 注記は cwd 側のツリーを指す', /D:[\\/]org-tree 配下のままだと/.test(reason), reason);
+}
+{
+  // JSON としては妥当だが accessToken を欠く credentials。ガードが JSON.parse の成否だけを
+  // 見ていたときは「正常」に分類され、現在のログインが生きている前提の切り替え手順に落ちて
+  // いた。しかし swap 側は accessToken を必須にするので、案内した swap save は必ず失敗し、
+  // 退避が無ければ行き止まりになる。判定は credentials.js の hasUsableCredentials に一本化した。
+  const home = sandbox('deny-no-accesstoken', { rules: ORG });
+  fs.writeFileSync(path.join(home, '.claude', '.credentials.json'), '{"claudeAiOauth":{}}', 'utf8');
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read', tool_input: {},
+  });
+  check('accessToken を欠く credentials でも拒否する', decision(res) === 'deny', JSON.stringify(res));
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('accessToken 欠落は「復元に使えない」側に分類する',
+    /復元に使える中身ではありません/.test(reason), reason);
+  check('accessToken 欠落でも /login を案内する(行き止まりにしない)',
+    /^\s*\/login\s+…/m.test(reason), reason);
+  check('accessToken 欠落では現在が生きている前提の警告を出さない',
+    !/先に `\/login` すると/.test(reason), reason);
+}
+{
+  // アカウントは判別できる(subscriptionType が読める)が accessToken を欠く credentials。
+  // 以前はアカウントを判別できる場合だけ健全性判定を素通りして汎用文に落ちており、案内された
+  // swap save / swap は swap 側の accessToken 必須判定に弾かれて必ず失敗していた
+  // (denyMessage の state 判定は account では門番しない、というコメントの回帰確認)。
+  const home = sandbox('deny-accesstoken-known-account', { rules: ORG });
+  fs.writeFileSync(path.join(home, '.claude', '.credentials.json'),
+    '{"claudeAiOauth":{"subscriptionType":"pro"}}', 'utf8');
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read', tool_input: {},
+  });
+  check('アカウントを判別できても accessToken 欠落は拒否する', decision(res) === 'deny', JSON.stringify(res));
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('アカウントが判別できる場合も健全性判定を素通りしない(汎用文に落ちない)',
+    /現在ログイン中のアカウントは "pro"/.test(reason), reason);
+  check('この状態で失われる認証情報はないと伝える(通常の切り替え手順ではない)',
+    /失われる認証情報はない/.test(reason), reason);
+  check('案内する復元コマンドに --force が付いている(swap 側の accessToken 必須判定と噛み合う)',
+    /swap <name> --force/.test(reason), reason);
 }
 {
   // allow を書き損じたルールで保護が外れないこと。
@@ -539,18 +713,17 @@ console.log('account-guard');
 {
   fs.mkdirSync(BASE, { recursive: true });
   const CRASH = path.join(BASE, 'ag-crash.js');
+  // ガード本体は同じディレクトリの credentials.js を require する。コピー先は .tmp なので
+  // 相対参照のままでは解決できない。実体を指す絶対パスへ書き換えてから落とす
+  const credModule = JSON.stringify(path.join(__dirname, '..', 'credentials.js'));
   fs.writeFileSync(
     CRASH,
-    fs.readFileSync(GUARD, 'utf8').replace('function main() {', "function main() {\n  throw new Error('boom');"),
+    fs.readFileSync(GUARD, 'utf8')
+      .replace("require('./credentials')", `require(${credModule})`)
+      .replace('function main() {', "function main() {\n  throw new Error('boom');"),
     'utf8'
   );
-  const runCrash = (home, input) => {
-    const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
-    const out = execFileSync(process.execPath, [CRASH], {
-      env, input: JSON.stringify(input), encoding: 'utf8',
-    });
-    return out.trim() ? JSON.parse(out) : null;
-  };
+  const runCrash = (home, input) => toResult(execGuardScript(CRASH, { env: homeEnv(home), input }));
 
   const home = sandbox('crash', { subscriptionType: 'pro', rules: ORG });
   let res = runCrash(home, {
@@ -578,5 +751,469 @@ console.log('account-guard');
   check('保護ルール未設定なら異常終了でも何も拒否しない', res === null, JSON.stringify(res));
 }
 
-console.log(`\n  ${state.pass} passed, ${state.fail} failed`);
-process.exit(state.fail ? 1 : 0);
+// --- credentials.js を隣に置き忘れた構成 ---
+// インストール手順は account-guard.js の置き場所しか案内していないので、1 ファイルだけ
+// コピーする使い方が実際に起こりうる。require をトップレベルで素通しにすると、そこで
+// MODULE_NOT_FOUND が投げられて末尾の catch(異常終了を受け止める仕組み)より先に
+// プロセスが死ぬ。標準出力に何も出ないまま exit 1 で終わるため、Claude Code はブロックせず
+// 処理を続け、保護が丸ごと外れたことに誰も気づけない。判別不能として拒否側に倒すこと。
+{
+  const ALONE = path.join(BASE, 'alone-guard', 'account-guard.js');
+  fs.mkdirSync(path.dirname(ALONE), { recursive: true });
+  fs.copyFileSync(GUARD, ALONE); // credentials.js は意図的に置かない
+
+  const runAlone = (home, input) => toResult(execGuardScript(ALONE, { env: homeEnv(home), input }));
+
+  // 許可されたアカウント(team)で入っている。credentials.js があれば通る操作なので、
+  // ここで deny が出れば「読めないから拒否側に倒した」ことがはっきりする。
+  const home = sandbox('alone-home', { subscriptionType: 'team', rules: ORG });
+  let res = runAlone(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read',
+    tool_input: { file_path: 'a.py' },
+  });
+  check('credentials.js が無くても保護ツリーは拒否する', decision(res) === 'deny', JSON.stringify(res));
+  // 真因は隣のファイルなのに /login を促すと、正しいアカウントで入っている人が
+  // 何度ログインし直しても直らない袋小路に入る。拒否の文面が真因を指すこと。
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('拒否理由が真因(credentials.js が読めない)を指す',
+    /credentials\.js/.test(reason), reason);
+  check('効かない対処(/login)を唯一の次の一手として案内しない',
+    /`\/login` では直りません/.test(reason), reason);
+  // 他の deny 経路にはある一文。設置ミスだと読んだ Claude が「ガードの都合だから」と
+  // 別経路(ツリー名を書かない Bash など)で読み直すと、保護の目的そのものが崩れる。
+  check('この経路でも迂回禁止とユーザーへの報告を指示する',
+    /回避しようとせず/.test(reason) && /ユーザー/.test(reason), reason);
+
+  // 確認用の入り口(status)でも真因を出す。'アカウント: unknown' だけでは未ログインと
+  // 区別が付かず、deny 側でわざわざ塞いだ袋小路(/login の繰り返し)をここで踏む。
+  const statusOut = execGuardScript(ALONE, { argv: ['status'], env: homeEnv(home) });
+  check('status も credentials.js が読めないことを言う',
+    /credentials\.js/.test(statusOut) && /`\/login` では直りません/.test(statusOut), statusOut);
+
+  res = runAlone(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command: 'echo hello' },
+  });
+  check('credentials.js が無くても保護ツリー外は巻き込まない', res === null, JSON.stringify(res));
+}
+
+// --- credentials.js は同名で存在するが、必要なエクスポートが欠けている構成 ---
+// require 自体は成功するが、無関係な・古い credentials.js が同名で置かれていると
+// HOME 等が undefined になり得る。以前はこれを検証せずに使っていたため、この先の
+// path.join(HOME, ...) がトップレベルで例外を投げてプロセスごと落ちていた
+// (標準出力なし・exit 1 = 無言 fail-open。require が成功したかどうかしか見ていなかった
+// ことが原因)。require が成功しても中身の形を検証し、欠けていれば「読み込めない」場合と
+// 同じ扱いに合流することを確かめる。
+{
+  const BADSHAPE_DIR = path.join(BASE, 'badshape-guard');
+  fs.mkdirSync(BADSHAPE_DIR, { recursive: true });
+  const BADSHAPE_GUARD = path.join(BADSHAPE_DIR, 'account-guard.js');
+  fs.copyFileSync(GUARD, BADSHAPE_GUARD);
+  // HOME を欠いた、無関係な credentials.js。require 自体は成功するが中身は使えない形。
+  fs.writeFileSync(
+    path.join(BADSHAPE_DIR, 'credentials.js'),
+    "module.exports = { ACCOUNT_UNKNOWN: 'unknown' };",
+    'utf8'
+  );
+
+  const runBadShape = (home, input) => toResult(execGuardScript(BADSHAPE_GUARD, { env: homeEnv(home), input }));
+
+  const home = sandbox('badshape-home', { subscriptionType: 'team', rules: ORG });
+  const res = runBadShape(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read',
+    tool_input: { file_path: 'a.py' },
+  });
+  // 無言で終わっていない(= プロセスが落ちて exit 1 で fail-open していない)ことがまず要点。
+  check('形式が不正な credentials.js でも無言で終わらず出力を返す', res !== null, JSON.stringify(res));
+  check('形式が不正な credentials.js でも保護ツリーは拒否する', decision(res) === 'deny', JSON.stringify(res));
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('拒否理由が credentials.js の問題を指す', /credentials\.js/.test(reason), reason);
+  check('効かない対処(/login)を唯一の次の一手として案内しない',
+    /`\/login` では直りません/.test(reason), reason);
+
+  // 起動時の形式検証と、実際に呼んでいるメンバーがドリフトしないことを機械で見る。
+  // rawHasRecoverableToken は credentialsState() が使うのに検証リストから漏れており、
+  // 欠ける版が隣にあると deny 経路が TypeError で落ち、reportCrash が無出力・exit 0 で
+  // 終わって保護ツリーへのアクセスが素通しになっていた(このブロックが防ぐはずの fail-open)。
+  // リストを人が同期させる限り同じ漏れが再発するので、ソースどうしを突き合わせて落とす。
+  {
+    const src = fs.readFileSync(GUARD, 'utf8');
+    const block = src.slice(src.indexOf('const loaded = require'), src.indexOf('credentials = loaded;'));
+    const verified = new Set([...block.matchAll(/loaded\.(\w+)/g)].map((m) => m[1]));
+    // 直前が . や英数字のものはパスの一部(.credentials.json)なので拾わない。
+    // 行頭や空白に続く credentials.js は残るため、その 'js' だけ名前で除く。
+    const used = [...new Set([...src.matchAll(/(?<![.\w])credentials\.(\w+)/g)].map((m) => m[1]))]
+      .filter((n) => n !== 'js');
+    const missing = used.filter((n) => !verified.has(n));
+    check('credentials.* の呼び出しがすべて起動時の形式検証に含まれている',
+      missing.length === 0, '検証漏れ: ' + missing.join(', '));
+  }
+
+  // readCredentials だけを欠く形。他のエクスポートが揃っているため見逃されやすいが、
+  // 検証を素通りすると readableCredentials() の catch が拾って「credentials が壊れている」
+  // という別の案内に落ち、真因(隣の credentials.js)がどこにも出なくなる。
+  const NOREAD_DIR = path.join(BASE, 'noread-guard');
+  fs.mkdirSync(NOREAD_DIR, { recursive: true });
+  const NOREAD_GUARD = path.join(NOREAD_DIR, 'account-guard.js');
+  fs.copyFileSync(GUARD, NOREAD_GUARD);
+  fs.writeFileSync(
+    path.join(NOREAD_DIR, 'credentials.js'),
+    "module.exports = { HOME: 'C:/nowhere', CREDENTIALS: 'C:/nowhere/.credentials.json',"
+      + " ACCOUNT_UNKNOWN: 'unknown', currentAccount: () => 'unknown' };",
+    'utf8'
+  );
+  const noreadHome = sandbox('noread-home', { subscriptionType: 'team', rules: ORG });
+  const noreadRes = toResult(execGuardScript(NOREAD_GUARD, {
+    env: homeEnv(noreadHome),
+    input: {
+      hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read',
+      tool_input: { file_path: 'a.py' },
+    },
+  }));
+  check('readCredentials を欠く credentials.js でも保護ツリーは拒否する',
+    decision(noreadRes) === 'deny', JSON.stringify(noreadRes));
+  const noreadReason = noreadRes?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('拒否理由が credentials.js の形式を真因として指す',
+    /credentials\.js/.test(noreadReason) && /`\/login` では直りません/.test(noreadReason),
+    noreadReason);
+}
+
+// --- HOME を導出できない環境 ---
+// credentials.js が読めず、かつ USERPROFILE も HOME も未設定の環境では、フォールバックの
+// 最後の砦を '.' にすると CONFIG が cwd 配下(./.claude/account-guard/config.json)として
+// 解決されてしまう。cwd から読めてしまうと、たまたま設定の無い場所では保護が丸ごと外れる
+// (exit 0・標準出力なし = fail-open)。os.homedir() を最後の砦にすることで、cwd に本物の
+// ルールを置いても、それが設定として読まれないことを確かめる。
+//
+// 環境変数の delete / 空文字では再現できない(このマシンで実測して確認した Windows 特有の癖):
+//   - delete すると、Windows では子プロセス生成時に libuv が USERPROFILE / HOMEDRIVE などを
+//     実在する値で勝手に補ってしまう(キーが丸ごと無いときだけ発動する)。すると
+//     `process.env.USERPROFILE || ...` の最初の項で真になり、直したい3項目め
+//     (`|| os.homedir()`)自体を通らない。バグを戻しても再現できず、テストとして無意味になる。
+//   - 空文字にすると、Windows の os.homedir() は USERPROFILE が「空文字として存在する」だけで
+//     その空文字をそのまま返す(実プロファイルへはフォールバックしない)。つまり
+//     `|| os.homedir()` に辿り着いても壊れた値(空文字)になり、修正前の `'.'` と
+//     見分けが付かない(どちらも cwd 相対に解決されて同じ結果になる)。
+// そこで os.homedir() 自体をテスト用の値に差し替え、cwd とは無関係な既知の場所を返すようにする。
+// これで「3項目めまで来たら cwd ではなくその値が使われる」ことを確定的に検証できる。
+{
+  const ALONE_DIR = path.join(BASE, 'homefallback-alone');
+  fs.mkdirSync(ALONE_DIR, { recursive: true });
+  fs.copyFileSync(GUARD, path.join(ALONE_DIR, 'account-guard.js')); // credentials.js は意図的に置かない
+
+  // os.homedir() の差し替え先。cwd(後述の home)とは別物で、かつ設定ファイルを一切
+  // 置かない実在しないディレクトリにする。ここが CONFIG の基準になれば「ルール未設定」
+  // として何も拒否されないはずで、cwd 側のルールが読まれていないことの裏付けになる。
+  const FAKE_HOME = path.join(BASE, 'homefallback-real-home');
+  const RUNNER = path.join(ALONE_DIR, 'run-with-fake-home.js');
+  fs.writeFileSync(RUNNER, [
+    "'use strict';",
+    `require('os').homedir = () => ${JSON.stringify(FAKE_HOME)};`,
+    "require('./account-guard.js');", // 差し替え後に本体を読み込む。os は Node 内でキャッシュ共有される
+  ].join('\n'), 'utf8');
+
+  // cwd には「本物の」保護ルールを置く。HOME='.' のバグが残っていれば、これが読まれて拒否される。
+  const TARGET = path.join(BASE, 'nohome-target');
+  const home = sandbox('nohome-cwd', { rules: [{ tree: TARGET, allow: [] }] });
+
+  const env = { ...process.env, NO_COLOR: '1', USERPROFILE: '', HOME: '' };
+
+  const res = toResult(execGuardScript(RUNNER, {
+    cwd: home, // プロセスの実際の cwd。HOME='.' のバグがあればここが CONFIG の基準になる
+    env,
+    input: { hook_event_name: 'PreToolUse', cwd: TARGET, tool_name: 'Read', tool_input: { file_path: 'x' } },
+  }));
+  check('HOME が無い環境でも設定をカレントディレクトリから読まない', res === null, JSON.stringify(res));
+}
+
+// --- HOME 導出の入力が全て空文字を返す環境(credentials.js を正しく置いた通常構成) ---
+// 上のテストは credentials.js を意図的に置かない構成でしか「HOME を導出できない」ケースを
+// 検証していない。credentials.js 自身にも同じ穴(os.homedir() が空文字を返す環境では
+// HOME='' になり、CREDENTIALS / CONFIG が cwd 相対に解決される)があったため、
+// credentials.js が存在する通常構成でも同じことが成り立つことを確かめる。
+// 環境変数の delete / 空文字だけでは再現できない事情は上のテストのコメントと同じ
+// (Windows の libuv 補完・os.homedir() の空文字そのまま返し)なので、
+// os.homedir() 自体を差し替える方式に倣う。
+{
+  const NORMAL_DIR = path.join(BASE, 'homefallback-normal');
+  fs.mkdirSync(NORMAL_DIR, { recursive: true });
+  fs.copyFileSync(GUARD, path.join(NORMAL_DIR, 'account-guard.js'));
+  fs.copyFileSync(path.join(__dirname, '..', 'credentials.js'), path.join(NORMAL_DIR, 'credentials.js'));
+
+  const RUNNER2 = path.join(NORMAL_DIR, 'run-with-empty-home.js');
+  fs.writeFileSync(RUNNER2, [
+    "'use strict';",
+    "require('os').homedir = () => '';", // os.homedir() 自体が空文字を返す壊れた環境を再現
+    "require('./account-guard.js');", // os は Node 内でキャッシュ共有されるので credentials.js 側にも効く
+  ].join('\n'), 'utf8');
+
+  // cwd には「本物の」保護ルールを置く。HOME='' のバグが残っていれば cwd 相対に解決され、
+  // それが読まれて偶然 deny されただけ、という誤検証になる。ツール呼び出し自体は
+  // この保護ルールと無関係にして、「HOME を特定できない」という理由で拒否されることを見る。
+  const TARGET2 = path.join(BASE, 'emptyhome-target');
+  const home2 = sandbox('emptyhome-cwd', { rules: [{ tree: TARGET2, allow: [] }] });
+
+  const env2 = { ...process.env, NO_COLOR: '1', USERPROFILE: '', HOME: '' };
+  const res2 = toResult(execGuardScript(RUNNER2, {
+    cwd: home2,
+    env: env2,
+    input: {
+      hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+      tool_input: { command: 'echo hello' },
+    },
+  }));
+  // 無言で fail-open していない(素通し = res===null)ことが要点。保護対象と無関係な
+  // Bash 呼び出しでも、HOME を特定できない間は安全側に倒して拒否する。
+  check('credentials.js が正しく揃っていても HOME が全滅なら無言で通さない', res2 !== null, JSON.stringify(res2));
+  check('credentials.js が正しく揃っていても HOME が全滅なら拒否する', decision(res2) === 'deny', JSON.stringify(res2));
+  const reason2 = res2?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('拒否理由が HOME を特定できないことを言う(無言で終わっていない)',
+    /HOME|ホームディレクトリ/.test(reason2), reason2);
+
+  // 空白のみの HOME。空文字は falsy なので素朴な `||` チェーンでも先へ進むが、空白のみは
+  // truthy なため usableHome の trim() が無いとそのまま採用され、path.join(' ', ...) が
+  // cwd 配下の実在しない場所を指して「設定が無い」= ルール 0 件の素通しに戻る。
+  // trim() を消すリグレッションを捉えられるのはこの経路だけなので、空文字とは別に見る。
+  const RUNNER3 = path.join(NORMAL_DIR, 'run-with-blank-home.js');
+  fs.writeFileSync(RUNNER3, [
+    "'use strict';",
+    "require('os').homedir = () => '   ';",
+    "require('./account-guard.js');",
+  ].join('\n'), 'utf8');
+
+  const res3 = toResult(execGuardScript(RUNNER3, {
+    cwd: home2,
+    env: { ...process.env, NO_COLOR: '1', USERPROFILE: '   ', HOME: '   ' },
+    input: {
+      hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+      tool_input: { command: 'echo hello' },
+    },
+  }));
+  check('空白のみの HOME でも無言で通さない', res3 !== null, JSON.stringify(res3));
+  check('空白のみの HOME でも拒否する', decision(res3) === 'deny', JSON.stringify(res3));
+  check('空白のみの HOME でも理由が HOME を特定できないことを言う',
+    /HOME|ホームディレクトリ/.test(res3?.hookSpecificOutput?.permissionDecisionReason || ''),
+    JSON.stringify(res3));
+
+  // HOME 未解決のときは CONFIG がダミーの相対パスになるため、通常の修復経路
+  // (isConfigRepair = CONFIG 自身の編集を通す)は絶対パスと決して一致せず成立しない。
+  // 逃げ道が 1 つも無いと、フック登録を外すことも環境変数を直すこともできず、Claude Code の
+  // 中から復旧不能になる(外部エディタや git で戻すしかなくなる)。settings.json の
+  // 読み書きだけは通ることを確かめる。ここで保護の穴は増えない: HOME が不明な時点で
+  // 保護ツリーも特定できておらず、そもそも何も保護できていない。
+  const settingsTarget = path.join(home2, '.claude', 'settings.json');
+  for (const tool of ['Read', 'Edit', 'Write']) {
+    const out4 = execGuardScript(RUNNER2, {
+      cwd: home2,
+      env: env2,
+      input: { hook_event_name: 'PreToolUse', cwd: home2, tool_name: tool, tool_input: { file_path: settingsTarget } },
+    });
+    check(`HOME 未解決でも settings.json の ${tool} は通す(復旧経路を残す)`,
+      out4.trim() === '', out4);
+  }
+  // 逃げ道は settings.json だけ。無関係なファイルまで通すと、HOME 未解決を騙る形で
+  // 保護が外れる余地が広がる。
+  const out5 = execGuardScript(RUNNER2, {
+    cwd: home2,
+    env: env2,
+    input: {
+      hook_event_name: 'PreToolUse', cwd: home2, tool_name: 'Edit',
+      tool_input: { file_path: path.join(home2, 'notes.txt') },
+    },
+  });
+  check('HOME 未解決でも settings.json 以外は通さない', out5.trim() !== '', out5);
+  check('逃げ道は拒否メッセージにも書いてある(書かないと気づけない)',
+    /settings\.json/.test(res2?.hookSpecificOutput?.permissionDecisionReason || ''),
+    JSON.stringify(res2));
+
+  // status も同じ状態を「保護は無効」と言わない。「全部拒否される」原因を調べに来る唯一の
+  // 入り口がここで、実態と逆の情報(保護が効いていない)を出したうえに実在しないダミーパスの
+  // config.json を直せと案内すると、行き止まりに入ってガードを外す方向の回避しか残らなくなる
+  // (main() の status 分岐は homeUnresolved を通常の「未作成 — 保護は無効」表示とは別扱いに
+  // している。ここはその回帰テスト)。
+  const statusOut2 = execGuardScript(RUNNER2, { argv: ['status'], cwd: home2, env: env2 });
+  check('status は HOME 未解決を通常の「未作成 — 保護は無効」の文言では言わない(事実と逆になる)',
+    !/未作成 — 保護は無効/.test(statusOut2), statusOut2);
+  check('status はすべての操作を拒否している旨を明言する',
+    /保護は無効ではありません/.test(statusOut2) && /すべての操作を拒否しています/.test(statusOut2),
+    statusOut2);
+  check('status でも settings.json からフック登録を外す逃げ道を案内する',
+    /settings\.json/.test(statusOut2) && /フック登録を[\s\S]*外してください/.test(statusOut2),
+    statusOut2);
+}
+
+// HOME 未解決とガード自身の異常終了が重なった場合。main() 側には settings.json の逃げ道が
+// あるのに reportCrash 側だけ isConfigRepair しか見ていなかったため、この組み合わせでだけ
+// 「Claude Code の中から復旧する手段が 1 つも無い」状態が残っていた(CONFIG がダミーの
+// 相対パスになるので isConfigRepair は決して成立しない)。両方の経路で逃げ道が要る。
+{
+  const CRASH_DIR = path.join(BASE, 'crash-homeunresolved');
+  fs.mkdirSync(CRASH_DIR, { recursive: true });
+  // main() だけを確実に落とす。reportCrash の側を見たいので、注入は main の中に限る
+  // (トップレベルで投げると catch より先にプロセスが死に、別の経路の検証になってしまう)。
+  const original = fs.readFileSync(GUARD, 'utf8');
+  const injected = original.replace('function main() {', 'function main() {\n  throw new Error("injected for test");');
+  if (injected === original) throw new Error('main() への注入に失敗しました(テストの前提が崩れています)');
+  fs.writeFileSync(path.join(CRASH_DIR, 'account-guard.js'), injected, 'utf8');
+  fs.copyFileSync(path.join(__dirname, '..', 'credentials.js'), path.join(CRASH_DIR, 'credentials.js'));
+
+  // HOME が全滅した環境の作り方は上のテストと同じ(環境変数の空文字だけでは再現できない)。
+  const RUNNER4 = path.join(CRASH_DIR, 'run.js');
+  fs.writeFileSync(RUNNER4, [
+    "'use strict';",
+    "require('os').homedir = () => '';",
+    "require('./account-guard.js');",
+  ].join('\n'), 'utf8');
+
+  const crashHome = sandbox('crash-cwd', { rules: [{ tree: path.join(BASE, 'crash-target'), allow: [] }] });
+  const crashEnv = { ...process.env, NO_COLOR: '1', USERPROFILE: '', HOME: '' };
+  const runCrash = (toolName, filePath) => execGuardScript(RUNNER4, {
+    cwd: crashHome,
+    env: crashEnv,
+    input: { hook_event_name: 'PreToolUse', cwd: crashHome, tool_name: toolName, tool_input: { file_path: filePath } },
+  });
+
+  const settingsTarget = path.join(crashHome, '.claude', 'settings.json');
+  for (const tool of ['Read', 'Edit', 'Write']) {
+    const out = runCrash(tool, settingsTarget);
+    check(`異常終了 + HOME 未解決でも settings.json の ${tool} は通す(全停止させない)`,
+      out.trim() === '', out);
+  }
+  // 逃げ道は settings.json だけ。ここを広げると、異常終了を装う形で保護が外れる。
+  const outOther = runCrash('Edit', path.join(crashHome, 'notes.txt'));
+  check('異常終了 + HOME 未解決でも settings.json 以外は通さない', outOther.trim() !== '', outOther);
+  const crashReason = (outOther.trim() ? JSON.parse(outOther) : null)
+    ?.hookSpecificOutput?.permissionDecisionReason || '';
+  // CONFIG はこの状態ではダミー値なので、そのパスを「読めない設定ファイル」として出すと
+  // 存在しない場所を直しに行かせることになる。
+  check('異常終了の文面がダミーの設定パスを直せと言わない',
+    !/home-unresolved/.test(crashReason), crashReason);
+  check('異常終了の文面でも逃げ道(settings.json)を案内する',
+    /settings\.json/.test(crashReason), crashReason);
+}
+
+// credentials を読み取れなかっただけの状態を「壊れている」と同一視しない。中身が健全なまま
+// 手が届いていないだけ(ウイルス対策のロック・ACL の一時変更・EBUSY)のことがあり、そこで
+// 「失われる認証情報はない」と断言して /login を勧めると、まだ退避していないアカウントの
+// refreshToken がその場で消える(復旧はブラウザ OAuth のやり直し)。
+// ディレクトリを置いて EISDIR を作るのは、権限操作なしで移植性のある形で読み取り失敗を
+// 再現できるため(0 バイト・JSON 破損は「中身を見たうえで使えない」側なので別扱いのまま)。
+{
+  const home = sandbox('creds-unreadable', { rules: ORG });
+  fs.mkdirSync(path.join(home, '.claude', '.credentials.json'), { recursive: true });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:\\org-tree\\proj',
+    tool_name: 'Read', tool_input: { file_path: 'src/main.py' },
+  });
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('読み取れないだけの場合は拒否する', decision(res) === 'deny', JSON.stringify(res));
+  check('読み取れないだけの場合は「失われる認証情報はない」と断言しない',
+    !/失われる認証情報はない/.test(reason), reason);
+  check('読み取れない場合は控えを残す手を先に案内する',
+    /swap save <name> --force/.test(reason), reason);
+  check('読み取れない場合も /login で消えることを伝える',
+    /`\/login` すると/.test(reason), reason);
+  // 2 手目の `swap <name>` にも --force が要る。CREDENTIALS 自体は読めないままなので、
+  // 付けずに案内すると swap 側の同じ判定で必ず中止され、案内どおり打つと止まる。
+  check('2 手目の swap にも --force が付いている(付いていないと swap 側が必ず中止する)',
+    reason.includes('swap <name> --force'), reason);
+  // 権限で読めない場合は swap のどの経路も控えを取れずに止まる。手で控えを取る逃げ道を
+  // 示さないと、案内どおり打った先が行き止まりになる。
+  check('「どちらも控えを取れませんでした」で止まる場合の逃げ道(手で別名コピーして /login)を案内する',
+    /どちらも「控えを取れませんでした」で止まるなら/.test(reason) && /手で別名コピーして/.test(reason), reason);
+  // 破損(0 バイト)の側は従来どおり「失うものは無い」と言い切ってよい。取り違えると
+  // 今度は行き止まり(打つ手が 1 つも無い状態)に戻るので、両方を並べて固定する。
+  const broken = sandbox('creds-empty', { rules: ORG, raw: '' });
+  const resBroken = run(broken, {
+    hook_event_name: 'PreToolUse', cwd: 'C:\\org-tree\\proj',
+    tool_name: 'Read', tool_input: { file_path: 'src/main.py' },
+  });
+  check('0 バイトの credentials は従来どおり「失うものは無い」と案内する',
+    /失われる認証情報はない/.test(resBroken?.hookSpecificOutput?.permissionDecisionReason || ''),
+    JSON.stringify(resBroken));
+}
+
+// accessToken だけが欠けた credentials(書き込みの途中が典型)。復元には使えないので
+// hasUsableCredentials は false になるが、refreshToken は交換すればまた使えるため、
+// 「失われる認証情報はない」と言って /login を勧めると、まだ退避していないアカウントの
+// 認証がそこで消える。破損(0 バイト)と同じ扱いにしていた頃はそうなっていた。
+{
+  const home = sandbox('creds-refresh-only', {
+    rules: ORG,
+    raw: JSON.stringify({ claudeAiOauth: { refreshToken: 'r-1', subscriptionType: 'pro' } }),
+  });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:\\org-tree\\proj',
+    tool_name: 'Read', tool_input: { file_path: 'src/main.py' },
+  });
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('refreshToken だけ残る場合も拒否する', decision(res) === 'deny', JSON.stringify(res));
+  check('refreshToken だけ残る場合は「失われる認証情報はない」と断言しない',
+    !/失われる認証情報はない/.test(reason), reason);
+  // 文面はトークンの名前を挙げない。この分岐には JSON として読めた中身(refreshToken が
+  // 残っていると確定できる)と、生バイト列から拾っただけの中身(refreshToken か accessToken の
+  // どちらかまでしか分からない)の両方が来るため。検査は「何が残っているか」の断定ではなく、
+  // 失って困るものが残っていると伝えているかを見る。
+  check('失って困るトークンが残っていることを理由として示す',
+    /交換すればまた使えるトークンが残っています/.test(reason), reason);
+  check('先に /login すると失われることを伝える', /`\/login` すると/.test(reason), reason);
+  // swap 側はこの中身も「読めない現在」として扱う(hasUsableCredentials が false)。
+  // --force を付けずに案内すると、案内どおり打っても必ず中止される。
+  check('案内する swap には --force が付いている',
+    /swap save <name> --force/.test(reason) && reason.includes('swap <name> --force'), reason);
+}
+
+// credentialsState() の SyntaxError 分岐(account-guard.js:474-482)。上の creds-refresh-only は
+// JSON として読める(accessToken だけ欠ける)場合の hasRecoverableToken 経路を、creds-empty は
+// raw='' で rawHasRecoverableToken も false になる unusable 側を見ており、どちらも
+// 「JSON.parse が例外を投げ、かつ切れた位置より手前に refreshToken の文字列が残っている」
+// 組み合わせは通らない。書き込みの途中で切り詰められた credentials がまさにこの形で、
+// 以前はここを無条件に unusable(失うものは無い)へ倒し、「失われる認証情報はない」と
+// 断言して /login を勧めていた。
+{
+  const home = sandbox('creds-truncated-syntax-error', {
+    rules: ORG,
+    raw: '{"claudeAiOauth":{"accessToken":"AT-A","refreshToken":"RT-ONLY-COPY"',
+  });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:\\org-tree\\proj',
+    tool_name: 'Read', tool_input: { file_path: 'src/main.py' },
+  });
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('JSON 構文エラーで読めなくても保護ツリーは拒否する', decision(res) === 'deny', JSON.stringify(res));
+  check('JSON 構文エラーを理由に「失われる認証情報はない」と断言しない',
+    !/失われる認証情報はない/.test(reason), reason);
+  check('未ログイン側の文言(消える退避はありません)も流用しない',
+    !/消える退避はありません/.test(reason), reason);
+  check('失って困るトークンが残っていることを理由として示す',
+    /交換すればまた使えるトークンが残っています/.test(reason), reason);
+  // こちらは JSON 構文エラー = rawHasRecoverableToken が生バイト列から拾っただけの経路。
+  // 拾えたのが accessToken だけの控え(書き込みの途中で切れた形)もここに来るので、
+  // refreshToken と名指しすると、交換という存在しない復旧手段を探させることになる。
+  check('生の中身から拾ったトークンを refreshToken と名指ししない',
+    !/refreshToken/.test(reason), reason);
+  check('先に /login すると失われることを伝える', /`\/login` すると/.test(reason), reason);
+}
+
+// denyMessage の通常経路(account-guard.js:663-688、credentials は健全な usable)。まだ一度も
+// swap で退避していない切り替え先へ向かう最初の1回。以前はこの経路に /login が一切出ず、
+// 「swap save <name> → swap <name>」の2手だけを案内していた。切り替え先を一度も退避して
+// いなければ `swap <name>` は「退避されていません」で必ず止まるため、案内どおり打つと
+// 堂々巡りになっていた(README の初回手順は「退避 → /login → 退避」の順で /login を挟む)。
+{
+  const home = sandbox('deny-first-time-no-backups', { subscriptionType: 'pro', rules: ORG });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/org-tree/proj', tool_name: 'Read',
+    tool_input: { file_path: 'src/main.py' },
+  });
+  check('健全な credentials でも保護ツリーは拒否する(前提)', decision(res) === 'deny', JSON.stringify(res));
+  const reason = res?.hookSpecificOutput?.permissionDecisionReason || '';
+  check('通常の切り替え手順(save→swap)を出す(前提)',
+    /swap save <name>/.test(reason) && /swap <name>/.test(reason), reason);
+  check('切り替え先を一度も退避していない場合の初回手順を出す',
+    /まだ一度も退避していない場合は、この順で進めてください/.test(reason), reason);
+  check('初回手順は退避のあとに /login する順序で出ている(先に /login ではない)',
+    /1\.\s*swap save <name>[\s\S]*2\.\s*\/login[\s\S]*3\.\s*swap save <別名>/.test(reason), reason);
+}
+
+report();
