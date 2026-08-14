@@ -91,11 +91,22 @@ function execSwapScript(script, argv = [], { cwd, env } = {}) {
   const opts = { encoding: 'utf8' };
   if (cwd !== undefined) opts.cwd = cwd;
   opts.env = env || { ...process.env, NO_COLOR: '1' };
+  // swap.js 自体は stdin を読まないが、account-guard.js と同じ execFileSync の下地なので
+  // 挙動を揃えておく(input を渡す呼び出しは今のところ無いが、将来 stdin を使う経路が
+  // 増えたときに継承由来のハングを踏まないための予防でもある)。
+  opts.input = '';
+  // ハングしたら殺して FAIL に変える(issue #8: test/.tmp の孤児プロセスが次回実行の
+  // stdin 待ちを引き起こしていた事故の再発防止)。
+  opts.timeout = 30000;
+  opts.killSignal = 'SIGKILL';
   try {
     const out = execFileSync(process.execPath, [script, ...argv], opts);
     return { code: 0, out, err: '' };
   } catch (e) {
-    return { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
+    // timeout で殺された場合は e.status が null になり e.signal が入る。原因が
+    // 埋もれないよう err の先頭に出しておく(通常の非ゼロ終了と見分けられるようにする)。
+    const err = e.signal ? `[timeout ${e.signal}] ${e.stderr || ''}` : (e.stderr || '');
+    return { code: e.status ?? 1, out: e.stdout || '', err };
   }
 }
 

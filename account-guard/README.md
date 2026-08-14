@@ -98,7 +98,10 @@ Claude Code の外から git で戻すしか手がなくなった。保護ツリ
 
 ### テスト
 
-`node test/<名前>.test.js` で 1 本ずつ実行する。性質が 2 つに分かれる。
+`node test/run.js` で一括実行する(実行前に `test/.tmp/` を丸ごと消してから作り直すので、
+前回実行の残骸を気にしなくてよい)。`node test/run.js swap` のように引数を渡すとファイル名の
+一部で絞り込める。1 本だけ実行したいときは従来どおり `node test/<名前>.test.js` でもよい。
+性質が 2 つに分かれる。
 
 - `swap` / `account-guard` / `probe` … 経路ごとの example test
 - `fault` / `reachable` … property test。前者はランダムな操作列に故障(EPERM 等の例外・

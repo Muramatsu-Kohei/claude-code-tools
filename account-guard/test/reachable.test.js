@@ -207,11 +207,18 @@ function pickInitialOp(rng, state, i) {
 // --- 子プロセスの起動(fault.test.js と同じ形。故障注入はしない) ---
 function runSwap(home, argv) {
   const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+  // swap.js は stdin を読まないが、input を渡さないと stdio[0] が親の stdin を継承し、
+  // 待ちが発生したときに孤児プロセスとして test/.tmp に残ってしまう(issue #8)。
+  // 空文字で明示的に閉じ、timeout を保険にする(fault.test.js と同じ形)。
+  const opts = { encoding: 'utf8', env, input: '', timeout: 30000, killSignal: 'SIGKILL' };
   try {
-    const out = execFileSync(process.execPath, [SWAP, ...argv], { encoding: 'utf8', env });
+    const out = execFileSync(process.execPath, [SWAP, ...argv], opts);
     return { code: 0, out, err: '' };
   } catch (e) {
-    return { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
+    // timeout で殺されると e.status は null、e.signal に SIGKILL 等が入る。通常の非ゼロ終了と
+    // 区別できるよう err の先頭に印を付ける。
+    const err = e.signal ? `[timeout ${e.signal}] ${e.stderr || ''}` : (e.stderr || '');
+    return { code: e.status ?? 1, out: e.stdout || '', err };
   }
 }
 

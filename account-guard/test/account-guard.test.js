@@ -57,7 +57,16 @@ const configPath = (home) => path.join(home, '.claude', 'account-guard', 'config
 function execGuardScript(scriptPath, { argv = [], env, cwd, input } = {}) {
   const opts = { env, encoding: 'utf8' };
   if (cwd !== undefined) opts.cwd = cwd;
+  // account-guard.js は hook として stdin から JSON を読む設計なので、input を渡さない
+  // 呼び出しでも stdin を明示的に閉じる(空文字を渡せば stdio[0] が pipe になり、子は
+  // 親の TTY を継承せず即座に EOF を受け取る)。継承したままだと EOF が来ず、親の stdin を
+  // 待ち続けて永久にハングする(issue #8: test/.tmp の孤児プロセスがこれで残っていた)。
   if (input !== undefined) opts.input = JSON.stringify(input);
+  else opts.input = '';
+  // 上記の対策後も万一ハングが再発したら、ここで確実に殺して FAIL に変える(CI で
+  // ハングしたまま検出できない事態を避けるための保険)。
+  opts.timeout = 30000;
+  opts.killSignal = 'SIGKILL';
   return execFileSync(process.execPath, [scriptPath, ...argv], opts);
 }
 
