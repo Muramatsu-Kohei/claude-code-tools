@@ -198,10 +198,10 @@ console.log('account-guard');
   // cwd が「当たったルールとは別の」保護ツリーの内側にいる場合。ヒットしたルールだけを見て
   // cd 注記の要否を決めていたため、保護ツリーが 2 つ以上ある構成では注記が出ず、案内どおり
   // 打った swap が今度は cwd 側のルールに当たって同じ deny に戻る堂々巡りになっていた。
-  const TWO = [{ tree: 'C:/org-tree', allow: ['team'] }, { tree: 'D:/org-tree', allow: ['team'] }];
+  const TWO = [{ tree: 'C:/org-tree', allow: ['team'] }, { tree: 'D:/second-tree', allow: ['team'] }];
   const home = sandbox('deny-cross-tree', { subscriptionType: 'pro', rules: TWO });
   const res = run(home, {
-    hook_event_name: 'PreToolUse', cwd: 'D:/org-tree/work', tool_name: 'Read',
+    hook_event_name: 'PreToolUse', cwd: 'D:/second-tree/work', tool_name: 'Read',
     tool_input: { file_path: 'C:/org-tree/proj/secret.py' },
   });
   check('別ツリーの対象を触っても拒否する(前提)', decision(res) === 'deny', JSON.stringify(res));
@@ -209,7 +209,7 @@ console.log('account-guard');
   check('cwd が別の保護ツリー内なら cwd 注記を出す', /別のターミナル/.test(reason), reason);
   // 注記が指すのは「今いるツリー」であって、当たったルールのツリーではない。取り違えると
   // どのツリーから出れば実行できるのかが伝わらない。
-  check('cwd 注記は cwd 側のツリーを指す', /D:[\\/]org-tree 配下のままだと/.test(reason), reason);
+  check('cwd 注記は cwd 側のツリーを指す', /D:[\\/]second-tree 配下のままだと/.test(reason), reason);
 }
 {
   // JSON としては妥当だが accessToken を欠く credentials。ガードが JSON.parse の成否だけを
