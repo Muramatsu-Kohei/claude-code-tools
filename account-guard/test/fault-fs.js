@@ -14,13 +14,25 @@
 
 const fs = require('fs');
 
-// 実際に swap.js / credentials.js が呼んでいる同期 API のうち、この 7 つだけを包む
-// (openSync/readSync/closeSync/statSync/rmSync は両ファイルとも呼んでいない。grep で確認済み)。
+// 実装側(swap.js・credentials.js・account-guard.js)が実際に呼んでいる同期 API のうち、
+// 故障を注入する意味があるものを包む。openSync/readSync/closeSync/statSync/rmSync は
+// どのファイルも呼んでいない。
+// 呼んでいるのに意図的に外してあるものが 2 つある。「一覧は網羅している」とだけ書いて
+// chmodSync が抜けていた頃は、writeAtomic の chmod 失敗経路(下記)が注入不能なことに
+// 誰も気づけなかったので、外した理由まで書き残す。
+//   fs.writeSync  … failText が stderr(fd 2)へ直接書くためだけに使う。ここを失敗させると、
+//                    注入した故障そのものの説明が画面に出なくなり、何を確かめたのか読めなくなる。
+//   fs.existsSync … credentials.js が使うが、内部で例外を握りつぶす API なので throw を
+//                    注入しても現実には起きない状態を作ることになる(swap.js が existsSync を
+//                    避けて probeFile を使っているのも、この握りつぶしが理由)。
+// chmodSync を含めるのは、writeAtomic の chmod が try の内側にあり、失敗すると tmp を消して
+// 書き込みごと中止する = 退避が起きなかった経路になるため(keepAside 側の chmod は
+// 握りつぶしなので、そちらは注入しても何も変わらないことの確認になる)。
 // fault.test.js もこの一覧を故障の対象候補として使うので、ここを更新したら fault.test.js 側も
 // 追随させること(重複を持つ以上、片方だけ直すとテストが存在しない call 名を指定してしまう)。
 const WRAPPED_CALLS = [
   'writeFileSync', 'renameSync', 'copyFileSync', 'unlinkSync',
-  'readFileSync', 'mkdirSync', 'readdirSync',
+  'readFileSync', 'mkdirSync', 'readdirSync', 'chmodSync',
 ];
 
 // 書き込む内容を先頭半分に切り詰める。中断状態(電源断・kill -9)は「まったく書けなかった」

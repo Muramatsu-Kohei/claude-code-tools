@@ -187,4 +187,41 @@ for (let i = 0; i < CASES; i++) {
 }
 
 console.log(`  (${CASES} ケース, ${((Date.now() - startedAt) / 1000).toFixed(1)}s)`);
+
+// --- WRAPPED_CALLS が実装側の fs 呼び出しからドリフトしていないこと ---
+// WRAPPED_CALLS は「実装側が呼ぶ fs の同期 API のうち、故障を注入する意味があるもの」の
+// 一覧。ここが実装からずれると、注入したいはずの経路が誰にも気づかれないまま故障注入の
+// 対象から抜け落ちる(実際に chmodSync が一覧から抜けていて、しかも「一覧は網羅している」と
+// いうコメントが付いていたため、writeAtomic の chmod 失敗経路が長期間検査対象から漏れていた)。
+// 実装側 3 ファイルのソースから `fs.<name>Sync(` の呼び出し名をすべて拾い、WRAPPED_CALLS か
+// 意図的な除外リスト(fault-fs.js の WRAPPED_CALLS 直上のコメント参照)のどちらかに
+// 含まれることを確かめる。どちらにも無ければ、新しく増えた fs 呼び出しの故障注入を
+// 検討しないまま見落としている、ということ。
+{
+  const IMPL_FILES = [
+    path.join(__dirname, '..', 'swap.js'),
+    path.join(__dirname, '..', 'credentials.js'),
+    path.join(__dirname, '..', 'account-guard.js'),
+  ];
+  // 意図的な除外(fault-fs.js の WRAPPED_CALLS 直上のコメントと同じ理由を持つ)。
+  //   writeSync  … failText が stderr へ直接書くためだけに使う。故障を注入すると、
+  //                注入そのものの説明が画面から消えて何を確かめたのか読めなくなる。
+  //   existsSync … credentials.js が使うが、内部で例外を握りつぶす API なので throw を
+  //                注入しても現実には起きない状態を作ることになる。
+  const INTENTIONAL_EXCLUSIONS = new Set(['writeSync', 'existsSync']);
+  const CALL_RE = /fs\.(\w+Sync)\(/g;
+  const found = new Set();
+  for (const file of IMPL_FILES) {
+    const src = fs.readFileSync(file, 'utf8');
+    let m;
+    CALL_RE.lastIndex = 0;
+    while ((m = CALL_RE.exec(src))) found.add(m[1]);
+  }
+  const wrapped = new Set(WRAPPED_CALLS);
+  const drifted = [...found].filter((name) => !wrapped.has(name) && !INTENTIONAL_EXCLUSIONS.has(name));
+  check('実装側の fs.*Sync 呼び出しは WRAPPED_CALLS か意図的な除外リストのどちらかに含まれる',
+    drifted.length === 0,
+    'WRAPPED_CALLS に無く、除外リストにも無い呼び出し: ' + drifted.join(', '));
+}
+
 report();
