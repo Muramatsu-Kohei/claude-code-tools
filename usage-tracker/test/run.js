@@ -53,19 +53,23 @@ for (const f of files) {
   // stdin は 'ignore' にする。テストファイル自身は stdin を読まないが、継承したままだと
   // このランナーの stdin(端末や CI のパイプ)がそのままぶら下がりかねない。
   // ファイル単位の timeout。テストが内部で起動する子プロセス(run() 経由)には個々に
-  // タイムアウトを掛けていないため、CI でハングしたまま job のタイムアウトまで枠を焼くのを
-  // 避けるため、ここで締める。実測は数秒程度なので、遅いランナーを見込んでも
-  // 10 分あれば通常実行が引っかかることはない。
+  // 30 秒の保険が掛かっているが、それでは捕まえられない場所(テスト本体のループや fs の待ち)で
+  // 固まる余地は残るので、ここでも締める。CI 実測は 3 ツール + セットアップ込みの全体で
+  // 約 2 分、最長ファイルでも 1 分未満。job 側の timeout-minutes: 15 より十分小さく取り、
+  // ハングしてもランナー自身が集計(「失敗: …」)を出せるようにする。
   const r = spawnSync(process.execPath, [path.join(__dirname, f)], {
     stdio: ['ignore', 'inherit', 'inherit'],
     windowsHide: true,
-    timeout: 600000,
+    timeout: 180000,
     killSignal: 'SIGKILL',
   });
   // signal で終了したときは status が null になる。timeout はその代表例だが、OOM killer や
   // 外部からの kill でも signal は入るので、timeout と断定はできない。単なる異常終了と
   // 区別できないと「なぜか失敗した」で終わってしまうので、理由をここで出す。
   if (r.signal) console.log(`  (${f} は signal で強制終了: ${r.signal})`);
+  // spawn 自体に失敗したとき(ENOENT・EAGAIN 等)は status も signal も無く、理由が
+  // r.error にしか出ない。拾わないと末尾の「失敗:」にファイル名が並ぶだけになる。
+  if (r.error) console.log(`  (${f} は起動に失敗: ${r.error.message})`);
   if (r.status !== 0) failed.push(f);
 }
 
