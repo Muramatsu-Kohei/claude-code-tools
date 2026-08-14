@@ -28,6 +28,8 @@ const TMP = path.join(__dirname, '.tmp');
 const only = process.argv[2];
 
 function main() {
+  // .tmp を消せなかったかどうか。最後に「すべて PASS なのに非ゼロ終了」の理由を出すために持つ。
+  let cleanupFailed = false;
   if (only || process.env.SWAP_SCRIPT) {
     const reasons = [];
     if (only) reasons.push(`フィルタ指定 "${only}"`);
@@ -37,8 +39,8 @@ function main() {
     // force: true だけでは足りない場面がある: 孤児プロセス(issue #8 参照)が .tmp 配下を
     // カレントディレクトリにしていたりファイルハンドルを開いたままだと、Windows は
     // force: true でも EBUSY / EPERM を投げて rmSync ごと失敗する。しかもこれは「まさに
-    // この掃除が必要な場面」(=孤児が残っている場面)そのものなので、ここで無言で
-    // クラッシュするとランナーが 1 本もテストを走らせずに落ち、原因が読めないメッセージだけが残る。
+    // この掃除が必要な場面」(=孤児が残っている場面)そのものなので、無言でクラッシュすると
+    // 原因が読めないメッセージだけが残る。
     // maxRetries/retryDelay は Windows のハンドル解放が非同期に少し遅れて終わることがある
     // ことへの保険(実体は消えているのにハンドルの解放待ちで一瞬だけ触れない、という
     // レースを吸収する)。それでも失敗したら孤児プロセスの残存を明示して案内する。
@@ -48,11 +50,16 @@ function main() {
       console.error(`test/.tmp の削除に失敗した: ${e.message}`);
       console.error('孤児プロセスが test/.tmp 配下をカレントディレクトリにしているか、ファイルを開いたままの可能性がある(issue #8)。');
       console.error('Windows での確認: `Get-Process node` で残存プロセスを確認し、`Stop-Process -Id <PID> -Force` で終了させてから再実行する。');
-      // process.exit ではなく exitCode + return で抜ける。harness.js:23-26 と同じ理由で、
-      // Windows では stdout がパイプ(CI のログ収集等)のとき書き込みが非同期になり、
-      // 直後に process.exit を呼ぶと直前の console.error が切れて届かないことがある。
+      console.error('残骸を抱えたまま続行する。影響を受けるのは、そのサブディレクトリを使うスイートだけ。');
+      // ここで止めない。各テストは自分のサブディレクトリを消してから作り直すので、残骸の影響は
+      // それを使うスイートに閉じる。掴んでいるのが孤児とは限らず(Defender のスキャンや
+      // エクスプローラの一時ロックでも EBUSY は出る)、そのたびに 1 本も走らないのは代償が
+      // 大きい。ただし消せなかった事実は非ゼロ終了として残す(警告だけだと CI のログに埋もれ、
+      // issue #8 の再現を見落とす)。process.exit を使わないのは harness.js:23-26 と同じ理由で、
+      // Windows では stdout がパイプ(CI のログ収集等)のとき書き込みが非同期になり、直後に
+      // exit すると直前の console.error が切れて届かないことがある。
+      cleanupFailed = true;
       process.exitCode = 1;
-      return;
     }
   }
 
@@ -95,7 +102,14 @@ function main() {
     // signal で終了したときは status が null になる。timeout はその代表例だが、OOM killer や
     // 外部からの kill でも signal は入るので、timeout と断定はできない。単なる異常終了と
     // 区別できないと「なぜか失敗した」で終わってしまうので、理由をここで出す。
-    if (r.signal) console.log(`  (${f} は signal で強制終了: ${r.signal})`);
+    if (r.signal) {
+      console.log(`  (${f} は signal で強制終了: ${r.signal})`);
+      // Windows には process group kill が無く、ここで死ぬのは直下の子(このテストファイル)だけ。
+      // テストが execFileSync で起こした孫(swap.js 等)は生き残り、.tmp を掴んだまま孤児になる
+      // — この網が捕まえたい場面で、自分が issue #8 の状態を作ってしまう。次回実行が理由の
+      // 読めない EBUSY で止まる前に、ここで名指ししておく。
+      console.log('   孫プロセスが残って test/.tmp を掴んでいる可能性がある(issue #8)。`Get-Process node` で確認し、残っていれば `Stop-Process -Id <PID> -Force` で終了させること。');
+    }
     // spawn 自体に失敗したとき(ENOENT・EAGAIN 等)は status も signal も無く、理由が
     // r.error にしか出ない。拾わないと末尾の「失敗:」にファイル名が並ぶだけになる。
     if (r.error) console.log(`  (${f} は起動に失敗: ${r.error.message})`);
@@ -109,6 +123,9 @@ function main() {
     return;
   }
   console.log(`${files.length} ファイル すべて PASS`);
+  // 全 PASS でも .tmp を消せていなければ終了コードは非ゼロのまま。「すべて PASS なのに赤い」の
+  // 理由がどこにも出ないと、掃除の失敗を見落としたまま次に進んでしまう。
+  if (cleanupFailed) console.log('(ただし test/.tmp を消せていないので終了コードは非ゼロ)');
 }
 
 main();
