@@ -103,10 +103,14 @@ function execSwapScript(script, argv = [], { cwd, env } = {}) {
     const out = execFileSync(process.execPath, [script, ...argv], opts);
     return { code: 0, out, err: '' };
   } catch (e) {
-    // timeout で殺された場合は e.status が null になり e.signal が入る。原因が
-    // 埋もれないよう err の先頭に出しておく(通常の非ゼロ終了と見分けられるようにする)。
-    const err = e.signal ? `[timeout ${e.signal}] ${e.stderr || ''}` : (e.stderr || '');
-    return { code: e.status ?? 1, out: e.stdout || '', err };
+    // timeout で殺された場合、e.status は null で e.code に 'ETIMEDOUT' が入る。ここで
+    // code: 1 に潰すと呼び出し側の `r.code === 1`(想定内の失敗)と区別が付かず、
+    // ハングが PASS として集計されてしまう。timeout は基盤の異常なので assertion の
+    // 合否に混ぜず、その場で投げて止める。
+    if (e.code === 'ETIMEDOUT') {
+      throw new Error(`子プロセスが timeout(${opts.timeout}ms)で強制終了された: ${script} ${argv.join(' ')}`);
+    }
+    return { code: e.status ?? 1, out: e.stdout || '', err: e.stderr || '' };
   }
 }
 

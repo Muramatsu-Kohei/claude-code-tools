@@ -50,4 +50,4 @@ jobs:
 
       - name: usage-tracker
         working-directory: usage-tracker
-        run: node test/transcript.test.js
+        run: node test/run.js

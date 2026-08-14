@@ -15,7 +15,22 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const TMP = path.join(__dirname, '.tmp');
-fs.rmSync(TMP, { recursive: true, force: true });
+// force: true だけでは足りない場面がある: 孤児プロセス(issue #8 参照)が .tmp 配下を
+// カレントディレクトリにしていたりファイルハンドルを開いたままだと、Windows は
+// force: true でも EBUSY / EPERM を投げて rmSync ごと失敗する。しかもこれは「まさに
+// この掃除が必要な場面」(=孤児が残っている場面)そのものなので、ここで無言で
+// クラッシュするとランナーが 1 本もテストを走らせずに落ち、原因が読めないメッセージだけが残る。
+// maxRetries/retryDelay は Windows のハンドル解放が非同期に少し遅れて終わることがある
+// ことへの保険(実体は消えているのにハンドルの解放待ちで一瞬だけ触れない、という
+// レースを吸収する)。それでも失敗したら孤児プロセスの残存を明示して案内する。
+try {
+  fs.rmSync(TMP, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+} catch (e) {
+  console.error(`test/.tmp の削除に失敗した: ${e.message}`);
+  console.error('孤児プロセスが test/.tmp 配下をカレントディレクトリにしているか、ファイルを開いたままの可能性がある(issue #8)。');
+  console.error('Windows での確認: `Get-Process node` で残存プロセスを確認し、`Stop-Process -Id <PID> -Force` で終了させてから再実行する。');
+  process.exit(1);
+}
 
 const only = process.argv[2];
 const files = fs.readdirSync(__dirname)
