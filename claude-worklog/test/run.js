@@ -38,9 +38,10 @@ function main() {
       console.error(`test/.tmp の削除に失敗した: ${e.message}`);
       console.error('孤児プロセスが test/.tmp 配下をカレントディレクトリにしているか、ファイルを開いたままの可能性がある(issue #8)。');
       console.error('Windows での確認: `Get-Process node` で残存プロセスを確認し、`Stop-Process -Id <PID> -Force` で終了させてから再実行する。');
-      // process.exit ではなく exitCode + return で抜ける。harness.js:23-26 と同じ理由で、
-      // Windows では stdout がパイプ(CI のログ収集等)のとき書き込みが非同期になり、
-      // 直後に process.exit を呼ぶと直前の console.error が切れて届かないことがある。
+      // process.exit ではなく exitCode + return で抜ける。Windows では stdout がパイプ
+      // (CI のログ収集等)のとき書き込みが非同期になり、直後に process.exit を呼ぶと直前の
+      // console.error が切れて届かないことがある(3 ツール共通の作法で、同じ理由のコメントが
+      // account-guard/test/harness.js にもある)。
       process.exitCode = 1;
       return;
     }
