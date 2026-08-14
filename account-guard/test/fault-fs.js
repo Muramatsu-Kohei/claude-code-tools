@@ -28,8 +28,10 @@ const fs = require('fs');
 // chmodSync を含めるのは、writeAtomic の chmod が try の内側にあり、失敗すると tmp を消して
 // 書き込みごと中止する = 退避が起きなかった経路になるため(keepAside 側の chmod は
 // 握りつぶしなので、そちらは注入しても何も変わらないことの確認になる)。
-// fault.test.js もこの一覧を故障の対象候補として使うので、ここを更新したら fault.test.js 側も
-// 追随させること(重複を持つ以上、片方だけ直すとテストが存在しない call 名を指定してしまう)。
+// fault.test.js はこの一覧を require して故障の対象候補に使う(重複は持たないので、ここを
+// 更新すれば向こうは自動で追随する)。「片方だけ直すと食い違う」と書いてあった頃は、存在しない
+// 二重管理を警戒させていた。実装側の呼び出しとのドリフトのほうは自動では気づけないので、
+// fault.test.js の末尾がこの一覧と実装側の fs.*Sync を突き合わせて検査する。
 const WRAPPED_CALLS = [
   'writeFileSync', 'renameSync', 'copyFileSync', 'unlinkSync',
   'readFileSync', 'mkdirSync', 'readdirSync', 'chmodSync',
