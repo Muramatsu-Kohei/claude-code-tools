@@ -28,16 +28,6 @@ jobs:
     # 15 分あれば通常実行が引っかかることはない(テスト側にもランナー・子プロセスの
     # 二段でタイムアウトを入れてあり、これは最後の砦)。
     timeout-minutes: 15
-    # ローカルを fnm 管理に移して Node 24 を既定にしたので、CI の版も追随させる。ただし
-    # いきなり 24 固定にせず、まず 20 と 24 の両方をランナー上で緑にできることを確かめる
-    # (ローカルでは 24 で全 1698 件 PASS 済み。残るリスクは errno 依存の故障注入と
-    # 子プロセス周りが Windows ランナー上でどう出るか)。確認できたらこの matrix は畳む。
-    strategy:
-      # 片方が落ちても残りを打ち切らない。1 回の実行で両版の結果を出揃わせるため
-      # (下の各ステップの if: !cancelled() と同じ理由)。
-      fail-fast: false
-      matrix:
-        node: [20, 24]
 
     steps:
       # v4 系は action 自体が Node 20 ランタイムで動く実装で、ランナー側から非推奨の
@@ -48,9 +38,10 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          # ローカルの開発環境に合わせる。上げるときはローカルも揃えること。
-          # 20 は既に EOL で、移行が終わったら落とす。
-          node-version: ${{ matrix.node }}
+          # ローカルの開発環境(fnm default = v24.19.0)に合わせる。上げるときはローカルも
+          # 揃えること。EOL だった 20 から移したもので、固定前に matrix [20, 24] を一時的に
+          # 入れて両版の緑を確認済み(どちらも 1521 / 157 / 20 件で FAIL なし)。
+          node-version: '24'
 
       - name: account-guard
         working-directory: account-guard
