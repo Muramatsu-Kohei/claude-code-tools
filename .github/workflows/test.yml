@@ -24,10 +24,25 @@ jobs:
     # Windows である以上、そちらに CI を合わせるのが筋。public リポジトリなので Windows
     # ランナーでも Actions は無料(実行時間の倍率課金がかかるのは private のみ)。
     runs-on: windows-latest
-    # ハングしたまま Actions の実行時間を焼き続けないための上限。全体の実測は 2 分弱なので
-    # 15 分あれば通常実行が引っかかることはない(テスト側にもランナー・子プロセスの
+    # ハングしたまま Actions の実行時間を焼き続けないための上限。1 ツールの実測は 1 分未満
+    # なので 15 分あれば通常実行が引っかかることはない(テスト側にもランナー・子プロセスの
     # 二段でタイムアウトを入れてあり、これは最後の砦)。
+    #
+    # この上限はツールごとに効くので、1 job = 1 ツールにしてあることが前提になっている。
+    # 3 ツールを 1 job で直列に回していたときは、ファイル単位の timeout(120 秒)が全 11 本ぶん
+    # 積み上がると最大 22 分になり、ハング時にこの 15 分が先に来て job ごと殺され、ランナー自身の
+    # 集計行(「失敗: …」)が出ないまま終わる恐れがあった。分けたことで最長の account-guard でも
+    # 5 本 × 2 分 = 10 分に収まる。
     timeout-minutes: 15
+
+    strategy:
+      # 1 ツールが落ちても残りを打ち切らない。1 回の実行で 3 ツールぶんの結果が出揃うように
+      # する(直列だった頃に各ステップへ入れていた if: !cancelled() がこれに置き換わる)。
+      fail-fast: false
+      matrix:
+        # ディレクトリ名がそのまま working-directory になる。テストを持つツールを増やしたら
+        # ここに足す。
+        tool: [account-guard, claude-worklog, usage-tracker]
 
     steps:
       # v4 系は action 自体が Node 20 ランタイムで動く実装で、ランナー側から非推奨の
@@ -43,18 +58,6 @@ jobs:
           # 入れて両版の緑を確認済み(どちらも 1521 / 157 / 20 件で FAIL なし)。
           node-version: '24'
 
-      - name: account-guard
-        working-directory: account-guard
-        run: node test/run.js
-
-      - name: claude-worklog
-        # 前段の account-guard が落ちてもここで止めない。1 回の実行で 3 ツールぶんの
-        # 結果が出揃うようにする(cancelled でのみスキップし、常に走る always() は使わない)。
-        if: ${{ !cancelled() }}
-        working-directory: claude-worklog
-        run: node test/run.js
-
-      - name: usage-tracker
-        if: ${{ !cancelled() }}
-        working-directory: usage-tracker
+      - name: ${{ matrix.tool }}
+        working-directory: ${{ matrix.tool }}
         run: node test/run.js
