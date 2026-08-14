@@ -206,10 +206,22 @@ function validateName(name) {
   // restorableByName は逆に区別したままにしてある。あちらが揃えるべき相手は main() の
   // サブコマンド判定で、そちらが大小を区別する以上、`swap Save` は今もスロットの復元として
   // 通る = 「打てるコマンド」として案内してよい。判定の目的が違うので同じにはしない。
-  if (RESERVED_NAMES.has(name.toLowerCase()) && !probeFile(accountFile(name)).exists) {
+  const folded = name.toLowerCase();
+  if (RESERVED_NAMES.has(folded) && !probeFile(accountFile(name)).exists) {
+    // 理由は打った綴りによって変わる。同じ文面を両方に出していた頃は、大小違い(`Warmup`)を
+    // 弾くときに「`swap Warmup` はサブコマンドとして解釈される」と書いていたが、これは
+    // 大小を区別するファイルシステム(Linux など)では成り立たない。そこでは Warmup.json は
+    // warmup.json とは別のファイルで、main() のサブコマンド判定も大小を区別するので
+    // `swap Warmup` は普通に復元として通る。弾く判断は「大小を畳む環境が存在する以上、
+    // 予約の意味が綴りひとつで消えないようにする」ことであって、復元できないことではない。
     fail('その名前は swap のサブコマンドと同じなので使えません: ' + name
-      + '\n  作れたとしても `swap ' + name + '` はサブコマンドとして解釈されるため、'
-      + 'そのスロットを復元する手段がなくなります'
+      + (folded === name
+        ? '\n  作れたとしても `swap ' + name + '` はサブコマンドとして解釈されるため、'
+          + 'そのスロットを復元する手段がなくなります'
+        : '\n  大小違いも同じ名前として弾いています。大小を区別しないファイルシステム'
+          + '(Windows・macOS)では accounts/' + folded + '.json として保存され、'
+          + '`swap ' + folded + '` がサブコマンドとして解釈されるため、そのスロットを'
+          + '復元する手段がなくなります')
       + '\n  別の名前を指定してください');
   }
 }

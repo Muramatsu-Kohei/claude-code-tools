@@ -2864,6 +2864,12 @@ const TRUNCATED_CURRENT =
   const r = runSwap(home, ['save', 'Warmup']);
   check('大小違いでも予約名は新しい退避先に使わせない',
     r.code === 1 && /サブコマンドと同じ/.test(r.err), r.out + r.err);
+  // 弾く理由は環境によって変わる。大小を区別するファイルシステム(Linux など)では
+  // accounts/Warmup.json は warmup.json とは別のファイルで、main() のサブコマンド判定も
+  // 大小を区別するので `swap Warmup` は普通に復元として通る。そこで「復元する手段が
+  // なくなります」とだけ言うと、事実に反する理由で断ることになる。
+  check('大小違いを弾く理由は、大小を畳む環境の話として説明する',
+    /大小を区別しないファイルシステム/.test(r.err), r.err);
   check('中止したのでファイルも作らない', !fs.existsSync(acctPath(home, 'Warmup')), r.err);
 }
 {
