@@ -19,7 +19,9 @@ const OTHER = path.join(BASE, 'other-repo'); // 保護と無関係なツリー(�
 
 for (const r of [TREE, SIMILAR, OTHER]) {
   fs.mkdirSync(r, { recursive: true });
-  execFileSync('git', ['init', '-q'], { cwd: r, windowsHide: true });
+  // git は stdin を読まないのでハングの実害は薄いが、孤児プロセスが残る事故(issue #8)の
+  // 検出網として timeout だけは掛けておく
+  execFileSync('git', ['init', '-q'], { cwd: r, windowsHide: true, timeout: 30000, killSignal: 'SIGKILL' });
 }
 
 const CONFIG = { restrictedTrees: [{ tree: TREE, allow: ['team'] }] };
@@ -197,7 +199,9 @@ check('F1: config の tree の大小が実際のキーと違っても保護ツ�
 // 専用のサンドボックスに紛れない名前の保護ツリーを別途用意する
 const MOVE_TREE = path.join(BASE, 'move-tree'); // 保護ツリー(move 専用)。TREE と別名にして SIMILAR に紛れないようにする
 fs.mkdirSync(MOVE_TREE, { recursive: true });
-execFileSync('git', ['init', '-q'], { cwd: MOVE_TREE, windowsHide: true });
+// git は stdin を読まないのでハングの実害は薄いが、孤児プロセスが残る事故(issue #8)の
+// 検出網として timeout だけは掛けておく
+execFileSync('git', ['init', '-q'], { cwd: MOVE_TREE, windowsHide: true, timeout: 30000, killSignal: 'SIGKILL' });
 const { home: home4, logDir: logDir4 } = sandboxHome(
   path.join(BASE, 'home-move'),
   { restrictedTrees: [{ tree: MOVE_TREE, allow: ['team'] }] },

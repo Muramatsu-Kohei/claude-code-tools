@@ -31,6 +31,9 @@ function projectKey(p) {
 function repoRoot() {
   return normPath(execFileSync('git', ['rev-parse', '--show-toplevel'], {
     cwd: TOOL_DIR, encoding: 'utf8', windowsHide: true,
+    // git は stdin を読まないのでハングの実害は薄いが、孤児プロセスが残る事故(issue #8)の
+    // 検出網として timeout だけは掛けておく
+    timeout: 30000, killSignal: 'SIGKILL',
   }).trim());
 }
 
@@ -65,14 +68,26 @@ function runner(home, defaultCwd) {
     const env = {
       ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1', ...(opts.env || {}),
     };
+    // worklog.js は session-start/session-end で stdin から同期的にフック JSON を読む
+    // (worklog.js:504)。ここで input を渡さない呼び出しは stdio[0] を 'ignore' にして
+    // 明示的に閉じているので EOF 待ちにはならないが、テストの書き方を誤ってフック系の
+    // コマンドで input を渡し忘れる余地は残る。timeout はその保険(issue #8 と同じ構造)。
+    const timeout = 30000;
     try {
       const out = execFileSync(process.execPath, [WORKLOG, ...args], {
         input: opts.input, encoding: 'utf8', cwd: opts.cwd || defaultCwd, env,
         stdio: [opts.input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
-        windowsHide: true,
+        windowsHide: true, timeout, killSignal: 'SIGKILL',
       });
       return { code: 0, out, err: '' };
     } catch (e) {
+      // timeout で殺された場合、e.status は null で e.code に 'ETIMEDOUT' が入る。ここで
+      // code: -1 に潰すと呼び出し側の「非 0 終了」判定(想定内の失敗)と区別が付かず、
+      // ハングが PASS として集計されてしまう。timeout は基盤の異常なので assertion の
+      // 合否に混ぜず、その場で投げて止める。
+      if (e.code === 'ETIMEDOUT') {
+        throw new Error(`子プロセスが timeout(${timeout}ms)で強制終了された: ${WORKLOG} ${args.join(' ')}`);
+      }
       // 非 0 終了もテスト対象(引数エラーの確認)なので投げずに返す
       return { code: e.status == null ? -1 : e.status, out: e.stdout || '', err: e.stderr || '' };
     }

@@ -12,7 +12,9 @@ const { home, logDir } = sandboxHome(BASE);
 // ものになってしまう(プロジェクト = git ルート)
 const REPO = path.join(BASE, 'repo');
 fs.mkdirSync(REPO, { recursive: true });
-execFileSync('git', ['init', '-q'], { cwd: REPO, windowsHide: true });
+// git は stdin を読まないのでハングの実害は薄いが、孤児プロセスが残る事故(issue #8)の
+// 検出網として timeout だけは掛けておく
+execFileSync('git', ['init', '-q'], { cwd: REPO, windowsHide: true, timeout: 30000, killSignal: 'SIGKILL' });
 
 const { check, finish } = checks();
 const run = runner(home, REPO);

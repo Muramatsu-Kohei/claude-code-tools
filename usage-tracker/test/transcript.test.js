@@ -37,12 +37,24 @@ function writeTranscript(home, project, id, recs) {
 // 偽 HOME を向けてスクリプトを実行する。非 0 終了も検証対象なので投げずに返す
 function run(script, home) {
   const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+  // 孤児プロセスが残る事故(issue #8)の検出網として timeout を掛ける。stdin は既に
+  // 'ignore' で閉じているのでこのスクリプト自体がハングする経路は無いはずだが、
+  // 念のための保険。
+  const timeout = 30000;
   try {
     const out = execFileSync(process.execPath, [path.join(TRANSCRIPT, script)], {
       encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+      timeout, killSignal: 'SIGKILL',
     });
     return { code: 0, out, err: '' };
   } catch (e) {
+    // timeout で殺された場合、e.status は null で e.code に 'ETIMEDOUT' が入る。ここで
+    // code: -1 に潰すと呼び出し側の「非 0 終了」判定(想定内の失敗)と区別が付かず、
+    // ハングが PASS として集計されてしまう。timeout は基盤の異常なので assertion の
+    // 合否に混ぜず、その場で投げて止める。
+    if (e.code === 'ETIMEDOUT') {
+      throw new Error(`子プロセスが timeout(${timeout}ms)で強制終了された: ${script}`);
+    }
     return { code: e.status == null ? -1 : e.status, out: e.stdout || '', err: e.stderr || '' };
   }
 }

@@ -23,7 +23,11 @@ touch(MULTI, 'tools', 'tool-d', 'README.md');
 mk(SINGLE, 'UI'); mk(SINGLE, 'docs');
 touch(SINGLE, 'README.md');
 touch(SINGLE, 'UI', 'README.md');
-for (const r of [MULTI, SINGLE]) execFileSync('git', ['init', '-q'], { cwd: r, windowsHide: true });
+// git は stdin を読まないのでハングの実害は薄いが、孤児プロセスが残る事故(issue #8)の
+// 検出網として timeout だけは掛けておく
+for (const r of [MULTI, SINGLE]) {
+  execFileSync('git', ['init', '-q'], { cwd: r, windowsHide: true, timeout: 30000, killSignal: 'SIGKILL' });
+}
 
 function write(repo, sessions) {
   const lines = [];
