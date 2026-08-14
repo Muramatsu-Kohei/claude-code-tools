@@ -2635,4 +2635,62 @@ const TRUNCATED_CURRENT =
     out.includes('書きかけのまま残っているファイルがあります'), out);
 }
 
+// --- 現在の credentials が 2 回続けて読めないとき、復元ガードを素通りさせない ---
+// cmdSwap は readCurrentForGuard() の結果 cur を 1 度だけ取り、4 つの復元ガード(同一性・
+// 来歴・退避先が復元元と同じ・別アカウントだと確認できない)はすべて `cur && …` で書かれて
+// いる。cur が null になると 4 つが同時に外れる。そのあと saveCurrent が
+// `pre || readCredsOrNull(CREDENTIALS)` で自前に読み直しており、その 3 度目が成功すると、
+// ガードを 1 つも通っていない切り替えが、退避だけ済ませて先へ進んでいた。来歴が復元元を
+// 指していれば、退避はそのスロット(= 復元元)を現在のログインで上書きし、続く writeAtomic が
+// 読み込み済みの旧内容をマシン全体へ書き戻す。--force は要らず、exit 0 で終わるので
+// `swap team && claude -p …` のようなラッパーは成功として扱う。
+// nth:[1,4] は上の status のテストと同じ「readCredsOrNull 経由の 2 回だけを落とす」指定
+// (2・3・5 回目の probeFile / unreadableReason 経由は通す)。
+{
+  const home = sandbox('current-unreadable-twice-swap', {
+    current: creds('team', { token: 'CUR-NEW' }),
+    accounts: { team: creds('team', { token: 'SLOT-OLD' }) },
+    slot: 'team',
+  });
+  const r = execSwapScript(SWAP, ['team'], {
+    env: {
+      ...homeEnv(home),
+      NODE_OPTIONS: '--require ' + path.join(__dirname, 'fault-fs.js'),
+      SWAP_FAULT: JSON.stringify({
+        call: 'readFileSync', match: '.credentials.json', kind: 'throw', code: 'EBUSY', nth: [1, 4],
+      }),
+    },
+  });
+  const live = fs.readFileSync(credPath(home), 'utf8');
+  const slot = fs.readFileSync(acctPath(home, 'team'), 'utf8');
+  check('ガードが素通りしたまま切り替えを完了しない', r.code !== 0, r.out + r.err);
+  // 巻き戻りの検査は「新しいトークンが残っている」と「古いトークンが入っていない」の両方を
+  // 見る。前者だけだと、両方を書いてしまう実装(退避と差し替えの順序が入れ替わった場合)を
+  // 見逃す。
+  check('マシン全体の credentials を旧トークンへ巻き戻さない',
+    live.includes('CUR-NEW') && !live.includes('SLOT-OLD'), live);
+  check('復元元のスロットを現在のログインで上書きしない',
+    slot.includes('SLOT-OLD') && !slot.includes('CUR-NEW'), slot);
+}
+
+// --- 生バイト列から拾えたトークンを refreshToken と名指ししない ---
+// rawHasRecoverableToken は refreshToken と accessToken のどちらでも真になるのに、これを
+// 使う 3 箇所(status の控えの集計・saveFirstText・account-guard の拒否文)はいずれも
+// 「refreshToken が残っています」と断定していた。書き込みの途中で accessToken の直後に
+// 切れた控えは実際にこの形になるので、そこに「交換すればまた使えます」と案内すると、
+// 存在しない復旧手段を探させることになる。判定そのものは変えない(accessToken だけでも
+// 失って困る中身なので、控えを消させない側に倒したまま)。
+{
+  const home = sandbox('raw-token-not-named-refresh', { current: creds('pro') });
+  fs.mkdirSync(replacedDir(home), { recursive: true });
+  fs.writeFileSync(path.join(replacedDir(home), '.unreadable-current-1.json'),
+    '{"claudeAiOauth":{"accessToken":"AT-PARTIAL', 'utf8');
+  const out = (({ out: o, err }) => o + err)(runSwap(home, []));
+  check('控えは「消さないでください」の側に残したまま(判定は変えない)',
+    out.includes('消さないでください'), out);
+  check('残っていたトークンを refreshToken と名指ししない',
+    !out.includes('refreshToken が残っている控え')
+    && !out.includes('refreshToken は交換すれば'), out);
+}
+
 report();
