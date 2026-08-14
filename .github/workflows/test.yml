@@ -10,6 +10,11 @@ on:
     branches: [main]
   pull_request:
 
+# テストを回すだけで、リポジトリへの書き込みも API 呼び出しもしない。GITHUB_TOKEN の
+# 既定権限はリポジトリ設定次第で書き込みまで付きうるので、ここで読み取りに絞っておく。
+permissions:
+  contents: read
+
 jobs:
   test:
     # windows を使うのは、対象ツールが Windows 前提(.cmd・PowerShell・%USERPROFILE%・
@@ -42,9 +47,13 @@ jobs:
         run: node test/run.js
 
       - name: claude-worklog
+        # 前段の account-guard が落ちてもここで止めない。1 回の実行で 3 ツールぶんの
+        # 結果が出揃うようにする(cancelled でのみスキップし、常に走る always() は使わない)。
+        if: ${{ !cancelled() }}
         working-directory: claude-worklog
         run: node test/run.js
 
       - name: usage-tracker
+        if: ${{ !cancelled() }}
         working-directory: usage-tracker
         run: node test/run.js
