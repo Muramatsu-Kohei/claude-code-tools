@@ -25,11 +25,16 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      # v4 系は action 自体が Node 20 ランタイムで動く実装で、ランナー側から非推奨の
+      # 警告が出る(Node 24 に強制的に載せ替えられて動いてはいる)。警告を消すため v7 系に上げる。
+      # これは action の実装が動くランタイムの話で、下の node-version(テストを実行する
+      # Node のバージョン)とは別物。
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           # ローカルの開発環境(v20.13.1)に合わせる。上げるときはローカルも揃えること。
+          # なお Node 20 自体は既に EOL に入っている。ローカルを上げる際はここも一緒に上げる。
           node-version: '20'
 
       # claude-worklog と account-guard のテストは git init で偽リポジトリを作る。ランナーには
