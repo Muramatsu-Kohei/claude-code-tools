@@ -2693,4 +2693,72 @@ const TRUNCATED_CURRENT =
     && !out.includes('refreshToken は交換すれば'), out);
 }
 
+// --- 退避先に入っていた旧内容を退けたことを、その場の出力に出す ---
+// writeSlot が控えを取った事実(reportReplaced)を呼び出し側が出し忘れると、上書きが
+// 起きたことに気づくのは後日そのスロットを復元して別アカウントに戻ったときになる。
+// cmdSave 経路。
+{
+  const home = sandbox('report-replaced-save', {
+    current: creds('pro', { token: 'acct-B' }),
+    accounts: { personal: creds('pro', { token: 'acct-A' }) },
+    slot: 'personal',
+  });
+  const r = runSwap(home, ['save']);
+  check('退避は成功する', r.code === 0, r.out + r.err);
+  check('退けた旧内容をその場の出力に出す',
+    r.out.includes('入っていた旧内容は控えに退けました:'), r.out);
+  check('控えのパス(.replaced 配下)を出力に含める',
+    r.out.includes(replacedDir(home)), r.out);
+}
+{
+  // 同じ報告が cmdSwap の自動退避(切り替えの前に必ず通る)からも出ること。片方だけ直して
+  // 食い違う事故がこのファイルで繰り返し起きているので、経路ごとに別々に確かめる。
+  const home = sandbox('report-replaced-swap', {
+    current: creds('pro', { token: 'acct-B' }),
+    accounts: { personal: creds('pro', { token: 'acct-A' }), team: creds('team') },
+    slot: 'personal',
+  });
+  const r = runSwap(home, ['team']);
+  check('切り替えは成功する', r.code === 0, r.out + r.err);
+  check('自動退避で退けた旧内容もその場の出力に出す',
+    r.out.includes('入っていた旧内容は控えに退けました:'), r.out);
+  check('控えのパス(.replaced 配下)を出力に含める',
+    r.out.includes(replacedDir(home)), r.out);
+}
+
+// --- 未ログインの status は /login を案内する ---
+// 退避が 0 件でも、理由が「未ログイン」なのか「credentials を読めない」なのかで次の一手は
+// 別物になる。`swap save` だけを勧めると、案内どおり打っても「未ログイン」で止まる。
+{
+  const home = sandbox('status-true-first-run', {}); // credentials も退避も無い、真の初回状態
+  const r = runSwap(home, []);
+  check('status は成功する', r.code === 0, r.out + r.err);
+  check('現在のアカウントは未ログインと表示する', /現在のアカウント: 未ログイン/.test(r.out), r.out);
+  check('退避済み 0 件の案内は /login を含む', /なし。Claude Code で `\/login`/.test(r.out), r.out);
+}
+{
+  // 未ログインのまま存在しない名前を指定した場合も同じ理由で /login を案内すること
+  // (cmdSwap 側の既定文が別に持っているので、status と食い違いうる)。
+  const home = sandbox('swap-nope-true-first-run', {});
+  const r = runSwap(home, ['nope']);
+  check('未ログインで存在しない名前を指定すると中止する', r.code === 1, r.out + r.err);
+  check('エラー出力に /login を含む', r.err.includes('/login'), r.err);
+}
+
+// --- 現在ログイン中のスロットを、択一の選択肢として出さない ---
+// 「退避されていません」案内は利用可能なスロットごとに実際に打てるコマンドを列挙するが、
+// 現在ログイン中と同じ中身のスロットへ切り替えても no-op にしかならない。択一の選択肢として
+// 出す以上、選んで前進しないものは実行コマンドから外し、/login による別アカウント追加を促す。
+{
+  const home = sandbox('same-slot-not-a-choice', {
+    current: creds('pro', { token: 'same-tok' }),
+    accounts: { pro: creds('pro', { token: 'same-tok' }) },
+  });
+  const r = runSwap(home, ['nope']);
+  check('存在しない名前を指定すると中止する', r.code === 1, r.out + r.err);
+  check('現在ログイン中の文言を出す', /現在このスロットでログイン中です/.test(r.err), r.err);
+  check('pro を実際に打てるコマンドとして出さない(swap pro --force が出ない)',
+    !/swap pro --force/.test(r.err), r.err);
+}
+
 report();
