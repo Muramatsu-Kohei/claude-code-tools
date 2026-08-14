@@ -2761,4 +2761,90 @@ const TRUNCATED_CURRENT =
     !/swap pro --force/.test(r.err), r.err);
 }
 
+// --- 来歴が読めないときの status は「未記録」と正反対の案内を出す ---
+// 「未記録」(このツールをまだ使っていない)と「読めない」(ファイルはあるが開けない)は
+// readCurrentSlot がどちらも null を返すので、curSlot だけを見て文面を選ぶと区別できない。
+// currentSlotIsUnreadable() を見ずに書いていた頃は、読めないだけの状態で「来歴が未記録です。
+// `swap save <name>` で退避すると記録されます」という、打っても直らない案内を出し、
+// 一覧の `*` 印と「現在のログインと内容が違います」の判定が理由も告げずに消えていた
+// (stderr には「来歴(.current)を読めません」と出ているのに、両方出すと矛盾する)。
+{
+  const home = sandbox('status-current-unreadable', {
+    current: creds('pro', { token: 'cur' }),
+    accounts: { mypro: creds('pro', { token: 'mypro' }) },
+  });
+  fs.mkdirSync(slotPath(home), { recursive: true }); // .current をディレクトリにして読めなくする
+  const r = runSwap(home, []);
+  check('status は成功する', r.code === 0, r.out + r.err);
+  check('打っても直らない「来歴が未記録です」は出さない',
+    !r.out.includes('来歴が未記録です'), r.out);
+  check('読めないことを理由として明示する',
+    r.out.includes('来歴(.current)を読めないため'), r.out);
+  check('`*` 印と食い違い判定を出せていない旨の注記を、退避一覧の直後に出す',
+    r.out.includes('判定は出せていません'), r.out);
+}
+
+// --- 消せなかった来歴が読めないなら「残っている」と警告しない ---
+// dropCurrentSlot は unlinkSync が ENOENT 以外で失敗すると「古い来歴が残った」と扱っていたが、
+// 残った実体を readCurrentSlot が読めるかどうかまでは見ていなかった。.current がまるごと
+// ディレクトリだと read も unlink も EISDIR で落ちるが、残った実体は readCurrentSlot からは
+// 読めない(= 来歴としては効かず、次に名前を省いた退避が誤って別アカウントのスロットを
+// 上書きすることもない)。それでも「名前を省いた退避は別のアカウントのスロットを上書きします」
+// と警告するのは事実に反する。来歴を記録できなかったこと自体は伝える。
+{
+  const home = sandbox('save-dropcurrentslot-still-unreadable', {
+    current: creds('pro', { token: 'cur' }),
+  });
+  fs.mkdirSync(slotPath(home), { recursive: true }); // .current をディレクトリにして read も unlink も失敗させる
+  const r = runSwap(home, ['save', 'mypro']);
+  check('退避先への書き込み自体は済んでいる(来歴だけが書けない)',
+    tokenOf(acctPath(home, 'mypro')) === 'cur', r.out + r.err);
+  check('来歴を記録できなかったこと自体は伝える',
+    (r.out + r.err).includes('来歴を記録できませんでした'), r.out + r.err);
+  check('読めない残骸を実害があるかのように警告しない',
+    !(r.out + r.err).includes('古い来歴が残ったままです'), r.out + r.err);
+}
+
+// --- 来歴だけが根拠のスロットを、証明済みのものと同じ更新一覧に混ぜない ---
+// README の初回手順(swap save → 別アカウントで /login → swap save <別名>)をそのまま踏むと、
+// staleSlots(refreshToken の一致で裏を取れる)は 0 件のまま、driftedProvenance(来歴だけが
+// 根拠)だけが発火する。この 2 つは根拠の強さが違うので、stale 向けの見出し
+// 「前者だと分かっているときだけ更新してください」は stale が 1 件も無いときに出してはならない
+// (drifted しか無いのにこの見出しを出すと、来歴だけの推測を refreshToken 一致と同じ強さで
+// 語ることになる)。一方で drifted 向けの更新コマンド自体は行き止まりにせず出す。
+{
+  const home = sandbox('driftedprovenance-only', {
+    current: creds('pro', { token: 'acct-B' }),
+    accounts: { pro: creds('pro', { token: 'acct-A' }) },
+    slot: 'pro',
+  });
+  const r = runSwap(home, ['save', 'team']);
+  check('退避は成功する', r.code === 0, r.out + r.err);
+  check('今回の退避と内容が違うスロットとして pro を挙げる',
+    r.out.includes('今回の退避と内容が違うスロットがあります: pro'), r.out);
+  check('stale (refreshToken 一致) は 0 件なので、その見出しは出さない',
+    !r.out.includes('前者だと分かっているときだけ更新してください'), r.out);
+  check('根拠は来歴だけで、内容が古いという証明はないと明示する',
+    r.out.includes('pro の根拠は来歴だけで、内容が古いという証明はありません'), r.out);
+  check('中身を確かめたうえでの更新コマンド自体は出す(行き止まりにしない)',
+    r.out.includes('swap save pro --force'), r.out);
+}
+
+// --- usage は名前を省いた --force の意味も説明する ---
+// `swap save <name> --force` のままだと、名前を省いた場合の挙動(退避先が来歴か
+// subscriptionType から自動で決まる)が一切説明されず、案内どおり名前を省いて --force を
+// 付けた人が、意図しないスロットを上書きした理由を usage から読み取れなかった。
+{
+  const home = sandbox('usage-save-force-name-optional', {});
+  const r = runSwap(home, ['help']);
+  check('usage は成功する', r.code === 0, r.out + r.err);
+  // 行頭からの箇条書き行だけを見る。素の includes だと、`swap <name> --force` の説明中に
+  // 出てくる「それを許すのは swap save [<name>] --force だけ)」という言及にも当たってしまい、
+  // 箇条書き自体を元の `swap save <name> --force` へ戻した変異を検知できない。
+  check('swap save [<name>] --force の形(名前は省略可)を箇条書きとして案内する',
+    /^ {2}swap save \[<name>\] --force$/m.test(r.out), r.out);
+  check('名前を省いた場合に退避先が自動で決まる旨まで説明する',
+    r.out.includes('名前を省くと退避先は上の規則で決まるため'), r.out);
+}
+
 report();
