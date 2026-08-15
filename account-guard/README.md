@@ -208,7 +208,7 @@ $ node account-guard.js status C:/org-tree/some-project
 `/login` はブラウザ OAuth を毎回踏む必要があるが、切り替えで実際に変わるのは
 `~/.claude/.credentials.json` の 1 本だけで、CLAUDE.md・memory・skills・履歴は共有された
 ままになる。それならファイルを退避して入れ替えるほうが速い、という判断
-(比較検討は `docs/account-separation.md` §6.1)。
+(比較検討は `docs/account-separation.md` §5.1)。
 
 ```console
 $ swap                  # 現在のアカウントと退避済み一覧

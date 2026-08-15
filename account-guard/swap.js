@@ -4,7 +4,7 @@
 // なぜファイルの入れ替えなのか: `/login` はブラウザ OAuth を毎回踏む必要があるうえ、
 // 切り替えで変わるのは ~/.claude/.credentials.json の 1 本だけで、CLAUDE.md・memory・
 // skills・履歴・worklog・usage-tracker はすべて共有されたままだから。
-// 詳細と方式Bとの比較は docs/account-separation.md の §6.1 を参照。
+// 詳細と方式Bとの比較は docs/account-separation.md の §5.1 を参照。
 //
 // 重要: 認証の入れ替えはマシン全体に即座に効き、並行して動いている別セッションも巻き込む
 // (§1.3)。したがってタイマーやフックから自動実行してはならない。人が意図して叩くこと。
@@ -98,7 +98,7 @@ const {
 } = credentials;
 
 // 退避先を ~/.claude 配下に置くのは、元の credentials と同じ ACL を継承させるため。
-// 平文トークンの本数は増えるが、保護レベルは変わらない(§6.1 の「残るリスク」)。
+// 平文トークンの本数は増えるが、保護レベルは変わらない(§5.1 の「残るリスク」)。
 const ACCOUNTS_DIR = path.join(HOME, '.claude', 'accounts');
 // 現在のログインの来歴。スロットではないので、一覧が拾う `*.json` に当たらない名前にする。
 const CURRENT_FILE = path.join(ACCOUNTS_DIR, '.current');
@@ -126,7 +126,7 @@ const NAME_RE = /^[a-zA-Z0-9_-]+$/;
 // そのスロットを復元する引数の形が存在しなくなる(手でファイルを動かすしかない行き止まり)。
 // main() が実際にサブコマンドとして横取りする名前。この名前のスロットは既に復元できない。
 const DISPATCHED_NAMES = new Set(['save', 'help', '-h', '--help']);
-// warmup はまだ実装していないが、docs/account-separation.md §6.3 で仕様確定済みの
+// warmup はまだ実装していないが、docs/account-separation.md §5.3 で仕様確定済みの
 // サブコマンド(両アカウントの窓を開ける)。実装前にスロット名として取られると、実装した
 // 瞬間に `swap warmup` がそのスロットの復元ではなくサブコマンドとして解釈され、復元する
 // 引数の形が失われる(save で実際に起きたのと同じ袋小路)。予約は 1 語ぶんの自由と引き換えに
@@ -2253,7 +2253,7 @@ function usage() {
 取り違えて上書きしても accounts/<name>.json へ戻せば復旧できます。
 
 タイマーやフックから自動実行しないこと。認証の入れ替えはマシン全体に即座に効き、
-稼働中の別セッションを巻き込みます(docs/account-separation.md §1.3 / §6.1)。`);
+稼働中の別セッションを巻き込みます(docs/account-separation.md §1.3 / §5.1)。`);
 }
 
 function main() {

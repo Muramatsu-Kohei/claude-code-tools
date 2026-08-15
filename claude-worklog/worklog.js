@@ -661,7 +661,7 @@ function gitDelta(cwd, startHead) {
 // ---------------------------------------------------------------------------
 //  スコープ(1リポジトリ内のツール単位)
 //
-//  repo-A のように 1 リポジトリへ複数のツールが同居する構成では、プロジェクト単位の記録が
+//  このリポジトリのように 1 リポジトリへ複数のツールが同居する構成では、プロジェクト単位の記録が
 //  混ざって読めなくなる。そこで最上位ディレクトリ名をスコープとして扱う。
 //  要点は「リポジトリが複数ツール構成かの判定」と「セッションがどのツールの作業だったかの
 //  判定」を分けること。前者は目印ファイル、後者は変更ファイル数で決める。目印でセッションを
@@ -681,7 +681,7 @@ const DENY_DIRS = new Set(['docs', 'doc', 'test', 'tests', 'src', 'lib', 'bin', 
   'assets', 'images', 'dist', 'build', 'obj', 'out', 'target', 'legal', 'shared', 'common',
   'tmp', 'temp', 'node_modules', '.git', '.github', '.vscode', '.claude']);
 
-// 中身が個々のツールである入れ物。2 階層目までをスコープ名にする(例: tools/tool-d)
+// 中身が個々のツールである入れ物。2 階層目までをスコープ名にする(例: tools/image-resizer)
 const CONTAINER_DIRS = new Set(['tools', 'packages', 'apps', 'projects', 'crates', 'services']);
 
 const MULTI_TOOL_MIN = 2;
