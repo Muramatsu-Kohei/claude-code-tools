@@ -1342,7 +1342,7 @@ console.log('swap');
   check('復元できなくなることを理由として書く', /復元する手段がなくなります/.test(r.err), r.err);
 }
 {
-  // warmup はまだ実装していないが docs/account-separation.md §6.3 で仕様確定済み。
+  // warmup はまだ実装していないが docs/account-separation.md §5.3 で仕様確定済み。
   // 実装を待ってから予約すると、それまでに作られたスロットが実装した瞬間に復元不能になる
   // (`swap warmup` がサブコマンドとして解釈され、復元する引数の形が消える)。
   const home = sandbox('reserved-name-warmup', {
