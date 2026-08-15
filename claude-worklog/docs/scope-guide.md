@@ -82,9 +82,13 @@ worklog today --days 7                   # ClaudeCode/claude-worklog の形で�
 
 | 例 | 判定 | 中身 |
 | --- | --- | --- |
-| このリポジトリ | **有効**(5) | `account-guard` `claude-statusline` `claude-window-keeper` `claude-worklog` `usage-tracker` が自分の README を持つ。`docs` は持たないので数えない |
-| 単一ツールのリポジトリ | **無効**(0) | `src` `lib` `tests` `docs` … どれも自分の README を持たない → 内部構造なのでツールではない |
+| このリポジトリ | **有効**(5) | `account-guard` `claude-statusline` `claude-window-keeper` `claude-worklog` `usage-tracker` が自分の README を持つ。`docs` は数えない（下記） |
+| 目印を持つディレクトリが無いリポジトリ | **無効**(0) | `src` `lib` `tests` `docs` … どれも自分の README を持たない → 内部構造なのでツールではない |
 | ツールが1つだけのリポジトリ | **無効**(1) | 条件を満たす最上位ディレクトリが1つしかない |
+
+`docs` `src` `lib` などのありふれた名前は**除外リストに入れてあり、目印ファイルを置いても
+数えない**。内部構造のディレクトリにたまたま README があるだけでスコープが有効に切り替わると、
+ツール名でない語がラベルとして出てしまうため。
 
 1リポジトリ1ツールでは無効になり、**今と完全に同じ挙動**になる。`src` や `docs` が
 ツール名として出てくることはない。
