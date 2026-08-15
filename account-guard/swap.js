@@ -45,6 +45,9 @@
 
 const fs = require('fs');
 const path = require('path');
+// warmup は自分自身(swap.js)と ping スクリプトを子プロセスとして起動する。切り替えを
+// cmdSwap の関数呼び出しで済ませない理由は cmdWarmup のコメントに書いた。
+const { execFileSync } = require('child_process');
 // credentials の場所と読み方は account-guard.js と共有する(credentials.js のコメント参照)。
 // require を素通しにすると、隣に置き忘れた構成で生の MODULE_NOT_FOUND だけが出て真因に
 // たどり着けない(swap.cmd のパスを書き換えて swap.js だけ移すのは README が案内する配置)。
@@ -97,6 +100,32 @@ const {
   hasRecoverableToken, rawHasRecoverableToken,
 } = credentials;
 
+// サブコマンドの表は test/fault.test.js と共有する(理由は subcommands.js のコメント)。
+// credentials.js と同じく、隣に無いと動けない。require を素通しにすると DISPATCHED_NAMES が
+// 空になり、`swap save` がサブコマンドではなくスロット名として解釈される = 退避のつもりで
+// 打ったコマンドが accounts/save.json の復元に走り、切り替わっていないのに exit 0 で終わる。
+// 生の MODULE_NOT_FOUND で止まるより静かで危ないので、ここで形まで確かめて落とす。
+let subcommands;
+try {
+  subcommands = require('./subcommands');
+} catch (e) {
+  fail('swap.js の隣にある subcommands.js を読み込めません'
+    + '\n  (' + path.join(__dirname, 'subcommands.js') + ': ' + (e.code || e.message) + ')'
+    + '\n  swap.js を別の場所へ移した場合は、subcommands.js も同じディレクトリへ置いてください');
+}
+if (
+  !subcommands
+  || !Array.isArray(subcommands.SUBCOMMANDS)
+  || subcommands.SUBCOMMANDS.length === 0
+  || !subcommands.SUBCOMMANDS.every(s => s && typeof s.name === 'string' && s.name)
+  || !Array.isArray(subcommands.RESERVED_ONLY_NAMES)
+) {
+  fail('swap.js の隣にある subcommands.js の形式が想定と違います'
+    + '\n  (' + path.join(__dirname, 'subcommands.js') + ')'
+    + '\n  SUBCOMMANDS(name を持つ要素の空でない配列)と RESERVED_ONLY_NAMES(配列)が必要です'
+    + '\n  swap.js と対応する版の subcommands.js を同じディレクトリへ置き直してください');
+}
+
 // 退避先を ~/.claude 配下に置くのは、元の credentials と同じ ACL を継承させるため。
 // 平文トークンの本数は増えるが、保護レベルは変わらない(§5.1 の「残るリスク」)。
 const ACCOUNTS_DIR = path.join(HOME, '.claude', 'accounts');
@@ -125,17 +154,13 @@ const NAME_RE = /^[a-zA-Z0-9_-]+$/;
 // 読むので、`accounts/save.json` を作れてしまうと `swap save` は復元ではなく退避に走り、
 // そのスロットを復元する引数の形が存在しなくなる(手でファイルを動かすしかない行き止まり)。
 // main() が実際にサブコマンドとして横取りする名前。この名前のスロットは既に復元できない。
-const DISPATCHED_NAMES = new Set(['save', 'help', '-h', '--help']);
-// warmup はまだ実装していないが、docs/account-separation.md §5.3 で仕様確定済みの
-// サブコマンド(両アカウントの窓を開ける)。実装前にスロット名として取られると、実装した
-// 瞬間に `swap warmup` がそのスロットの復元ではなくサブコマンドとして解釈され、復元する
-// 引数の形が失われる(save で実際に起きたのと同じ袋小路)。予約は 1 語ぶんの自由と引き換えに
-// それを塞ぐので、実装を待たずにここへ入れておく。
-// ただし「新しく作らせない」ことと「既にあるスロットを復元できない」ことは別。予約しただけの
-// 名前は main() が横取りしないので、今は `swap warmup` で普通に復元できる。両者を同じ集合で
-// 判定していたため、status が復元できるスロットを「復元できません」と警告し、不要な改名や、
-// より危険な /login のやり直しへ誘導していた。実装するときはこの名前を上へ移すだけでよい。
-const RESERVED_ONLY_NAMES = new Set(['warmup']);
+const DISPATCHED_NAMES = new Set(subcommands.SUBCOMMANDS.map(s => s.name));
+// 仕様は確定しているが main() がまだ横取りしていない名前(いまは空。subcommands.js 参照)。
+// 「新しく作らせない」ことと「既にあるスロットを復元できない」ことは別で、予約しただけの
+// 名前は main() が横取りしない以上、そのスロットは普通に復元できる。両者を同じ集合で
+// 判定していた頃は、status が復元できるスロットを「復元できません」と警告し、不要な改名や、
+// より危険な /login のやり直しへ誘導していた。集合を分けているのはそのため。
+const RESERVED_ONLY_NAMES = new Set(subcommands.RESERVED_ONLY_NAMES);
 const RESERVED_NAMES = new Set([...DISPATCHED_NAMES, ...RESERVED_ONLY_NAMES]);
 
 // `swap <name>` を「打てるコマンド」として案内してよいか。validateName は新規作成しか
@@ -2229,6 +2254,284 @@ function cmdSwap(target, force) {
   }
 }
 
+// --- warmup(退避済みアカウントの 5 時間枠をまとめて開ける) ---
+
+// 子プロセス 1 つあたりの上限。仕様が定めているのは ping の 5 分だが、切り替えにも同じ値を
+// 使う。趣旨は「1 つが固まったまま開始時のアカウントへ戻れなくなる状態を作らない」ことで、
+// それは切り替えが固まった場合にも同じく当てはまる(docs/account-separation.md §5.3)。
+const WARMUP_STEP_TIMEOUT_MS = 5 * 60 * 1000;
+
+// ping スクリプトの場所。既定は claude-window-keeper をこのリポジトリと同じ並びに置いた配置。
+// CLAUDE_WINDOW_PING で上書きできるのは、window-keeper を別の場所へ置いた人のためと、
+// テストがダミーを差し込むため(本物を叩くと実際に枠を消費する)。
+// ping を swap.js が自前の `claude -p` で済ませないのは、window-keeper の state が更新されず、
+// 次の毎時実行で ping が二重に飛んで窓が張り直るため(§5.3)。
+function pingScript() {
+  const fromEnv = process.env.CLAUDE_WINDOW_PING;
+  if (fromEnv && fromEnv.trim()) return path.resolve(fromEnv.trim());
+  return path.join(__dirname, '..', 'claude-window-keeper', 'claude-window-ping.ps1');
+}
+
+// 確認の答えは同期で読む。readline は非同期で、答えを待つ間に呼び出し元が先へ進んでしまう
+// (このファイルは同期処理だけで組まれており、そこへ非同期を 1 本持ち込むと、確認を取る前に
+//  切り替えが走る経路ができる)。fd 0 を直接読むのがそのための唯一の手。
+function readAnswer() {
+  const buf = Buffer.alloc(256);
+  // 非ブロッキングで開かれた stdin は、まだ入力が無いだけで EAGAIN を返す。回数で諦めると
+  // 「考えている間に中止された」になるので、EOF か 1 行来るまで待つ。busy loop にしないため
+  // Atomics.wait で同期的に眠る(同期のまま待てる手段が他に無い)。
+  const idle = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
+    try {
+      const n = fs.readSync(0, buf, 0, buf.length, null);
+      return n > 0 ? buf.subarray(0, n).toString('utf8') : '';
+    } catch (e) {
+      if (e.code === 'EAGAIN') {
+        Atomics.wait(idle, 0, 0, 20);
+        continue;
+      }
+      // EOF は「入力が閉じられた」= 答えなし。それ以外は呼び出し元が中止の理由に使う。
+      if (e.code === 'EOF') return '';
+      throw e;
+    }
+  }
+}
+
+function confirmWarmup() {
+  process.stdout.write('続けますか? [y/N] ');
+  let answer;
+  try {
+    answer = readAnswer();
+  } catch (e) {
+    console.log('');
+    console.log('確認の入力を読めませんでした(' + (e.code || e.message) + ')。中止します。');
+    console.log('  意図して非対話で実行する場合は `swap warmup --yes` を使ってください。');
+    return false;
+  }
+  const a = answer.trim().toLowerCase();
+  return a === 'y' || a === 'yes';
+}
+
+// 子プロセスの失敗理由を 1 行にする。status が無いまま死んだ場合(タイムアウト・強制終了)を
+// 終了コードと混ぜない。混ぜると、固まって殺されたのか、ガードに当たって正しく中止したのかが
+// 結果一覧から読み取れなくなる。
+function childFailureReason(e) {
+  if (e.status != null) return '終了コード ' + e.status;
+  if (e.code === 'ETIMEDOUT') return 'タイムアウト(' + (WARMUP_STEP_TIMEOUT_MS / 1000) + '秒)で強制終了';
+  return '終了コードを残さずに落ちた(code=' + (e.code || '不明') + ' signal=' + (e.signal || 'なし') + ')';
+}
+
+// 切り替えは swap.js 自身を子プロセスとして呼ぶ。cmdSwap を関数として呼ばないのは、あちらの
+// ガードが 10 箇所すべて fail() = process.exit(1) で中止する前提で書かれているため。関数呼び出しに
+// すると、1 つのアカウントがガードに当たった時点でプロセスごと終わり、「片方が失敗しても残りは
+// 試し、最後に必ず開始時へ戻す」という warmup の意味論が成立しない。ガードの文面を戻り値へ
+// 作り替える改修は、出力を 1 行ずつ検証している既存テストを丸ごと巻き込むので採らない。
+// プロセス境界に閉じ込めれば、exit code だけで成否が取れて、案内の文面はそのまま画面に流れる。
+// __filename を使うのは、テストが SWAP_SCRIPT で変異版を指しているとき、子も同じ版になるため。
+//
+// force を渡すのは「開始時のアカウントへ戻る」切り替えだけ(呼び出し側がそう判断する)。
+// 他のアカウントへ進む切り替えでは渡さない。warmup が代わりに同意することになり、失効・
+// 判別不能・同一プランのガードが 1 回の確認でまとめて外れる。
+// 戻る側で渡すのは、それを付けないと不変条件そのものが破れるため。--force なしの切り替えは
+// 「同一プランで別アカウントだと証明できない」ときに中止する。プランの違う 3 つ以上の
+// アカウントを開けると、たとえば max -> team -> max と渡り歩いたあと最後の max へ戻る段で
+// このガードに当たり、開始時とは別のアカウントに乗ったまま戻れなくなる(実際に再現した)。
+// ガードが守っているのは「別アカウントを取り違えて上書きする」ことだが、戻り先の退避は
+// この実行の最初の切り替えで warmup 自身が書いた内容そのもの(cmdSwap は切り替えの前に必ず
+// 現在のログインを来歴 = 開始時のスロット名へ退避する)なので、取り違えようがない。
+// 一度も切り替わっていなければ呼び出し側が来歴を見て切り替え自体を行わないため、古い退避を
+// --force で掘り起こす経路にもならない。
+function runSwapChild(name, force) {
+  try {
+    execFileSync(process.execPath, force ? [__filename, name, '--force'] : [__filename, name], {
+      stdio: 'inherit',
+      timeout: WARMUP_STEP_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    });
+    return { ok: true, why: '' };
+  } catch (e) {
+    return { ok: false, why: childFailureReason(e) };
+  }
+}
+
+// ping は仕様どおり powershell.exe 経由で呼び、-Force は付けない(5 時間未経過なら ping 側が
+// SKIP する)。出力はそのまま素通しし、warmup 側では解析しない。SKIP は return で抜けるため
+// 終了コードで送信と区別できず、標準出力の文字列に依存すると ping 側の表示を変えた日に
+// 黙って壊れるため(§5.3 の「SKIP の見せ方」)。
+function runPing(script) {
+  try {
+    execFileSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script], {
+      stdio: 'inherit',
+      timeout: WARMUP_STEP_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    });
+    return { ok: true, why: '' };
+  } catch (e) {
+    return { ok: false, why: childFailureReason(e) };
+  }
+}
+
+// 切り替える前に、そのスロットが ping まで到達できるかを見る。復元してから失効に気づく形だと、
+// 更新できない認証にマシン全体を乗せた状態で次のアカウントへ進むことになり、その間に動いて
+// いる別セッションを巻き込む。判定は cmdSwap のガードと同じ材料(refreshToken の有無と失効)を
+// 見るが、あちらは --force で外せるのに対しこちらは外す手段を用意しない。warmup は複数回
+// 切り替えるので、1 回の同意でガードをまとめて外させない。
+function warmupPrecheck(name) {
+  let c;
+  try {
+    c = readCreds(accountFile(name));
+  } catch (e) {
+    return '退避を読めません(' + (e.code || e.message) + ')';
+  }
+  if (!refreshTokenOf(c.json)) return 'refreshToken がありません(/login のやり直しが必要)';
+  if (isExpired(c.json)) return '失効しています(/login のやり直しが必要)';
+  return null;
+}
+
+function cmdWarmup(yes) {
+  // ping スクリプトの不在は、1 つ目のアカウントへ切り替える前に確かめる。切り替えてから
+  // 気づくと、戻す手間だけ掛けて何も達成しない実行になる。ここで止まっても壊れるのは warmup
+  // だけで、`swap <name>` と `swap save` は動く(§5.3。ping を持たない人のための約束)。
+  const ping = pingScript();
+  if (!probeFile(ping).exists) {
+    fail('ping スクリプトが見つかりません: ' + ping
+      + '\n  claude-window-keeper を別の場所へ置いている場合は、環境変数 CLAUDE_WINDOW_PING に'
+      + ' claude-window-ping.ps1 のパスを設定してください'
+      + '\n  使えなくなるのは warmup だけです(`swap <name>` と `swap save` は今までどおり動きます)');
+  }
+
+  // 戻り先はスロット名で持つ。ここが決まらないと不変条件「終了時のアカウント = 開始時の
+  // アカウント」を守れないので、切り替えを 1 回も行わないうちに中止する。
+  const start = readCurrentSlot();
+  if (!start) {
+    fail(currentSlotIsUnreadable()
+      ? '来歴(.current)を読めないので、戻り先のアカウントを決められません: ' + CURRENT_FILE
+        + '\n  warmup は複数回切り替えたあと必ず開始時のアカウントへ戻すため、'
+        + '戻り先が決まらない状態では実行しません'
+        + '\n  .current を読める状態に戻すか、`swap <いまのアカウント名>` で来歴を record し直してください'
+      : '来歴(.current)が未記録なので、戻り先のアカウントを決められません'
+        + '\n  warmup は複数回切り替えたあと必ず開始時のアカウントへ戻すため、'
+        + '戻り先が決まらない状態では実行しません'
+        + '\n  先に `swap save <いまのアカウント名>` で現在のアカウントを退避すると、来歴が記録されます');
+  }
+
+  const { names, error } = savedAccounts();
+  if (error) {
+    fail('退避済みアカウントの一覧を読めません(' + error + '): ' + ACCOUNTS_DIR
+      + '\n  一覧が読めないと、どのアカウントの窓を開けるべきかを決められません'
+      + '\n  ディレクトリを読める状態に戻してから、もう一度実行してください');
+  }
+  // 復元できない名前(サブコマンドと同名)のスロットは `swap <name>` で戻せないので、warmup も
+  // 開けられない。黙って飛ばすと「一覧にあるのに結果に出ない」になるため、理由ごと知らせる。
+  const unreachable = names.filter(n => !restorableByName(n));
+  const targets = names.filter(restorableByName);
+  if (targets.length === 0) {
+    fail('開けられる退避がありません'
+      + (unreachable.length
+        ? '\n  ' + unreachable.join(', ') + ' は' + renameToRestoreText(unreachable[0])
+        : '\n  先に `swap save <名前>` で現在のアカウントを退避してください'));
+  }
+  if (!targets.includes(start)) {
+    // readCurrentSlot は指す先の実在まで確かめているので、ここに来るのは来歴が「復元できない
+    // 名前」のスロットに乗っている場合だけ。戻れないと分かっている状態では始めない。
+    fail('来歴が指すスロット(' + start + ')へは `swap ' + start + '` で戻せません'
+      + '\n  ' + renameToRestoreText(start)
+      + '\n  改名してから warmup を実行してください');
+  }
+
+  // 開始時のアカウントを最後に回す。不変条件は finally で守るが、最後に置けば正常に終わった
+  // 時点で既に戻っているので、余分な切り替えが 1 回減る。
+  const order = [...targets.filter(n => n !== start), start];
+
+  console.log('warmup: 次のアカウントの 5 時間枠を順に開きます');
+  for (const n of order) console.log('  ' + n + (n === start ? '  [開始時のアカウント]' : ''));
+  if (unreachable.length) {
+    console.log('除外: ' + unreachable.join(', ') + ' — ' + renameToRestoreText(unreachable[0]));
+  }
+  console.log('ping: ' + ping);
+  // 強制終了(Ctrl-C など)まではプロセス側で保証できないので、戻し方を先に伝えておく(§5.3)。
+  console.log('終了時は ' + start + ' に戻します。中断された場合は `swap ' + start + '` で戻せます。');
+
+  if (!yes) {
+    if (!process.stdin.isTTY) {
+      fail('標準入力が端末ではないため中止しました'
+        + '\n  warmup は認証の入れ替えを複数回行うので、稼働中の別セッションを巻き込む度合いが'
+        + ' `swap` 単体より大きくなります'
+        + '\n  タイマーやフックから自動実行しないでください(docs/account-separation.md §5.2)'
+        + '\n  意図して非対話で実行する場合だけ `swap warmup --yes` を使ってください');
+    }
+    if (!confirmWarmup()) {
+      console.log('中止しました(何も変更していません)。');
+      return;
+    }
+  }
+
+  const results = [];
+  // 一度でも切り替えを試みたか。試みていなければ認証は開始時のままなので、戻す必要がない
+  // (戻すために余分な切り替えを 1 回走らせると、それ自体が別セッションを巻き込む)。
+  let switched = false;
+  try {
+    for (const name of order) {
+      console.log('');
+      console.log('--- ' + name + ' ---');
+      const skip = warmupPrecheck(name);
+      if (skip) {
+        console.log('スキップ: ' + skip);
+        results.push({ name, state: 'スキップ', why: skip });
+        continue;
+      }
+      // 開始時のアカウントが順番の先頭に来ることはない(最後に回している)が、直前の切り替えが
+      // 失敗して認証がそのまま残っている場合に備え、来歴を読み直して要否を決める。
+      if (readCurrentSlot() !== name) {
+        switched = true;
+        // 最後の 1 つ(= 開始時のアカウント)へ移る切り替えは「戻る」動作なので --force を使う。
+        // 途中のアカウントへ進む切り替えでは使わない(runSwapChild のコメント参照)。
+        const r = runSwapChild(name, name === start);
+        if (!r.ok) {
+          console.log('切り替えに失敗しました(' + r.why + ')');
+          results.push({ name, state: '失敗', why: '切り替え: ' + r.why });
+          continue;
+        }
+      }
+      const p = runPing(ping);
+      results.push({ name, state: p.ok ? '成功' : '失敗', why: p.ok ? '' : 'ping: ' + p.why });
+    }
+  } finally {
+    // 不変条件: 終了時のアカウント = 開始時のアカウント。ping が失敗しても、途中で例外が
+    // 出ても守る。追跡していた値ではなく来歴を読み直すのは、切り替えが「credentials は
+    // 書けたが .current は書けなかった」半端な状態で終わっている可能性があるため。
+    //
+    // 本線 — 順番の最後に置いた開始時のアカウントへ戻る切り替え — はループの中で済むので、
+    // ここへ来るのは「それが失敗した」か「想定外の例外でループを抜けた」ときだけ。前者は
+    // cmdSwap が「退避に失敗したら切り替えない」設計なので、別アカウントに乗ったまま戻れない
+    // 状態自体が作りにくく、テストからこの分岐へ到達させられていない(swap.test.js の warmup
+    // 群が検査しているのは本線のほう)。変異させても緑のままになる = 検査で守られていない
+    // 防御なので、消すときはテストの結果を根拠にしないこと。
+    if (switched && readCurrentSlot() !== start) {
+      console.log('');
+      console.log('開始時のアカウント(' + start + ')に戻します。');
+      const back = runSwapChild(start, true);
+      if (!back.ok) {
+        // ここは stdout に既に出力したあとなので fail(process.exit)は使わない。
+        // 直前に出した行がパイプ越しに切れる(failText 直上のコメントと同じ理由)。
+        failText('開始時のアカウント(' + start + ')に戻せませんでした(' + back.why + ')'
+          + '\n  いまどのアカウントにログインしているかは `swap` で確認できます'
+          + '\n  手で戻す場合は `swap ' + start + '` を実行してください');
+        process.exitCode = 1;
+      }
+    }
+  }
+
+  console.log('');
+  console.log('結果:');
+  for (const r of results) {
+    console.log('  ' + r.name + ': ' + r.state + (r.why ? ' — ' + r.why : ''));
+  }
+  // スキップは失敗ではない(失効した退避を飛ばすのは仕様どおりの動作)ので、終了コードは
+  // 立てない。立てるのは実際に開けなかった窓があるときだけ。
+  if (results.some(r => r.state === '失敗')) process.exitCode = 1;
+}
+
 function usage() {
   console.log(`Claude のログインアカウントを切り替える
 
@@ -2246,6 +2549,14 @@ function usage() {
                        credentials を諦めて進む」つもりで付けた --force が、
                        たまたま同じ名前になった別アカウントのスロットを上書きしうる
                        (旧内容の控えは残るので戻せる)
+  swap warmup          退避済みアカウントの 5 時間枠を順に開く
+                       各アカウントへ切り替えて ping を 1 発ずつ打ち、最後は必ず
+                       開始時のアカウントへ戻す。失効した退避はスキップする
+                       --force は受け付けない(複数回の切り替えを 1 回の同意で
+                       強行させないため)
+  swap warmup --yes    実行前の確認を省く
+                       標準入力が端末でないときは、これが無いと中止する
+                       (タイマーやフックから自動実行させないための歯止め)
 
 退避先: ${ACCOUNTS_DIR}
 現在のログインがどのスロット由来かは ${CURRENT_FILE} に記録します。
@@ -2267,16 +2578,45 @@ function main() {
   // 取り除く以上、"--force" という文字列が cmd や extra に残ることは無く、validateName まで
   // 届かない(NAME_RE 単体は "--force" を弾かないが、CLI の入り口で先に消費される)。
   const force = args.includes('--force');
-  const rest0 = args.filter(a => a !== '--force');
+  // --yes も位置に関わらず取り除く。--force を位置不問にしたのと同じ理由で、`swap --yes warmup`
+  // と打たれたときに --yes がサブコマンド名として解釈され、意図した形で打っているのに
+  // 「退避されていません」で止まる、という食い違いを避ける。
+  const yes = args.includes('--yes');
+  const rest0 = args.filter(a => a !== '--force' && a !== '--yes');
   if (rest0.length === 0) {
-    // --force だけを渡された(適用対象が無い)。cmdStatus に横流しすると
-    // 「引数が無いので状態表示」と「--force だけ渡した」が区別できず、typo に気づけない。
-    fail('--force を付けるコマンドがありません'
-      + '\n  `swap <name> --force` または `swap save --force` の形で指定してください');
+    // フラグだけを渡された(適用対象が無い)。cmdStatus に横流しすると「引数が無いので状態表示」と
+    // 「フラグだけ渡した」が区別できず、typo に気づけない。
+    if (force) {
+      fail('--force を付けるコマンドがありません'
+        + '\n  `swap <name> --force` または `swap save --force` の形で指定してください');
+    }
+    fail('--yes を付けるコマンドがありません'
+      + '\n  `swap warmup --yes` の形で指定してください');
   }
   const [cmd, ...rest] = rest0;
-  if (cmd === '-h' || cmd === '--help' || cmd === 'help') return usage();
   const extra = rest;
+  if (cmd === 'warmup') {
+    if (extra.length > 0) {
+      fail('引数が多すぎます: ' + args.join(' ')
+        + '\n  `swap warmup` は名前を取りません(退避済みのアカウントをすべて順に開きます)');
+    }
+    if (force) {
+      fail('warmup は --force を受け付けません'
+        + '\n  --force は失効済み・判別不能・同一プランのガードをまとめて外すフラグで、warmup に'
+        + '付けると、複数回行う切り替えのすべてに 1 回の同意で効いてしまいます'
+        + '\n  特定のアカウントへ強行したい場合は `swap <name> --force` を個別に実行してください');
+    }
+    return cmdWarmup(yes);
+  }
+  // --yes は warmup 専用。他のコマンドで黙って捨てると、確認を省いたつもりのフラグが何にも
+  // 効いていないまま進む(--force を位置不問にしたときと同じ、「打った形と効く内容が食い違う」
+  // 事故になる)。
+  if (yes) {
+    fail('--yes は warmup 専用です: ' + args.join(' ')
+      + '\n  実行前に確認を取るのは warmup だけなので、他のコマンドでは効きません'
+      + '\n  `swap warmup --yes` の形で使ってください');
+  }
+  if (cmd === '-h' || cmd === '--help' || cmd === 'help') return usage();
   // 余分な引数は typo の兆候なので黙って捨てない(save は名前を 1 つだけ取る)
   if (cmd === 'save') {
     if (extra.length > 1) {

@@ -19,7 +19,12 @@ const { execFileSync } = require('child_process');
 const { makeHarness } = require('./harness');
 
 const BASE = path.join(__dirname, '.tmp', 'swap');
-const SWAP = path.join(__dirname, '..', 'swap.js');
+// SWAP_SCRIPT でテスト対象の swap.js を差し替えられるようにしておく(test/fault.test.js と
+// test/reachable.test.js に元からある口を、こちらにも揃えた)。感度検証 — わざと壊した版を
+// 指して、守っているはずのテストが本当に FAIL するかを確かめる — のためのもので、既定は
+// 本物の swap.js。warmup は自分自身を子プロセスとして起こすが、そちらは __filename を使うので
+// 差し替えた版のまま連鎖する。
+const SWAP = process.env.SWAP_SCRIPT ? path.resolve(process.env.SWAP_SCRIPT) : path.join(__dirname, '..', 'swap.js');
 // 故障注入(SWAP_FAULT)を使うテストだけがこれを NODE_OPTIONS 経由で子プロセスに渡す。
 // 仕組みは test/fault.test.js と同じ(fault-fs.js のコメント参照)。
 const FAULT_FS = path.join(__dirname, 'fault-fs.js');
@@ -119,10 +124,32 @@ function execSwapScript(script, argv = [], { cwd, env } = {}) {
   }
 }
 
+// warmup は CLAUDE_WINDOW_PING が指すスクリプトを実際に起動する。指し忘れると既定の
+// ../claude-window-keeper/claude-window-ping.ps1(実在する)に落ち、テストが `claude -p` を
+// 飛ばして 5 時間枠を本当に消費する。取り返しがつかないので、すべての子プロセスに必ず
+// ダミーを渡し、存在を確かめられないうちは 1 つも起動しない。
+const PING_STUB = path.join(__dirname, 'ping-stub.ps1');
+if (!fs.existsSync(PING_STUB)) {
+  throw new Error('ping スタブが見つかりません: ' + PING_STUB
+    + '\n  これが無いと warmup が本物の ping スクリプトを叩く可能性があるため、実行しません');
+}
+
 // USERPROFILE/HOME を home に差し替えた環境変数の組み立て。ほとんどの呼び出しがこの形を
 // 必要とするのでここに寄せる(account-guard.test.js の homeEnv() と同じ形)。
+// PING_LOG / PING_EXIT は ping スタブの挙動を変えるので、親から漏れ込まないよう毎回落とす
+// (warmup のテストだけが extraEnv で明示的に渡す)。
 function homeEnv(home) {
-  return { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+  const env = {
+    ...process.env,
+    USERPROFILE: home,
+    HOME: home,
+    NO_COLOR: '1',
+    CLAUDE_WINDOW_PING: PING_STUB,
+  };
+  delete env.PING_LOG;
+  delete env.PING_EXIT;
+  delete env.PING_LABEL;
+  return env;
 }
 
 // extraEnv は故障注入(SWAP_FAULT・NODE_OPTIONS)など、通常は使わない環境変数を子プロセスに
@@ -1366,36 +1393,46 @@ console.log('swap');
   check('改名という実際に効く対処を出す', /改名してください/.test(r.out), r.out);
 }
 {
-  // RESERVED_ONLY_NAMES(warmup)は DISPATCHED_NAMES と違い main() がまだ横取りしていないので、
-  // 今のところ `swap warmup` で普通に復元できる。この違いを同じ「復元できません」で扱うと、
-  // 復元できるバックアップに対して不要な改名や、より危険な /login のやり直しへ誘導する
-  // (swap.js の RESERVED_ONLY_NAMES 周辺コメント参照)。validateName は warmup を新規スロット名
-  // として弾くので、accounts/warmup.json は sandbox() で直接ファイルとして置く(save 経由では作れない)。
+  // warmup は予約(RESERVED_ONLY_NAMES)を経て DISPATCHED_NAMES へ移り、main() が実際に
+  // 横取りするようになった。かつては「今のところ復元できる」ことを裏取りしていたが、
+  // 実装された今は逆に「もう復元できない」ことが事実になっている(status の予告どおり)。
+  // validateName は warmup を新規スロット名として弾くので、accounts/warmup.json は
+  // sandbox() で直接ファイルとして置く(save 経由では作れない)。
   const home = sandbox('reserved-only-name-warmup', {
     current: creds('pro', { token: 'pro-tok' }),
-    accounts: { warmup: creds('team', { token: 'warmup-tok' }) },
+    accounts: {
+      warmup: creds('team', { token: 'warmup-tok' }),
+      pro: creds('pro', { token: 'pro-tok' }),
+    },
+    slot: 'pro',
   });
   const r = runSwap(home, []);
-  check('まだ復元できる warmup を「復元できない名前」とは言わない(事実と違う)',
-    !/復元できない名前の退避があります/.test(r.out), r.out + r.err);
-  check('代わりに「いずれ復元できなくなる」と案内する',
-    /いずれ復元できなくなる名前の退避があります: warmup/.test(r.out), r.out);
-  check('実装された時点で復元できなくなるといういまのうちの改名を促す',
-    /実装された時点で復元できなくなる/.test(r.out) && /いまのうちに改名してください/.test(r.out), r.out);
+  check('実装済みの warmup は「復元できない名前」として案内する',
+    /復元できない名前の退避があります: warmup/.test(r.out), r.out + r.err);
+  check('改名という実際に効く対処を出す', /改名してください/.test(r.out), r.out);
+  check('もう「いずれ復元できなくなる」という予告は出さない(事実が追い越した)',
+    !/いずれ復元できなくなる名前の退避があります/.test(r.out), r.out);
 
-  // 警告が事実と食い違わないことの裏取り。実際に `swap warmup` を実行すると復元できることを見る
-  // (別プランなので --force なしで通る。他のテストの basic 経路と同じ組み合わせ)。
+  // 裏取り: `swap warmup` を実行しても accounts/warmup.json は復元されない。--yes を
+  // 付けていないので、この sandbox(来歴あり・ping スタブあり・退避先あり)では
+  // 「標準入力が端末ではない」で中止するところまで進み、切り替えを 1 回も行わずに終わる。
   const restored = runSwap(home, ['warmup']);
-  check('実際に `swap warmup` を実行すると復元できる',
-    restored.code === 0 && tokenOf(credPath(home)) === 'warmup-tok', restored.out + restored.err);
+  check('`swap warmup` を実行しても復元されない(標準入力が端末ではないため中止)',
+    restored.code === 1 && /標準入力が端末ではない/.test(restored.out + restored.err),
+    restored.out + restored.err);
+  check('credentials は pro のまま変わらない(warmup の中身に置き換わらない)',
+    tokenOf(credPath(home)) === 'pro-tok', restored.out + restored.err);
 }
 {
   // 予約名スロットの来歴があると、以後どのアカウントへも切り替えられなくなっていたバグの回帰。
-  // `swap warmup` で復元すると .current が warmup を指す。その後の `swap <他のスロット>` は
-  // 切り替えの前に必ず現在のログインを来歴の名前(= warmup)へ退避するが、validateName が
-  // 予約語を実在確認なしで一律に弾いていた頃は、ここで「サブコマンドと同じなので使えません」
-  // に当たり中断していた(退避なしでは切り替えも起きない)。既に実在するスロットには予約語
-  // チェックを効かせないことで、この行き止まりを塞いだ(validateName 参照)。
+  // warmup は DISPATCHED_NAMES へ移ったので、いまは `swap warmup` で復元して .current が
+  // warmup を指すことはない。それでも来歴が warmup を指す状態は、`swap save warmup`(既存
+  // スロットの明示的な更新。下の「予約名でも既存スロットの明示的な更新は通る」テスト参照)
+  // で今も作れる。その状態で `swap <他のスロット>` は切り替えの前に必ず現在のログインを
+  // 来歴の名前(= warmup)へ退避するが、validateName が予約語を実在確認なしで一律に弾いて
+  // いた頃は、ここで「サブコマンドと同じなので使えません」に当たり中断していた(退避なしでは
+  // 切り替えも起きない)。既に実在するスロットには予約語チェックを効かせないことで、この
+  // 行き止まりを塞いだ(validateName 参照)。
   const home = sandbox('reserved-name-warmup-provenance-swap', {
     current: creds('team', { token: 'warmup-cur-tok' }),
     accounts: {
@@ -2891,18 +2928,12 @@ const TRUNCATED_CURRENT =
   check('大小違いを弾く理由は、大小を畳む環境の話として説明する',
     /大小を区別しないファイルシステム/.test(r.err), r.err);
   check('中止したのでファイルも作らない', !fs.existsSync(acctPath(home, 'Warmup')), r.err);
-}
-{
-  // status の予告も同じ照合で見ている。ここが大小を区別していたため、大小違いで作られた
-  // スロットにだけ「いずれ復元できなくなる」が出ず、予約が守ろうとしていた当のスロットが
-  // 無警告のまま実装日を迎えることになっていた(そのときには復元の引数の形が消えている)。
-  const home = sandbox('reserved-only-name-mixed-case', {
-    current: creds('pro', { token: 'pro-tok' }),
-    accounts: { Warmup: creds('team', { token: 'warmup-tok' }) },
-  });
-  const r = runSwap(home, []);
-  check('大小違いの予約名スロットにも「いずれ復元できなくなる」を出す',
-    /いずれ復元できなくなる名前の退避があります: Warmup/.test(r.out), r.out + r.err);
+  // かつてここには、大小違いの予約名スロットにも status の「いずれ復元できなくなる」予告が
+  // 出ることを確かめるテストがあった(RESERVED_ONLY_NAMES を見る側の大小照合の回帰)。
+  // warmup を実装したことで RESERVED_ONLY_NAMES が空になり、その予告自体が出なくなったので
+  // 検証対象が消え、削除した。次に「仕様確定・未実装」のサブコマンドを RESERVED_ONLY_NAMES へ
+  // 予約するときは、この種のテストを復活させること(`git log -S RESERVED_ONLY_NAMES` で
+  // このテストの旧内容までたどれる。subcommands.js の同じコメント参照)。
 }
 
 // --- 消せなかった来歴が、指す先を消された残骸でも「残っている」と警告しない ---
@@ -2947,6 +2978,260 @@ const TRUNCATED_CURRENT =
     (r.out + r.err).includes('来歴を記録できませんでした'), r.out + r.err);
   check('指す先を消された残骸を実害があるかのように警告しない',
     !(r.out + r.err).includes('古い来歴が残ったままです'), r.out + r.err);
+}
+
+// --- swap warmup ---
+// 退避済みアカウントの 5 時間枠をまとめて開く。この機能で最も壊れやすいのは「複数回の
+// 切り替えを試したあと、開始時のアカウントへ戻り損ねる」ことなので、正常系・失敗系の
+// どちらでも不変条件(終了時のアカウント = 開始時のアカウント)を必ず確認する。
+// もう一つの軸は「ping を持たない人でも `swap` / `swap save` は今までどおり動く」約束と、
+// 「--yes が無い非対話実行やタイマー・フックからの自動実行を歯止めする」こと。
+//
+// PING_LOG は ping-stub.ps1 が呼ばれるたびに 1 行、その時点でログイン中の refreshToken を
+// 追記する。空行を除いた配列で比較すれば、「呼ばれた回数」と「どの順でどのアカウントに
+// 切り替えてから呼ばれたか」の両方を一度に検査できる(仕様の核心はここ)。
+function pingLines(logPath) {
+  // Add-Content(PowerShell)は CRLF で改行するので、\r が残ったまま比較すると
+  // 'refresh-work-tok' と 'refresh-work-tok\r' の食い違いで一致しなくなる。
+  return fs.existsSync(logPath)
+    ? fs.readFileSync(logPath, 'utf8').split(/\r?\n/).filter(Boolean) : [];
+}
+
+{
+  // 正常系(核心)。退避 3 件(personal=開始時, work, dead=失効済み)を warmup --yes で回すと、
+  // 失効した dead は ping されずスキップされ、残り(work → personal の順、開始時は必ず最後)
+  // だけが「切り替えてから ping」される。終了後は必ず開始時(personal)へ戻る。
+  const home = sandbox('warmup-basic', {
+    current: creds('max', { token: 'personal-tok' }),
+    accounts: {
+      personal: creds('max', { token: 'personal-tok' }),
+      work: creds('team', { token: 'work-tok' }),
+      dead: creds('pro', { token: 'dead-tok', expiresInDays: -1 }),
+    },
+    slot: 'personal',
+  });
+  const pingLog = path.join(home, 'ping.log');
+  const r = runSwap(home, ['warmup', '--yes'], { PING_LOG: pingLog });
+  check('warmup --yes は成功する', r.code === 0, r.out + r.err);
+  const lines = pingLines(pingLog);
+  check('失効した dead は ping されず、残り 2 件だけ ping される', lines.length === 2, lines.join(','));
+  check('1 件目は work に切り替えてから ping している',
+    lines[0] === 'refresh-work-tok', lines.join(','));
+  check('2 件目(最後)は開始時のアカウント personal に切り替えてから ping している',
+    lines[1] === 'refresh-personal-tok', lines.join(','));
+  check('終了時の来歴は開始時のアカウント personal のまま(不変条件)',
+    slotOf(home) === 'personal', slotOf(home));
+  check('終了時の credentials も personal のまま(不変条件)',
+    tokenOf(credPath(home)) === 'personal-tok', tokenOf(credPath(home)));
+  check('結果一覧に dead のスキップ理由が出る',
+    /^ {2}dead: スキップ — 失効しています/m.test(r.out), r.out);
+  check('結果一覧に work の成功が出る', /^ {2}work: 成功$/m.test(r.out), r.out);
+  check('結果一覧に personal の成功が出る', /^ {2}personal: 成功$/m.test(r.out), r.out);
+}
+{
+  // 同一プランを跨いで戻る経路。プランの違う 3 件を渡り歩くと、最後の 1 歩が「同一プランで
+  // 別アカウントだと証明できない」ガードに当たる(max -> team -> max と進んで、最後にその max へ
+  // 戻る)。戻る向きで --force を使わずにいると、ここで中止して開始時とは別のアカウントに乗った
+  // まま終わる = 不変条件が破れる(実装当初はそうなっていた)。戻り先の退避はこの実行の最初の
+  // 切り替えで warmup 自身が書いた内容そのものなので、取り違えようがない
+  // (swap.js の runSwapChild のコメント参照)。
+  // 退避一覧は名前順に並ぶので、開始時の personal の直前が同一プランの zzz になるよう名前を選んである。
+  const home = sandbox('warmup-returns-across-same-plan', {
+    current: creds('max', { token: 'personal-tok' }),
+    accounts: {
+      personal: creds('max', { token: 'personal-tok' }),
+      aaa: creds('team', { token: 'aaa-tok' }),
+      zzz: creds('max', { token: 'zzz-tok' }),
+    },
+    slot: 'personal',
+  });
+  const pingLog = path.join(home, 'ping.log');
+  const r = runSwap(home, ['warmup', '--yes'], { PING_LOG: pingLog });
+  check('同一プランを跨ぐ並びでも warmup は成功する', r.code === 0, r.out + r.err);
+  check('3 件すべてが「切り替えてから ping」される(戻る 1 歩も落ちない)',
+    pingLines(pingLog).join(',') === 'refresh-aaa-tok,refresh-zzz-tok,refresh-personal-tok',
+    pingLines(pingLog).join(','));
+  check('終了時の来歴は開始時のアカウント personal(不変条件)',
+    slotOf(home) === 'personal', slotOf(home));
+  check('終了時の credentials も personal(不変条件)',
+    tokenOf(credPath(home)) === 'personal-tok', tokenOf(credPath(home)));
+}
+{
+  // 進む向きの切り替えでは --force を使わない。同一プランの別アカウントは「別アカウントだと
+  // 証明できない」ので、cmdSwap は --force なしなら中止する。warmup がここで代わりに同意すると、
+  // 相手の唯一のバックアップを取り違えて潰す経路が 1 回の確認でまとめて開く。上の
+  // warmup-returns-across-same-plan と対になるテストで、片方だけを見て --force を一律に
+  // 付ける/外すと必ずどちらかが落ちる。
+  const home = sandbox('warmup-does-not-force-forward', {
+    current: creds('max', { token: 'personal-tok' }),
+    accounts: {
+      personal: creds('max', { token: 'personal-tok' }),
+      other: creds('max', { token: 'other-tok' }),
+    },
+    slot: 'personal',
+  });
+  const pingLog = path.join(home, 'ping.log');
+  const r = runSwap(home, ['warmup', '--yes'], { PING_LOG: pingLog });
+  check('同一プランの別アカウントへは進まない(失敗として記録される)',
+    /^ {2}other: 失敗/m.test(r.out), r.out);
+  check('失敗があるので終了コードは 1', r.code === 1, `code=${r.code}\n` + r.out + r.err);
+  check('進めなかった other では ping されない',
+    pingLines(pingLog).join(',') === 'refresh-personal-tok', pingLines(pingLog).join(','));
+  check('進めなかったので認証は開始時のまま(不変条件)',
+    tokenOf(credPath(home)) === 'personal-tok', tokenOf(credPath(home)));
+  check('other の退避は手つかず(取り違えて潰していない)',
+    tokenOf(acctPath(home, 'other')) === 'other-tok', tokenOf(acctPath(home, 'other')));
+}
+{
+  // 退避が開始時のアカウント 1 つだけのとき、そのアカウントは既にログイン中なので
+  // 切り替え自体が起きない(ping だけ 1 回走る)。切り替えを常に 1 回入れてしまうと、
+  // 退避が 1 件しかない人ほど無駄な認証の入れ替えでセッションを巻き込むことになる。
+  const home = sandbox('warmup-single-slot-is-start', {
+    current: creds('max', { token: 'solo-tok' }),
+    accounts: { personal: creds('max', { token: 'solo-tok' }) },
+    slot: 'personal',
+  });
+  const pingLog = path.join(home, 'ping.log');
+  const r = runSwap(home, ['warmup', '--yes'], { PING_LOG: pingLog });
+  check('warmup --yes は成功する', r.code === 0, r.out + r.err);
+  check('ping は 1 回だけ', pingLines(pingLog).length === 1, pingLines(pingLog).join(','));
+  check('切り替えは起きない(子プロセスの「切り替え:」行が出ない)',
+    !/切り替え:/.test(r.out), r.out);
+  check('来歴は変わらない', slotOf(home) === 'personal', slotOf(home));
+}
+{
+  // ping が失敗しても(PING_EXIT で終了コード 3 を再現)、開始時のアカウントには必ず戻る。
+  // 開始時のアカウントは順番の最後に置かれるので、最後のステップの ping が失敗しても
+  // 「切り替え」自体は先に終わっており、credentials は開始時のまま残る。
+  const home = sandbox('warmup-ping-fails', {
+    current: creds('max', { token: 'personal-tok' }),
+    accounts: {
+      personal: creds('max', { token: 'personal-tok' }),
+      work: creds('team', { token: 'work-tok' }),
+    },
+    slot: 'personal',
+  });
+  const pingLog = path.join(home, 'ping.log');
+  const r = runSwap(home, ['warmup', '--yes'], { PING_LOG: pingLog, PING_EXIT: '3' });
+  check('ping が失敗した分は終了コード 1', r.code === 1, r.out + r.err);
+  check('結果一覧で work が失敗になる',
+    /^ {2}work: 失敗 — ping: 終了コード 3$/m.test(r.out), r.out);
+  check('開始時のアカウント(personal)には必ず戻る(不変条件は ping 失敗でも守る)',
+    slotOf(home) === 'personal' && tokenOf(credPath(home)) === 'personal-tok', r.out + r.err);
+}
+{
+  // --yes が無く、標準入力も端末ではない(テストの子プロセスは常に非 TTY)ときは、
+  // タイマーやフックからの自動実行を防ぐため切り替えを 1 回も行わずに中止する。
+  const home = sandbox('warmup-no-yes-non-tty', {
+    current: creds('max', { token: 'tok' }),
+    accounts: { personal: creds('max', { token: 'tok' }) },
+    slot: 'personal',
+  });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['warmup']);
+  checkAbort('--yes 無しの非対話実行', home, before, r);
+  check('理由は「標準入力が端末ではない」', /標準入力が端末ではない/.test(r.err), r.err);
+}
+{
+  // `swap warmup --force` は中止する。--force は失効・判別不能・同一プランのガードを
+  // まとめて外すフラグで、warmup に付けると複数回の切り替えすべてに 1 回の同意で効いてしまう。
+  const home = sandbox('warmup-force-rejected', { current: creds('max', { token: 'tok' }) });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['warmup', '--force']);
+  checkAbort('warmup --force', home, before, r);
+  check('理由は「--force を受け付けません」', /--force を受け付けません/.test(r.err), r.err);
+}
+{
+  // `swap warmup` は名前を取らない。余分な引数は typo の兆候なので黙って捨てない。
+  const home = sandbox('warmup-extra-arg', { current: creds('max', { token: 'tok' }) });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['warmup', 'foo']);
+  checkAbort('warmup への引数過多', home, before, r);
+  check('理由は「引数が多すぎます」', /引数が多すぎます/.test(r.err), r.err);
+}
+{
+  // --yes は位置に関わらず取り除かれる。`swap --yes warmup` でも warmup --yes と同じに動く。
+  const home = sandbox('warmup-yes-before-subcommand', {
+    current: creds('max', { token: 'personal-tok' }),
+    accounts: {
+      personal: creds('max', { token: 'personal-tok' }),
+      work: creds('team', { token: 'work-tok' }),
+    },
+    slot: 'personal',
+  });
+  const pingLog = path.join(home, 'ping.log');
+  const r = runSwap(home, ['--yes', 'warmup'], { PING_LOG: pingLog });
+  check('`swap --yes warmup` は成功する', r.code === 0, r.out + r.err);
+  check('--yes が位置に関わらず効いて実際に ping まで進む',
+    pingLines(pingLog).length === 2, pingLines(pingLog).join(','));
+  check('終了時の来歴は開始時のアカウントのまま(不変条件)',
+    slotOf(home) === 'personal' && tokenOf(credPath(home)) === 'personal-tok', r.out + r.err);
+}
+{
+  // --yes は warmup 専用。他のコマンドに付けると、確認を省いたつもりのフラグが
+  // 何にも効いていないまま進む事故になるので中止する。
+  const home = sandbox('warmup-yes-on-save', { current: creds('max', { token: 'tok' }) });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['save', '--yes']);
+  checkAbort('save --yes', home, before, r);
+  check('理由は「warmup 専用」', /warmup 専用/.test(r.err), r.err);
+}
+{
+  // `swap --yes` だけ(適用対象が無い)は typo の兆候として中止する。
+  const home = sandbox('warmup-yes-alone', {});
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['--yes']);
+  checkAbort('--yes だけ', home, before, r);
+  check('理由は「--yes を付けるコマンドがありません」', /--yes を付けるコマンドがありません/.test(r.err), r.err);
+}
+{
+  // 来歴(.current)が未記録だと、警告を必ず戻すべき開始時のアカウントが決められないので、
+  // 切り替えを 1 回も行わずに中止する(退避先はあるが、どれが開始時かが分からない状態)。
+  const home = sandbox('warmup-no-provenance', {
+    accounts: { personal: creds('max', { token: 'tok' }) },
+  });
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['warmup', '--yes']);
+  checkAbort('来歴未記録での warmup', home, before, r);
+  check('「来歴」と「戻り先」の両方に言及する',
+    /来歴/.test(r.err) && /戻り先/.test(r.err), r.err);
+}
+{
+  // ping スクリプトが見つからないときは、1 つ目のアカウントへ切り替える前に気づいて
+  // 中止する。特に重要なのは、ping を持たない人でも `swap` / `swap save` は今までどおり
+  // 動くという約束が守られていること(同じ home・同じ壊れた CLAUDE_WINDOW_PING で確認する)。
+  const home = sandbox('warmup-no-ping-script', {
+    current: creds('max', { token: 'tok' }),
+  });
+  const noSuchPing = path.join(home, 'no-such-ping.ps1');
+  const before = snapshotTree(home);
+  const r = runSwap(home, ['warmup', '--yes'], { CLAUDE_WINDOW_PING: noSuchPing });
+  checkAbort('ping スクリプトが無い warmup', home, before, r);
+  check('理由は「ping スクリプトが見つかりません」', /ping スクリプトが見つかりません/.test(r.err), r.err);
+
+  const saveResult = runSwap(home, ['save'], { CLAUDE_WINDOW_PING: noSuchPing });
+  check('ping を持たない環境でも `swap save` は今までどおり成功する',
+    saveResult.code === 0, saveResult.out + saveResult.err);
+}
+{
+  // 復元できない名前のスロット(accounts/save.json、サブコマンドと衝突)が混ざっていても、
+  // それだけを除外して残りは開ける。除外した名前は理由ごと画面に出し、ping もされない
+  // (呼び出せないスロットに対して静かに何もしないのではなく、なぜ開けなかったかを示す)。
+  const home = sandbox('warmup-excludes-unrestorable', {
+    current: creds('max', { token: 'personal-tok' }),
+    accounts: {
+      personal: creds('max', { token: 'personal-tok' }),
+      save: creds('pro', { token: 'save-tok' }),
+    },
+    slot: 'personal',
+  });
+  const pingLog = path.join(home, 'ping.log');
+  const r = runSwap(home, ['warmup', '--yes'], { PING_LOG: pingLog });
+  check('復元できないスロットを除外しても成功する', r.code === 0, r.out + r.err);
+  check('除外した名前(save)を出力に出す', /除外: save/.test(r.out), r.out);
+  const lines = pingLines(pingLog);
+  check('save スロットでは ping されていない(personal の 1 回だけ)',
+    lines.length === 1 && lines[0] === 'refresh-personal-tok', lines.join(','));
 }
 
 report();
