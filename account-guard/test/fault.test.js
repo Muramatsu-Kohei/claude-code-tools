@@ -25,6 +25,17 @@ const {
   credPath, acctPath, slotPath,
   collectTokens, listFiles,
 } = require('./sandbox');
+// 操作列の元になるサブコマンドの表。ここから生成する理由は pickOperation のコメント参照。
+const { SUBCOMMANDS, BARE_FAULT_ARGVS, NAME_PLACEHOLDER } = require('../subcommands');
+
+// warmup は CLAUDE_WINDOW_PING が指すスクリプトを実際に起動する。ダミーを指し忘れると
+// 本物の claude-window-ping.ps1 に落ち、テストが `claude -p` を飛ばして 5 時間枠を本当に
+// 消費する(取り返しがつかない)。存在を確かめられないまま子プロセスを起動しない。
+const PING_STUB = path.join(__dirname, 'ping-stub.ps1');
+if (!fs.existsSync(PING_STUB)) {
+  throw new Error('ping スタブが見つかりません: ' + PING_STUB
+    + '\n  これが無いと warmup が本物の ping スクリプトを叩く可能性があるため、実行しません');
+}
 
 // SWAP_FAULT を親プロセス(このファイル自身)の環境に残したまま require すると、
 // fault-fs.js の分岐がここで発火して自分の fs まで壊しかねない。WRAPPED_CALLS を
@@ -101,16 +112,20 @@ function writeSandbox(home, { current, accounts, slot }) {
 }
 
 // --- 操作列 ---
+// 操作列はサブコマンドの表(../subcommands.js)から作る。6 パターンを直書きしていた頃は、
+// 新しいサブコマンドを足しても操作列には入らず、故障注入の守備範囲から静かに漏れていた
+// (warmup のように keepAside と .current を触るコマンドが漏れると、この property test が
+//  守っている不変条件そのものが検査されないまま緑になる)。表から作れば、subcommands.js へ
+// 1 行足すだけで自動的にここへ入る。
+const OPERATIONS = [
+  ...BARE_FAULT_ARGVS,
+  ...SUBCOMMANDS.flatMap(s => s.faultArgvs),
+];
 function pickOperation(rng) {
   const name = NAME_POOL[Math.floor(rng() * NAME_POOL.length)];
-  switch (Math.floor(rng() * 6)) {
-    case 0: return { label: 'swap', argv: [] };
-    case 1: return { label: 'swap save', argv: ['save'] };
-    case 2: return { label: `swap save ${name}`, argv: ['save', name] };
-    case 3: return { label: `swap save ${name} --force`, argv: ['save', name, '--force'] };
-    case 4: return { label: `swap ${name}`, argv: [name] };
-    default: return { label: `swap ${name} --force`, argv: [name, '--force'] };
-  }
+  const argv = OPERATIONS[Math.floor(rng() * OPERATIONS.length)]
+    .map(a => (a === NAME_PLACEHOLDER ? name : a));
+  return { label: ['swap', ...argv].join(' '), argv };
 }
 
 // --- 故障注入 ---
@@ -135,7 +150,20 @@ function randomFault(rng) {
 // (毎回付け外しする条件分岐を増やすと、条件を間違えたときに故障が静かに注入されなくなる
 // 事故のほうが起きやすい)。
 function runSwap(home, argv, fault) {
-  const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1', NODE_OPTIONS: '--require ' + FAULT_FS };
+  const env = {
+    ...process.env,
+    USERPROFILE: home,
+    HOME: home,
+    NO_COLOR: '1',
+    NODE_OPTIONS: '--require ' + FAULT_FS,
+    // warmup の ping を必ずダミーへ向ける(PING_STUB のコメント参照)。子が起動する孫の
+    // swap プロセスにもそのまま継承される。
+    CLAUDE_WINDOW_PING: PING_STUB,
+  };
+  // 呼ばれた回数を数える必要はない(この test の不変条件はトークンの残存だけ)ので、
+  // PING_LOG は設定しない。スタブは何も書かずに終わる。
+  delete env.PING_LOG;
+  delete env.PING_EXIT;
   if (fault) env.SWAP_FAULT = JSON.stringify(fault);
   else delete env.SWAP_FAULT;
   // execFileSync は stdio を pipe で開くので、swap.js が stdin を読まなくても子は親の
@@ -220,6 +248,9 @@ console.log(`  (${CASES} ケース, ${((Date.now() - startedAt) / 1000).toFixed(
     path.join(__dirname, '..', 'swap.js'),
     path.join(__dirname, '..', 'credentials.js'),
     path.join(__dirname, '..', 'account-guard.js'),
+    // fs をまったく呼ばない純データのモジュールだが、一覧から外すと「呼ぶようになった日」に
+    // 誰も気づけない。この検査が守っているのは網羅であって、いま何件当たるかではない。
+    path.join(__dirname, '..', 'subcommands.js'),
   ];
   // 意図的な除外はファイル単位で持つ。ファイルを問わない 1 つの集合にしていた頃は、ある
   // ファイルのために書いた除外が全ファイルに効いてしまい、たとえば swap.js の書き込み経路に
@@ -227,9 +258,13 @@ console.log(`  (${CASES} ケース, ${((Date.now() - startedAt) / 1000).toFixed(
   // だけのファイルを『無い』に倒し、控えを取らないまま上書きする」経路そのもので、
   // chmodSync を見落としたのとまったく同じ形の穴になる。
   const INTENTIONAL_EXCLUSIONS = new Map([
-    // failText が stderr(fd 2)へ直接書くためだけに使う。ここを失敗させると、注入した故障
-    // そのものの説明が画面から消えて、何を確かめたのか読めなくなる。
-    ['swap.js', new Set(['writeSync'])],
+    // writeSync … failText が stderr(fd 2)へ直接書くためだけに使う。ここを失敗させると、
+    //              注入した故障そのものの説明が画面から消えて、何を確かめたのか読めなくなる。
+    // readSync  … warmup の確認プロンプトが端末(fd 0)から答えを読むためだけに使う。この
+    //              test は子プロセスを execFileSync の pipe で起動する = stdin が端末では
+    //              ないので、操作列の warmup は必ず --yes 付きで走り、この経路自体を通らない
+    //              (通らない呼び出しに故障を注入しても、現実には起きない状態を作るだけ)。
+    ['swap.js', new Set(['writeSync', 'readSync'])],
     // status の表示にだけ使うフォールバック。内部で例外を握りつぶす API なので、throw を
     // 注入しても現実には起きない状態を作ることになる。
     ['account-guard.js', new Set(['existsSync'])],
