@@ -3100,6 +3100,25 @@ function pingLines(logPath) {
   check('来歴は変わらない', slotOf(home) === 'personal', slotOf(home));
 }
 {
+  // 上と同じく退避が開始時のアカウント 1 つだけの構成だが、その退避ファイル自身は失効させて
+  // ある。切り替えないアカウントの健全性を退避ファイルで判定すると、いま有効な認証(現在の
+  // credentials)で開けるはずの窓を開けないまま終わる。warmupPrecheck は「これから切り替えて
+  // 復元する」場合だけの関門であるべきで、既にそのアカウントで動いている場合は素通りする
+  // 必要がある(退避は最後に save した時点の古いものでしかなく、いま有効かどうかを表さない)。
+  const home = sandbox('warmup-single-slot-stale-backup', {
+    current: creds('max', { token: 'solo-tok' }),
+    accounts: { personal: creds('max', { token: 'solo-tok', expiresInDays: -1 }) },
+    slot: 'personal',
+  });
+  const pingLog = path.join(home, 'ping.log');
+  const r = runSwap(home, ['warmup', '--yes'], { PING_LOG: pingLog });
+  check('warmup --yes は成功する(退避の失効は無関係)', r.code === 0, r.out + r.err);
+  check('ping は 1 回だけ', pingLines(pingLog).length === 1, pingLines(pingLog).join(','));
+  check('結果一覧に personal の成功が出る', /^ {2}personal: 成功$/m.test(r.out), r.out);
+  check('スキップという語は出ない(失効した退避で弾かれていない)',
+    !/スキップ/.test(r.out), r.out);
+}
+{
   // ping が失敗しても(PING_EXIT で終了コード 3 を再現)、開始時のアカウントには必ず戻る。
   // 開始時のアカウントは順番の最後に置かれるので、最後のステップの ping が失敗しても
   // 「切り替え」自体は先に終わっており、credentials は開始時のまま残る。
@@ -3131,6 +3150,15 @@ function pingLines(logPath) {
   const r = runSwap(home, ['warmup']);
   checkAbort('--yes 無しの非対話実行', home, before, r);
   check('理由は「標準入力が端末ではない」', /標準入力が端末ではない/.test(r.err), r.err);
+  // この中止は process.exit ではなく exitCode を立てて return する形にしてある。process.exit
+  // だと直前の console.log がパイプ越しに切れることがあるため(failText 直上のコメント参照)。
+  // なので対象一覧の見出し行は、中止後も欠けずに残っているはず。
+  // ただしこの検査に感度は無い。ハーネスは execFileSync で子の stdout をまとめて回収するので、
+  // process.exit(1) に戻す変異を入れても緑のまま通る(実測)。切れるのは `| tee log` のような
+  // 非同期パイプ側の事情で、ここでは再現できない。仕様の記述として置いてあるだけなので、
+  // この防御を消してよいかの判断に、このテストの結果を根拠として使わないこと。
+  check('中止前に出した対象一覧の見出しは残っている(パイプ越しに切れていない)',
+    /^warmup: 次のアカウントの 5 時間枠を順に開きます$/m.test(r.out), r.out);
 }
 {
   // `swap warmup --force` は中止する。--force は失効・判別不能・同一プランのガードを
@@ -3231,6 +3259,28 @@ function pingLines(logPath) {
   check('除外した名前(save)を出力に出す', /除外: save/.test(r.out), r.out);
   const lines = pingLines(pingLog);
   check('save スロットでは ping されていない(personal の 1 回だけ)',
+    lines.length === 1 && lines[0] === 'refresh-personal-tok', lines.join(','));
+}
+{
+  // 復元できない名前のスロットが複数あっても、除外した名前は全部知らせる。案内(改名先の
+  // ファイル名)は 1 件ずつ要るので、先頭 1 件だけ出すと 2 件目以降の改名先が伝わらない。
+  const home = sandbox('warmup-excludes-multiple-unrestorable', {
+    current: creds('max', { token: 'personal-tok' }),
+    accounts: {
+      personal: creds('max', { token: 'personal-tok' }),
+      save: creds('pro', { token: 'save-tok' }),
+      help: creds('pro', { token: 'help-tok' }),
+    },
+    slot: 'personal',
+  });
+  const pingLog = path.join(home, 'ping.log');
+  const r = runSwap(home, ['warmup', '--yes'], { PING_LOG: pingLog });
+  check('復元できないスロットが複数でも成功する', r.code === 0, r.out + r.err);
+  check('除外した名前(help, save)を両方出力に出す', /^除外: help, save —/m.test(r.out), r.out);
+  check('改名先の案内に help の退避ファイル名が出る', /accounts\/help\.json/.test(r.out), r.out);
+  check('改名先の案内に save の退避ファイル名が出る', /accounts\/save\.json/.test(r.out), r.out);
+  const lines = pingLines(pingLog);
+  check('除外した 2 件では ping されていない(personal の 1 回だけ)',
     lines.length === 1 && lines[0] === 'refresh-personal-tok', lines.join(','));
 }
 

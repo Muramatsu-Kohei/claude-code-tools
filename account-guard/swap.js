@@ -181,6 +181,14 @@ function renameToRestoreText(name) {
   return 'swap のサブコマンドと同じ名前なので `swap ' + name + '` では復元できません'
     + '(accounts/' + name + '.json を別の名前へ改名してください)';
 }
+
+// 複数まとめて案内する版。改名は 1 件ずつ要るので、対象のファイル名を全部並べる。先頭 1 件の
+// 文面を代表として出すと、名前を並べた行と案内が食い違い、2 件目以降の改名先が伝わらない。
+function renameToRestoreListText(names) {
+  if (names.length === 1) return renameToRestoreText(names[0]);
+  return 'swap のサブコマンドと同じ名前なので `swap <名前>` では復元できません'
+    + '(' + names.map(n => 'accounts/' + n + '.json').join(' と ') + ' を別の名前へ改名してください)';
+}
 const DAY_MS = 86400000;
 
 // fail は「戻らない」前提で各所から呼ばれているので、exitCode を立てて return する形には
@@ -2428,7 +2436,7 @@ function cmdWarmup(yes) {
   if (targets.length === 0) {
     fail('開けられる退避がありません'
       + (unreachable.length
-        ? '\n  ' + unreachable.join(', ') + ' は' + renameToRestoreText(unreachable[0])
+        ? '\n  ' + unreachable.join(', ') + ' は' + renameToRestoreListText(unreachable)
         : '\n  先に `swap save <名前>` で現在のアカウントを退避してください'));
   }
   if (!targets.includes(start)) {
@@ -2446,7 +2454,7 @@ function cmdWarmup(yes) {
   console.log('warmup: 次のアカウントの 5 時間枠を順に開きます');
   for (const n of order) console.log('  ' + n + (n === start ? '  [開始時のアカウント]' : ''));
   if (unreachable.length) {
-    console.log('除外: ' + unreachable.join(', ') + ' — ' + renameToRestoreText(unreachable[0]));
+    console.log('除外: ' + unreachable.join(', ') + ' — ' + renameToRestoreListText(unreachable));
   }
   console.log('ping: ' + ping);
   // 強制終了(Ctrl-C など)まではプロセス側で保証できないので、戻し方を先に伝えておく(§5.3)。
@@ -2454,11 +2462,16 @@ function cmdWarmup(yes) {
 
   if (!yes) {
     if (!process.stdin.isTTY) {
-      fail('標準入力が端末ではないため中止しました'
+      // ここは対象一覧と ping パスを stdout に出したあとなので fail(process.exit)は使わない。
+      // 直前に出した行がパイプ越しに切れる(failText 直上のコメントと同じ理由)。しかもこの分岐に
+      // 入るのはフックやスケジューラからの実行、つまり出力がパイプやファイルの場合そのもの。
+      failText('標準入力が端末ではないため中止しました'
         + '\n  warmup は認証の入れ替えを複数回行うので、稼働中の別セッションを巻き込む度合いが'
         + ' `swap` 単体より大きくなります'
         + '\n  タイマーやフックから自動実行しないでください(docs/account-separation.md §5.2)'
         + '\n  意図して非対話で実行する場合だけ `swap warmup --yes` を使ってください');
+      process.exitCode = 1;
+      return;
     }
     if (!confirmWarmup()) {
       console.log('中止しました(何も変更していません)。');
@@ -2470,25 +2483,33 @@ function cmdWarmup(yes) {
   // 一度でも切り替えを試みたか。試みていなければ認証は開始時のままなので、戻す必要がない
   // (戻すために余分な切り替えを 1 回走らせると、それ自体が別セッションを巻き込む)。
   let switched = false;
+  // ループの中で開始時のアカウントへ戻る切り替えに失敗したか。finally の戻しと合わせて
+  // 同じ失敗を 2 回報告しないために持ち回る。
+  let backFailed = false;
   try {
     for (const name of order) {
       console.log('');
       console.log('--- ' + name + ' ---');
-      const skip = warmupPrecheck(name);
-      if (skip) {
-        console.log('スキップ: ' + skip);
-        results.push({ name, state: 'スキップ', why: skip });
-        continue;
-      }
       // 開始時のアカウントが順番の先頭に来ることはない(最後に回している)が、直前の切り替えが
       // 失敗して認証がそのまま残っている場合に備え、来歴を読み直して要否を決める。
       if (readCurrentSlot() !== name) {
+        // 退避の健全性を見るのは、そこから復元する場合だけ。既にそのアカウントで動いている
+        // ときの認証は credentials 側にあり、退避ファイルは最後に save した時点の古いもので
+        // しかない(ping のたびにトークンはローテートする)。切り替えないのに退避を見て弾くと、
+        // いま有効な認証で開けるはずの窓を開けないまま終わる。
+        const skip = warmupPrecheck(name);
+        if (skip) {
+          console.log('スキップ: ' + skip);
+          results.push({ name, state: 'スキップ', why: skip });
+          continue;
+        }
         switched = true;
         // 最後の 1 つ(= 開始時のアカウント)へ移る切り替えは「戻る」動作なので --force を使う。
         // 途中のアカウントへ進む切り替えでは使わない(runSwapChild のコメント参照)。
         const r = runSwapChild(name, name === start);
         if (!r.ok) {
           console.log('切り替えに失敗しました(' + r.why + ')');
+          if (name === start) backFailed = true;
           results.push({ name, state: '失敗', why: '切り替え: ' + r.why });
           continue;
         }
@@ -2509,7 +2530,12 @@ function cmdWarmup(yes) {
     // 防御なので、消すときはテストの結果を根拠にしないこと。
     if (switched && readCurrentSlot() !== start) {
       console.log('');
-      console.log('開始時のアカウント(' + start + ')に戻します。');
+      // ループの中で戻りに失敗して来た場合は、同じ切り替えをもう一度試すことになる。一時的な
+      // 失敗なら救えるので試すこと自体は残すが、断らないと同じエラーが 2 回出て、利用者には
+      // 別々の障害が 2 件起きたように見える。
+      console.log(backFailed
+        ? '開始時のアカウント(' + start + ')に戻せていないので、もう一度試します。'
+        : '開始時のアカウント(' + start + ')に戻します。');
       const back = runSwapChild(start, true);
       if (!back.ok) {
         // ここは stdout に既に出力したあとなので fail(process.exit)は使わない。
