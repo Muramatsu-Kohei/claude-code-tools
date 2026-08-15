@@ -98,7 +98,7 @@ const {
 } = credentials;
 
 // 退避先を ~/.claude 配下に置くのは、元の credentials と同じ ACL を継承させるため。
-// 平文トークンの本数は増えるが、保護レベルは変わらない(§6.1 の「残るリスク」)。
+// 平文トークンの本数は増えるが、保護レベルは変わらない(§5.1 の「残るリスク」)。
 const ACCOUNTS_DIR = path.join(HOME, '.claude', 'accounts');
 // 現在のログインの来歴。スロットではないので、一覧が拾う `*.json` に当たらない名前にする。
 const CURRENT_FILE = path.join(ACCOUNTS_DIR, '.current');
