@@ -45,7 +45,7 @@ P1 と P2 は同じ根に繋がっている。「プロジェクト = ディレ�
 
 `gitDelta(cwd, startHead)` は `startHead` が null のとき `git diff` をスキップする。
 `start` レコードが無いセッション(フック導入前に開始・SessionStart が発火しなかった等)では
-`files: []` になる。実例: `C--claude-repo-A.ndjson` のセッション `1c9576f6` は `edits: 6` だが `files: []`。
+`files: []` になる。実データにも `edits: 6` なのに `files: []` というセッションが存在した。
 
 → スコープ判定は `files` だけに頼れない。`editedFiles`(絶対パス)からの補完が必須。
 
@@ -54,7 +54,7 @@ P1 と P2 は同じ根に繋がっている。「プロジェクト = ディレ�
 スクラッチパッドが入る。判定時に除外すること。
 
 ```json
-"editedFiles": ["C:\\claude\\repo-A\\tool-c\\lib\\stage-calc.js",
+"editedFiles": ["C:\\claude\\ClaudeCode\\claude-worklog\\worklog.js",
                 "C:\\Users\\<user>\\AppData\\Local\\Temp\\claude\\...\\gen_cases.py"]
 ```
 
@@ -82,8 +82,7 @@ diff.relative → 未設定(false)
 ```
 
 → `path.resolve()` + ドライブ文字の大文字化を通してからキーを作る。
-**既存の3ファイル(`C--claude-repo-A` `C--claude-ClaudeCode` `C--claude-repo-F`)はすべて
-git ルート由来なので、データ移行は不要。**
+**既存のプロジェクトファイルはすべて git ルート由来なので、データ移行は不要。**
 
 ### F6 注入される引き継ぎに古さの上限がない
 
@@ -107,8 +106,8 @@ git ルート由来なので、データ移行は不要。**
 「自分の目印ファイルを持つ最上位ディレクトリが2つ以上」で判定した場合。
 
 ```
-複数ツール(7) repo-A       tool-a … tool-b
-複数ツール(7) repo-B       tool-a … 
+複数ツール(7) repo-A       目印を持つ下位ディレクトリ7個
+複数ツール(7) repo-B       同上
 複数ツール(3) ClaudeCode   claude-statusline claude-window-keeper claude-worklog
 複数ツール(4) repo-C       同梱の外部ライブラリ3個 + dev              ← 外部ライブラリ混在
 複数ツール(4) repo-D       同梱の外部ライブラリ・データセット4個      ← 同上
@@ -123,7 +122,7 @@ git ルート由来なので、データ移行は不要。**
 ### F10 ディレクトリ移動による孤児化が既に起きている
 
 `~/.claude/projects/` に `C--claude-utility` `C--claude-utility-claude-statusline`
-`C--claude-utility-claude-window-keeper` `C--claude-utility-repo-F` が残っている。
+`C--claude-utility-claude-window-keeper` が残っている。
 このリポジトリは以前 `C:\claude\utility` にあった。→ `move` サブコマンドの必要性の裏付け(§6)。
 
 ---
@@ -139,8 +138,9 @@ git ルート由来なので、データ移行は不要。**
 - **リポジトリの判定**に目印ファイルを使う(2つ以上で有効)
 - **セッションのスコープ判定**には目印を使わない。変更ファイル数で決める
 
-この分離が要点。repo-A の `tool-c` は現在 README を持たないが、いま最も作業している
-ツールである。目印でスコープを決めると**今アクティブなツールだけ分類されない**という逆の結果になる。
+この分離が要点。作りかけのツールはまだ README を持たないことが多いが、いま最も作業している
+のはそのツールである。目印でスコープを決めると**今アクティブなツールだけ分類されない**という
+逆の結果になる。
 
 ### D3 スコープは保存せず、読み取り時に導出する
 
@@ -148,8 +148,8 @@ git ルート由来なので、データ移行は不要。**
 書き込み時に固定しないことで:
 
 - リポジトリが後から複数ツールになったとき、**過去のセッションにも遡ってラベルが付く**
-  (例: repo-E は現在 `fmt-a` のみが README を持つので無効。2つ目のツールに README ができた時点で
-  有効になり、それまでに `fmt-a` を触ったセッションも `[fmt-a]` として表示される)
+  (ツールが1つしかないうちは無効。2つ目のツールに README ができた時点で有効になり、
+  それ以前に1つ目のツールを触ったセッションにも遡ってラベルが付く)
 - 判定式を後で改良したとき、履歴全体の分類がその場で直る。backfill 不要
 
 例外: `--scope` による明示指定はレコードに保存し、常に優先する(人の判断のほうが正しい)。
@@ -172,7 +172,7 @@ const DENY_DIRS = new Set(['docs', 'doc', 'test', 'tests', 'src', 'lib', 'bin', 
   'assets', 'images', 'dist', 'build', 'obj', 'out', 'target', 'legal', 'shared', 'common',
   'tmp', 'temp', 'node_modules', '.git', '.github', '.vscode', '.claude']);
 
-// 中身が個々のツールである入れ物。2階層目までをスコープ名にする(例: tools/tool-d)
+// 中身が個々のツールである入れ物。2階層目までをスコープ名にする(例: tools/image-resizer)
 const CONTAINER_DIRS = new Set(['tools', 'packages', 'apps', 'projects', 'crates', 'services']);
 
 const MULTI_TOOL_MIN = 2;
@@ -380,10 +380,10 @@ worklog move --from <部分一致> --to <部分一致|キー|パス> (--all | --
 | --- | --- | --- |
 | T1 | `claude-worklog/` で起動 → 数ターン作業 → 終了 → `worklog list --verbose` | `turns` / `edits` が 0 でない(**F1 の回帰テスト。最重要**) |
 | T2 | 同じセッションが親のプロジェクトに記録される | `C--claude-ClaudeCode.ndjson` に入る。子のファイルは作られない |
-| T3 | repo-F で `worklog list` | スコープ表示が出ない。注入も現状のまま |
-| T4 | repo-A の既存レコードでスコープを導出 | セッション `c399a95f` → `tool-c`(`docs` `shared` `tools/tool-d` に負けない) |
-| T5 | repo-A の `1c9576f6`(`files: []`) | `editedFiles` から `tool8-...` を導出できる。スクラッチパッドは無視される |
-| T6 | repo-E の `sub-a/` に README を仮置き → `worklog list` → 戻す | 一時的にスコープ有効になり、過去セッションにもラベルが付く(D3 の確認) |
+| T3 | 単一ツールのリポジトリで `worklog list` | スコープ表示が出ない。注入も現状のまま |
+| T4 | 複数ツールのリポジトリの既存レコードからスコープを導出 | 実際に作業したツールが選ばれる(`docs` `shared` のような除外ディレクトリや入れ物に負けない) |
+| T5 | `files: []` のレコード | `editedFiles` からツールを導出できる。スクラッチパッドは無視される |
+| T6 | 単一ツールのリポジトリで2つ目のディレクトリに README を仮置き → `worklog list` → 戻す | 一時的にスコープ有効になり、過去セッションにもラベルが付く(D3 の確認) |
 | T7 | 親と子で同時に起動 | 並列警告が出る(F7) |
 | T8 | `worklog context` の文字数 | 1600 未満。索引が切り捨てられていない |
 | T9 | `worklog list --scope claude-worklog` | 該当セッションのみ |
@@ -400,7 +400,7 @@ worklog move --from <部分一致> --to <部分一致|キー|パス> (--all | --
 ## 9. 残るリスク
 
 - スコープ判定は「変更ファイルが最多」というヒューリスティック。外部ライブラリを大量に触った回に
-  `Library_Poco` のようなラベルが付くことがある(F9)。表示が的外れになるだけで、引き継ぎは消えない
+  同梱ライブラリの名前がラベルとして付くことがある(F9)。表示が的外れになるだけで、引き継ぎは消えない
 - 目印ファイルを置かない運用のリポジトリではスコープが有効にならない。`scopeMode: 'on'` で対応
 - 読み取り時導出は**現在のディスク上の構成**を見る。ツールディレクトリを削除・改名すると、
   過去セッションのラベルが変わる(記録は失われない)

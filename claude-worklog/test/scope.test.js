@@ -15,10 +15,10 @@ const mk = (...p) => fs.mkdirSync(path.join(...p), { recursive: true });
 const touch = (...p) => fs.writeFileSync(path.join(...p), 'x');
 
 // multi: toolA / toolB が目印を持つ。docs と shared は候補外。tools/ は入れ物
-for (const d of ['toolA', 'toolB', 'docs', 'shared', path.join('tools', 'tool-d')]) mk(MULTI, d);
+for (const d of ['toolA', 'toolB', 'docs', 'shared', path.join('tools', 'image-resizer')]) mk(MULTI, d);
 touch(MULTI, 'toolA', 'README.md');
 touch(MULTI, 'toolB', 'package.json');
-touch(MULTI, 'tools', 'tool-d', 'README.md');
+touch(MULTI, 'tools', 'image-resizer', 'README.md');
 // single: 目印を持つ最上位ディレクトリは 1 つだけ
 mk(SINGLE, 'UI'); mk(SINGLE, 'docs');
 touch(SINGLE, 'README.md');
@@ -52,7 +52,7 @@ write(MULTI, [
   // files が空でも editedFiles から導出できる。リポジトリ外(スクラッチパッド)は無視
   { sid: 's2', ts: T + 1, summary: 'toolB を直した', handoff: 'toolB の続き', stats: { files: [], editedFiles: [path.join(MULTI, 'toolB', 'c.js'), 'C:\\Temp\\claude\\gen.py'] } },
   // 入れ物ディレクトリは 2 階層目までがスコープ名
-  { sid: 's3', ts: T + 2, summary: 'tool-d を直した', next: ['apng の続き'], stats: { files: ['tools/tool-d/x.js'], editedFiles: [] } },
+  { sid: 's3', ts: T + 2, summary: 'image-resizer を直した', next: ['リサイズ処理の続き'], stats: { files: ['tools/image-resizer/x.js'], editedFiles: [] } },
   // --scope の明示指定は自動導出より優先
   { sid: 's4', ts: T + 3, summary: '明示指定', scope: 'toolB', stats: { files: ['toolA/z.js', 'toolA/w.js'], editedFiles: [] } },
   // 判定材料が無ければスコープなし(リポジトリ全体の作業)
@@ -68,7 +68,7 @@ const lineOf = (out, needle) => out.split('\n').find((l) => l.includes(needle)) 
 const multiOut = run(MULTI, ['list', '-n', '10']);
 check('T4: 最多のディレクトリが勝つ(docs/shared/ルートは候補外)', / toolA .*toolA を直した/.test(lineOf(multiOut, 'toolA を直した')), lineOf(multiOut, 'toolA を直した'));
 check('T5: files が空でも editedFiles から導出、スクラッチパッドは無視', / toolB .*toolB を直した/.test(lineOf(multiOut, 'toolB を直した')), lineOf(multiOut, 'toolB を直した'));
-check('入れ物は 2 階層目まで', /tools\/tool-d /.test(lineOf(multiOut, 'tool-d を直した')), lineOf(multiOut, 'tool-d を直した'));
+check('入れ物は 2 階層目まで', /tools\/image-resizer /.test(lineOf(multiOut, 'image-resizer を直した')), lineOf(multiOut, 'image-resizer を直した'));
 check('--scope の明示指定が自動導出より優先', / toolB .*明示指定/.test(lineOf(multiOut, '明示指定')), lineOf(multiOut, '明示指定'));
 check('材料が無ければスコープなし', /\d\d:\d\d \[main\] ルートだけ/.test(lineOf(multiOut, 'ルートだけ')), lineOf(multiOut, 'ルートだけ'));
 

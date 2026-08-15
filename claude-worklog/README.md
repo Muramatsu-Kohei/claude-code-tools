@@ -54,7 +54,7 @@ $ claude                     # 同じディレクトリで新しいセッショ�
 3. **手動(`/handoff`)** — セッションの途中でも引き継ぎを取り込める。現在の作業ツリーの状態と
    食い違っていないかを確認したうえで、最初の一手を提示する。
    同じリポジトリ内の別ツールなら `/handoff claude-statusline`、別プロジェクトなら
-   `/handoff repo-F` のように引数で指定する(→[スコープ](#スコープ1-リポジトリ内のツール単位))。
+   `/handoff myapp` のように引数で指定する(→[スコープ](#スコープ1-リポジトリ内のツール単位))。
    コンテキストへ入れず文字列だけ欲しい場合は `worklog handoff --raw`
    (Windows なら `worklog handoff --raw | clip` でクリップボードに入る)。
 
@@ -218,7 +218,7 @@ worklog context   # 次セッションに注入されるテキスト
 | コマンド | 内容 |
 | --- | --- |
 | `worklog list [-n 10] [--verbose]` | 現在のリポジトリの直近セッション |
-| `worklog list --project repo-F` | プロジェクト名の部分一致で絞る |
+| `worklog list --project myapp` | プロジェクト名の部分一致で絞る |
 | `worklog list --scope claude-worklog` | リポジトリ内のツールで絞る(→[スコープ](#スコープ1-リポジトリ内のツール単位)) |
 | `worklog list --all -n 20` | 全プロジェクト横断 |
 | `worklog today [--days 7]` | 今日(または直近 N 日)の作業を全プロジェクト横断で |

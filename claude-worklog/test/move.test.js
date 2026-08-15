@@ -157,11 +157,11 @@ check('エラー時は何も書き換えない', (lines('C--claude-utility') || 
 // --- 6. 新しいキー(パス指定)への移動 ----------------------------------------
 reset();
 console.log('6. --to にパスを指定(記録がまだ無い移動先)');
-r = run(['move', '--from', 'utility', '--to', 'C:\\claude\\NewPlace', '--all']);
+r = run(['move', '--from', 'utility', '--to', 'C:\\claude\\MovedRepo', '--all']);
 check('exit 0', r.code === 0, r.err);
 check('ディスク上に無い移動先は警告する', r.out.includes('ディスク上に無い'), r.out);
-check('新しいファイルができた', lines('C--claude-NewPlace') !== null, fs.readdirSync(logDir).join(','));
-check('6 レコード入った', (lines('C--claude-NewPlace') || []).length === 6);
+check('新しいファイルができた', lines('C--claude-MovedRepo') !== null, fs.readdirSync(logDir).join(','));
+check('6 レコード入った', (lines('C--claude-MovedRepo') || []).length === 6);
 
 // --- 7. help に move が出る --------------------------------------------------
 check('help に move', run(['help']).out.includes('worklog move --from'));
