@@ -96,6 +96,7 @@ const THEME = {
   dir: c(FG.cyan),                // カレントディレクトリ名
   account: c(FG.magenta),         // アカウントスロット(account-guard 導入時のみ)
   model: c(ST.dim),               // モデル名
+  modelAlt: c(FG.brightBlue),     // モデル名(利用枠が別建てのモデル。下の ALT_MODEL_RE を参照)
   effort: c(ST.dim),              // 推論エフォート(low/medium/high)
   effortHigh: c(FG.yellow),       // 推論エフォート(xhigh/max) -- 消費が跳ねるので警告色
   fast: c(FG.yellow),             // fast モード有効
@@ -117,6 +118,12 @@ const PCT_WARN = 70;
 const PCT_CRIT = 90;
 const COST_WARN = 5;
 const COST_HIGH = 20;
+
+// 利用枠が他モデルと別建てになっているモデル。ここに載せた名前は THEME.modelAlt の色で出る。
+// 下の `5h` / `7d` は入力に来た枠の使用率をそのまま出しているだけで、どのモデルの枠かは
+// 区別しない。別枠のモデルへ切り替えたことに気づかないまま残量を読むと見込みを外すので、
+// モデル名の色で切り分ける。警告色(黄/赤)を使わないのは、危険ではなく「別勘定」だから。
+const ALT_MODEL_RE = /fable/i;
 
 // コンテキストは比率ではなく絶対量でも警告する。
 // 窓が 1M あると比率の閾値(70%)は 700k 相当になり、実質どこまで伸ばしても緑のままになる。
@@ -246,8 +253,13 @@ if (headBits.length) parts.push(headBits.join(' '));
 // 「どのモデルをどの強度で回しているか」が一続きで読める。
 const modelBits = [];
 if (d.model?.display_name) {
+  // 利用枠が他モデルと別建てのモデルは色を変える。同じ 5 時間枠を食っている前提で
+  // 残量を読むと見込みを外すため、モデル名そのもので気づけるようにしておく。
+  // id と表示名の両方を見るのは、表示名の付け方(世代番号の有無など)が変わりうるため。
+  const alt = ALT_MODEL_RE.test(d.model.id || '') || ALT_MODEL_RE.test(d.model.display_name);
   // "Opus 5" -> "Opus5"。空白を潰しても識別性は落ちない。
-  modelBits.push(`${THEME.model}${String(d.model.display_name).replace(/\s+/g, '')}${RESET}`);
+  const name = String(d.model.display_name).replace(/\s+/g, '');
+  modelBits.push(`${alt ? THEME.modelAlt : THEME.model}${name}${RESET}`);
 }
 // エフォートは2〜3文字に短縮。xhigh/max は消費が跳ねるので色で気づけるようにする。
 const EFFORT = { low: 'lo', medium: 'md', high: 'hi', xhigh: 'xhi', max: 'max' };
