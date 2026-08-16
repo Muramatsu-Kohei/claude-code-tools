@@ -226,8 +226,12 @@ const UNKNOWN_SLOT = '?';
 // ホームの解決順は account-guard(credentials.js)に合わせる。環境変数を先に見るのが向こうの
 // 規約で、os.homedir() だけにすると HOME を独自ディレクトリへ向けた環境で書き手と読み手が
 // 別のパスを指し、導入済みなのにスロットが永久に出ない。
+// 空白だけの値を弾くのは credentials.js の usableHome() と揃えるため。`||` だけだと
+// USERPROFILE="  " のような値をホームとして採用してしまい、path.join が相対パスを作って
+// ENOENT に落ち、「読めない」が「未導入」に化ける(この関数が守ろうとしている区別が消える)。
+const usableHome = (v) => (typeof v === 'string' && v.trim() ? v : null);
 function homeDir() {
-  return process.env.USERPROFILE || process.env.HOME || os.homedir();
+  return usableHome(process.env.USERPROFILE) || usableHome(process.env.HOME) || usableHome(os.homedir());
 }
 
 // 表示幅の上限。スロット名自体に長さ制限は無い(account-guard の NAME_RE は字種しか見ない)ので、
@@ -236,11 +240,17 @@ function homeDir() {
 const SLOT_MAX = 16;
 
 function readAccountSlot() {
+  const home = homeDir();
+  // ホームが決まらないのは「未導入」ではなく壊れた環境。account-guard も HOME_UNRESOLVED として
+  // 失敗させる場面なので、黙って消さずに印を出す。
+  if (!home) return UNKNOWN_SLOT;
   let raw;
   try {
-    raw = fs.readFileSync(path.join(homeDir(), '.claude', 'accounts', '.current'), 'utf8');
+    raw = fs.readFileSync(path.join(home, '.claude', 'accounts', '.current'), 'utf8');
   } catch (e) {
-    // 未導入(ファイルもディレクトリも無い)。それ以外は「読めない」として印を出す。
+    // ファイルが無い場合。未導入のほか、導入済みでまだ一度も swap していない、
+    // swap が来歴を消した(`.current` を unlink する経路がある)なども同じくここに来る。
+    // いずれも「記録が無い」であって異常ではないので、無表示にする。
     if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return null;
     return UNKNOWN_SLOT;
   }
@@ -257,10 +267,14 @@ const parts = [];
 const headBits = [];
 
 // ディレクトリ名。パスの区切りは win32/posix の両方を見る。
+let dirShown = false;
 const dirPath = d.workspace?.current_dir || d.cwd;
 if (dirPath) {
   const leaf = String(dirPath).replace(/[\\/]+$/, '').split(/[\\/]/).pop();
-  if (leaf) headBits.push(`${THEME.dir}${leaf}${RESET}`);
+  if (leaf) {
+    headBits.push(`${THEME.dir}${leaf}${RESET}`);
+    dirShown = true;
+  }
 }
 
 // `@` を付けるのはディレクトリ名との地続きを断つため。色だけに頼ると、色を落とす端末や
@@ -269,6 +283,12 @@ const slot = readAccountSlot();
 if (slot) headBits.push(`${THEME.account}@${slot}${RESET}`);
 
 if (headBits.length) parts.push(headBits.join(' '));
+
+// スロットだけは stdin ではなくローカルのファイル由来なので、末尾の「項目が1つも作れなかった」
+// 診断の判定から外す。外さないと、入力の形が変わって全項目を落としても `@max` の1項目が残り、
+// 異常が「項目の少ない正常な行」に化けて診断が二度と出なくなる(冒頭に書いた
+// 「異常時も必ず1行出す」は、まさにその入力側の変化を切り分けるための不変条件)。
+const nonInputParts = slot && !dirShown ? 1 : 0;
 
 // モデルと推論設定を1グループにまとめる。区切りを増やさずに済み、
 // 「どのモデルをどの強度で回しているか」が一続きで読める。
@@ -342,7 +362,7 @@ for (const [node, label] of [
   parts.push(s);
 }
 
-if (parts.length === 0) {
+if (parts.length - nonInputParts === 0) {
   write(`${THEME.fallback}(statusline: no fields)${RESET}`);
   process.exit(0);
 }
