@@ -3,7 +3,7 @@
 // settings.json の statusLine から `node <このファイル>` として呼ばれ、stdin で渡される JSON から
 // モデル・推論設定・コンテキスト使用率・コスト・差分行数・プラン利用枠(5時間/週次)を1行で出力する。
 // 出力例:
-//   claude @max | Opus5 hi | ctx 47k | $0.28 +12/-3 | 5h 16% 11:54 | 7d 2% Wed 09:20
+//   claude @max | Opus5 hi | ctx 41k | $0.28 +12/-3 | 5h 16% 11:54 | 7d 2% Wed 09:20
 // プラン枠の情報は claude.ai サブスク認証時にしか渡ってこないため、欠損時は黙って省く。
 // `@max` は account-guard を併用している場合だけ出るアカウントスロット名(後述の readAccountSlot)。
 //
@@ -220,7 +220,10 @@ function shortCost(v) {
 // 「無い」と「読めない・壊れている」は分ける。前者だけが無表示で、後者は UNKNOWN_SLOT を返す。
 // 畳んでしまうと、権限やロックで読めないだけの状態が「account-guard 未導入」と同じ見た目になり、
 // 取り違えに気づけない状態を黙って作る — この表示が防ごうとしているものそのものになる。
-// account-guard 側も readCurrentSlot で同じ理由から両者を区別している。
+// account-guard 側も readCurrentSlot で両者を区別しているが、区別の持ち方は違う。向こうは
+// 戻り値をオブジェクトに変えると呼び出し 6 箇所すべてに波及するため、どちらも null を返し、
+// 「読めなかった」はモジュール内のフラグと stderr の警告で運ぶ。ここは呼び出しが 1 箇所しか
+// ないので戻り値だけで表現できる。契約を写すときは向こうの戻り値ではなく意図のほうを見ること。
 const UNKNOWN_SLOT = '?';
 
 // ホームの解決順は account-guard(credentials.js)に合わせる。環境変数を先に見るのが向こうの
@@ -257,6 +260,13 @@ function readAccountSlot() {
   const name = raw.trim();
   // 壊れた・書き換えられたファイルから制御文字(ANSI エスケープ)が表示へ流れ込まないようにする。
   // 許す字種は account-guard のスロット名(NAME_RE)と同一。長さはここでは見ない。
+  //
+  // account-guard の readCurrentSlot は、これに加えて accounts/<name>.json の実在も確かめ、
+  // 指す先が消えていれば来歴ごと無効にする。ここでは意図的に真似しない。向こうの問いは
+  // 「そのスロットへ戻せるか」で、退避が消えていれば答えは No。こちらの問いは「いまどの
+  // アカウントか」で、退避を手で整理しても現在のログインは変わらない。実在を条件にすると、
+  // 退避を消しただけで表示が消え、取り違えに気づけない状態を自分で作ることになる。
+  // そのため `swap status` が「未記録」と言う状態でも、ここは名前を出し続ける。
   if (!/^[a-zA-Z0-9_-]+$/.test(name)) return UNKNOWN_SLOT;
   return name.length > SLOT_MAX ? `${name.slice(0, SLOT_MAX - 1)}~` : name;
 }
