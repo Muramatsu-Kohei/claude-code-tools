@@ -3,7 +3,7 @@
 // settings.json の statusLine から `node <このファイル>` として呼ばれ、stdin で渡される JSON から
 // モデル・推論設定・コンテキスト使用率・コスト・差分行数・プラン利用枠(5時間/週次)を1行で出力する。
 // 出力例:
-//   claude @max | Opus5 hi | ctx 5% 950k | $0.28 +12/-3 | 5h 16% 11:54 | 7d 2% Wed 09:20
+//   claude @max | Opus5 hi | ctx 47k | $0.28 +12/-3 | 5h 16% 11:54 | 7d 2% Wed 09:20
 // プラン枠の情報は claude.ai サブスク認証時にしか渡ってこないため、欠損時は黙って省く。
 // `@max` は account-guard を併用している場合だけ出るアカウントスロット名(後述の readAccountSlot)。
 //
@@ -262,16 +262,21 @@ if (d.thinking?.enabled === false) modelBits.push(`${THEME.nothink}nothink${RESE
 if (modelBits.length) parts.push(modelBits.join(' '));
 
 // コンテキストウィンドウ。セッション開始直後や /compact 直後は null になる。
-// % だけでは絶対感が掴めないためトークン数を併記する。残量ではなく使用量を出すのは、
-// 色の閾値(CTX_WARN_TOKENS)が使用量で決まっており、両者が揃っていないと
-// 「なぜ黄色いのか」が読み取れないため。残量は 1M 窓ではほぼ動かず判断材料にならない。
+// 主として出すのは % ではなく使用トークン数。判断に効くのは「あと何割か」ではなく「何 k か」で、
+// 単価が跳ねる水準(CTX_WARN_TOKENS)も切り上げ時の目安も絶対量で決まっている。1M 窓では
+// 250k 使っていても 25% にしかならず、比率は色が変わった理由すら説明できない。
+// % を添えるのは窓そのものを使い切りそうなとき(PCT_WARN 以上)だけ。そこでは自動 compact が
+// 近いという別種の情報になるので、他の項目と同じく「既定から外れたときだけ出す」に従う。
+// 残量ではなく使用量を出すのは、色の閾値が使用量で決まっているため(残量では対応が読めない)。
 const cw = d.context_window;
 const ctx = cw?.used_percentage;
 if (typeof ctx === 'number' && isFinite(ctx)) {
   const p = Math.floor(ctx);
   const used = (cw.total_input_tokens || 0) + (cw.total_output_tokens || 0);
-  let s = `${ctxColor(p, used)}ctx ${p}%${RESET}`;
-  if (used > 0) s += ` ${THEME.tokens}${shortTokens(used)}${RESET}`;
+  const color = ctxColor(p, used);
+  // トークン数が取れないときだけ % で代替する。無言で消すと項目ごと失われる。
+  let s = used > 0 ? `${color}ctx ${shortTokens(used)}${RESET}` : `${color}ctx ${p}%${RESET}`;
+  if (used > 0 && p >= PCT_WARN) s += ` ${THEME.tokens}${p}%${RESET}`;
   parts.push(s);
 }
 
