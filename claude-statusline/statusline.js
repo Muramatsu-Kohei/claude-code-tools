@@ -101,7 +101,7 @@ const THEME = {
   effortHigh: c(FG.yellow),       // 推論エフォート(xhigh/max) -- 消費が跳ねるので警告色
   fast: c(FG.yellow),             // fast モード有効
   nothink: c(ST.dim),             // 拡張思考が無効
-  tokens: c(ST.dim),              // コンテキスト残りトークン数
+  ctxPct: c(ST.dim),              // コンテキスト使用率(トークン数に添えるとき)
   cost: c(ST.dim),                // セッションコスト(通常)
   costWarn: c(FG.yellow),         // セッションコスト($5 以上)
   costHigh: c(FG.red),            // セッションコスト($20 以上)
@@ -216,18 +216,39 @@ function shortCost(v) {
 // それでもバナーより新しく、swap 運用の範囲では最も確かな手掛かりになる。
 // account-guard を使っていない環境ではファイルごと存在しないので、そのときは何も出さない
 // (「既定から外れたときだけ出す」の方針どおり、無関係な利用者の幅を奪わない)。
+//
+// 「無い」と「読めない・壊れている」は分ける。前者だけが無表示で、後者は UNKNOWN_SLOT を返す。
+// 畳んでしまうと、権限やロックで読めないだけの状態が「account-guard 未導入」と同じ見た目になり、
+// 取り違えに気づけない状態を黙って作る — この表示が防ごうとしているものそのものになる。
+// account-guard 側も readCurrentSlot で同じ理由から両者を区別している。
+const UNKNOWN_SLOT = '?';
+
+// ホームの解決順は account-guard(credentials.js)に合わせる。環境変数を先に見るのが向こうの
+// 規約で、os.homedir() だけにすると HOME を独自ディレクトリへ向けた環境で書き手と読み手が
+// 別のパスを指し、導入済みなのにスロットが永久に出ない。
+function homeDir() {
+  return process.env.USERPROFILE || process.env.HOME || os.homedir();
+}
+
+// 表示幅の上限。スロット名自体に長さ制限は無い(account-guard の NAME_RE は字種しか見ない)ので、
+// 弾かずに切り詰める。弾くと長い名前を付けた利用者にだけ表示が消え、未導入と区別が付かない。
+// 省略記号に `~` を使うのは、このファイルが出力を ASCII に限っているため(`…` は化ける)。
+const SLOT_MAX = 16;
+
 function readAccountSlot() {
+  let raw;
   try {
-    const home = os.homedir();
-    if (!home) return null;
-    const raw = fs.readFileSync(path.join(home, '.claude', 'accounts', '.current'), 'utf8');
-    const name = raw.trim();
-    // 壊れた・書き換えられたファイルから制御文字(ANSI エスケープ)や長大な文字列が
-    // 表示へ流れ込まないようにする。許す字種は account-guard のスロット名に合わせる。
-    return /^[a-zA-Z0-9_-]{1,20}$/.test(name) ? name : null;
+    raw = fs.readFileSync(path.join(homeDir(), '.claude', 'accounts', '.current'), 'utf8');
   } catch (e) {
-    return null; // 未導入(ENOENT)でも読めない場合でも、表示を諦めるだけにする。
+    // 未導入(ファイルもディレクトリも無い)。それ以外は「読めない」として印を出す。
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return null;
+    return UNKNOWN_SLOT;
   }
+  const name = raw.trim();
+  // 壊れた・書き換えられたファイルから制御文字(ANSI エスケープ)が表示へ流れ込まないようにする。
+  // 許す字種は account-guard のスロット名(NAME_RE)と同一。長さはここでは見ない。
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) return UNKNOWN_SLOT;
+  return name.length > SLOT_MAX ? `${name.slice(0, SLOT_MAX - 1)}~` : name;
 }
 
 const parts = [];
@@ -288,7 +309,7 @@ if (typeof ctx === 'number' && isFinite(ctx)) {
   const color = ctxColor(p, used);
   // トークン数が取れないときだけ % で代替する。無言で消すと項目ごと失われる。
   let s = used > 0 ? `${color}ctx ${shortTokens(used)}${RESET}` : `${color}ctx ${p}%${RESET}`;
-  if (used > 0 && p >= PCT_WARN) s += ` ${THEME.tokens}${p}%${RESET}`;
+  if (used > 0 && p >= PCT_WARN) s += ` ${THEME.ctxPct}${p}%${RESET}`;
   parts.push(s);
 }
 
