@@ -3,8 +3,9 @@
 // settings.json の statusLine から `node <このファイル>` として呼ばれ、stdin で渡される JSON から
 // モデル・推論設定・コンテキスト使用率・コスト・差分行数・プラン利用枠(5時間/週次)を1行で出力する。
 // 出力例:
-//   claude | Opus5 hi | ctx 5% 950k | $0.28 +12/-3 | 5h 16% 11:54 | 7d 2% Wed 09:20
+//   claude @max | Opus5 hi | ctx 41k | $0.28 +12/-3 | 5h 16% 11:54 | 7d 2% Wed 09:20
 // プラン枠の情報は claude.ai サブスク認証時にしか渡ってこないため、欠損時は黙って省く。
+// `@max` は account-guard を併用している場合だけ出るアカウントスロット名(後述の readAccountSlot)。
 //
 // 幅の方針: ステータスラインは常時表示で横幅が貴重なため、区切り(" | ")の数を増やさないよう
 // 関連する値をグループにまとめ、"Opus 5" は "Opus5" のように詰める。
@@ -28,6 +29,8 @@
 //  - 異常時も必ず1行出す。無出力にするとステータスラインが消え、原因の切り分けが不能になる。
 
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const ESC = '\x1b';
 
@@ -91,12 +94,14 @@ const RESET = c(ST.reset);
 const THEME = {
   sep: c(ST.dim),                 // 項目の区切り " | "
   dir: c(FG.cyan),                // カレントディレクトリ名
+  account: c(FG.magenta),         // アカウントスロット(account-guard 導入時のみ)
   model: c(ST.dim),               // モデル名
+  modelAlt: c(FG.brightBlue),     // モデル名(利用枠が別建てのモデル。下の ALT_MODEL_RE を参照)
   effort: c(ST.dim),              // 推論エフォート(low/medium/high)
   effortHigh: c(FG.yellow),       // 推論エフォート(xhigh/max) -- 消費が跳ねるので警告色
   fast: c(FG.yellow),             // fast モード有効
   nothink: c(ST.dim),             // 拡張思考が無効
-  tokens: c(ST.dim),              // コンテキスト残りトークン数
+  ctxPct: c(ST.dim),              // コンテキスト使用率(トークン数に添えるとき)
   cost: c(ST.dim),                // セッションコスト(通常)
   costWarn: c(FG.yellow),         // セッションコスト($5 以上)
   costHigh: c(FG.red),            // セッションコスト($20 以上)
@@ -113,6 +118,12 @@ const PCT_WARN = 70;
 const PCT_CRIT = 90;
 const COST_WARN = 5;
 const COST_HIGH = 20;
+
+// 利用枠が他モデルと別建てになっているモデル。ここに載せた名前は THEME.modelAlt の色で出る。
+// 下の `5h` / `7d` は入力に来た枠の使用率をそのまま出しているだけで、どのモデルの枠かは
+// 区別しない。別枠のモデルへ切り替えたことに気づかないまま残量を読むと見込みを外すので、
+// モデル名の色で切り分ける。警告色(黄/赤)を使わないのは、危険ではなく「別勘定」だから。
+const ALT_MODEL_RE = /fable/i;
 
 // コンテキストは比率ではなく絶対量でも警告する。
 // 窓が 1M あると比率の閾値(70%)は 700k 相当になり、実質どこまで伸ばしても緑のままになる。
@@ -197,21 +208,109 @@ function shortCost(v) {
   return `$${v.toFixed(2)}`;
 }
 
+// アカウントスロット。account-guard が `~/.claude/accounts/.current` に書く「前回 swap した先」。
+// 起動バナーの組織名は `~/.claude.json` の 24 時間キャッシュで、swap してもプラン名だけが先に
+// 変わり組織名は最大 1 日前のアカウントのまま残る(実測で確認済み)。バナーを信じて別プランの
+// 枠を溶かす取り違えを防ぐため、常時見えるここに「いまどのスロットか」を出す。
+// これは来歴であって現在のログインの証明ではない(swap を通さず /login し直すと古いまま残る)。
+// それでもバナーより新しく、swap 運用の範囲では最も確かな手掛かりになる。
+// account-guard を使っていない環境ではファイルごと存在しないので、そのときは何も出さない
+// (「既定から外れたときだけ出す」の方針どおり、無関係な利用者の幅を奪わない)。
+//
+// 「無い」と「読めない・壊れている」は分ける。前者だけが無表示で、後者は UNKNOWN_SLOT を返す。
+// 畳んでしまうと、権限やロックで読めないだけの状態が「account-guard 未導入」と同じ見た目になり、
+// 取り違えに気づけない状態を黙って作る — この表示が防ごうとしているものそのものになる。
+// account-guard 側も readCurrentSlot で両者を区別しているが、区別の持ち方は違う。向こうは
+// 戻り値をオブジェクトに変えると呼び出し 6 箇所すべてに波及するため、どちらも null を返し、
+// 「読めなかった」はモジュール内のフラグと stderr の警告で運ぶ。ここは呼び出しが 1 箇所しか
+// ないので戻り値だけで表現できる。契約を写すときは向こうの戻り値ではなく意図のほうを見ること。
+const UNKNOWN_SLOT = '?';
+
+// ホームの解決順は account-guard(credentials.js)に合わせる。環境変数を先に見るのが向こうの
+// 規約で、os.homedir() だけにすると HOME を独自ディレクトリへ向けた環境で書き手と読み手が
+// 別のパスを指し、導入済みなのにスロットが永久に出ない。
+// 空白だけの値を弾くのは credentials.js の usableHome() と揃えるため。`||` だけだと
+// USERPROFILE="  " のような値をホームとして採用してしまい、path.join が相対パスを作って
+// ENOENT に落ち、「読めない」が「未導入」に化ける(この関数が守ろうとしている区別が消える)。
+const usableHome = (v) => (typeof v === 'string' && v.trim() ? v : null);
+function homeDir() {
+  return usableHome(process.env.USERPROFILE) || usableHome(process.env.HOME) || usableHome(os.homedir());
+}
+
+// 表示幅の上限。スロット名自体に長さ制限は無い(account-guard の NAME_RE は字種しか見ない)ので、
+// 弾かずに切り詰める。弾くと長い名前を付けた利用者にだけ表示が消え、未導入と区別が付かない。
+// 省略記号に `~` を使うのは、このファイルが出力を ASCII に限っているため(`…` は化ける)。
+const SLOT_MAX = 16;
+
+function readAccountSlot() {
+  const home = homeDir();
+  // ホームが決まらないのは「未導入」ではなく壊れた環境。account-guard も HOME_UNRESOLVED として
+  // 失敗させる場面なので、黙って消さずに印を出す。
+  if (!home) return UNKNOWN_SLOT;
+  let raw;
+  try {
+    raw = fs.readFileSync(path.join(home, '.claude', 'accounts', '.current'), 'utf8');
+  } catch (e) {
+    // ファイルが無い場合。未導入のほか、導入済みでまだ一度も swap していない、
+    // swap が来歴を消した(`.current` を unlink する経路がある)なども同じくここに来る。
+    // いずれも「記録が無い」であって異常ではないので、無表示にする。
+    if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return null;
+    return UNKNOWN_SLOT;
+  }
+  const name = raw.trim();
+  // 壊れた・書き換えられたファイルから制御文字(ANSI エスケープ)が表示へ流れ込まないようにする。
+  // 許す字種は account-guard のスロット名(NAME_RE)と同一。長さはここでは見ない。
+  //
+  // account-guard の readCurrentSlot は、これに加えて accounts/<name>.json の実在も確かめ、
+  // 指す先が消えていれば来歴ごと無効にする。ここでは意図的に真似しない。向こうの問いは
+  // 「そのスロットへ戻せるか」で、退避が消えていれば答えは No。こちらの問いは「いまどの
+  // アカウントか」で、退避を手で整理しても現在のログインは変わらない。実在を条件にすると、
+  // 退避を消しただけで表示が消え、取り違えに気づけない状態を自分で作ることになる。
+  // そのため `swap status` が「未記録」と言う状態でも、ここは名前を出し続ける。
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) return UNKNOWN_SLOT;
+  return name.length > SLOT_MAX ? `${name.slice(0, SLOT_MAX - 1)}~` : name;
+}
+
 const parts = [];
 
+// 先頭グループ。「どこで」「どのアカウントで」作業しているかをまとめ、区切りを増やさない。
+const headBits = [];
+
 // ディレクトリ名。パスの区切りは win32/posix の両方を見る。
+let dirShown = false;
 const dirPath = d.workspace?.current_dir || d.cwd;
 if (dirPath) {
   const leaf = String(dirPath).replace(/[\\/]+$/, '').split(/[\\/]/).pop();
-  if (leaf) parts.push(`${THEME.dir}${leaf}${RESET}`);
+  if (leaf) {
+    headBits.push(`${THEME.dir}${leaf}${RESET}`);
+    dirShown = true;
+  }
 }
+
+// `@` を付けるのはディレクトリ名との地続きを断つため。色だけに頼ると、色を落とす端末や
+// 配色を変えた環境で "claude max" がパスの一部に見える。
+const slot = readAccountSlot();
+if (slot) headBits.push(`${THEME.account}@${slot}${RESET}`);
+
+if (headBits.length) parts.push(headBits.join(' '));
+
+// スロットだけは stdin ではなくローカルのファイル由来なので、末尾の「項目が1つも作れなかった」
+// 診断の判定から外す。外さないと、入力の形が変わって全項目を落としても `@max` の1項目が残り、
+// 異常が「項目の少ない正常な行」に化けて診断が二度と出なくなる(冒頭に書いた
+// 「異常時も必ず1行出す」は、まさにその入力側の変化を切り分けるための不変条件)。
+const nonInputParts = slot && !dirShown ? 1 : 0;
 
 // モデルと推論設定を1グループにまとめる。区切りを増やさずに済み、
 // 「どのモデルをどの強度で回しているか」が一続きで読める。
 const modelBits = [];
 if (d.model?.display_name) {
+  // 利用枠が他モデルと別建てのモデルは色を変える。同じ 5 時間枠を食っている前提で
+  // 残量を読むと見込みを外すため、モデル名そのもので気づけるようにしておく。
+  // id と表示名の両方を見るのは、表示名の付け方(世代番号の有無など)が変わりうるため。
+  const alt = ALT_MODEL_RE.test(d.model.id || '') || ALT_MODEL_RE.test(d.model.display_name);
   // "Opus 5" -> "Opus5"。空白を潰しても識別性は落ちない。
-  modelBits.push(`${THEME.model}${String(d.model.display_name).replace(/\s+/g, '')}${RESET}`);
+  const name = String(d.model.display_name).replace(/\s+/g, '');
+  modelBits.push(`${alt ? THEME.modelAlt : THEME.model}${name}${RESET}`);
 }
 // エフォートは2〜3文字に短縮。xhigh/max は消費が跳ねるので色で気づけるようにする。
 const EFFORT = { low: 'lo', medium: 'md', high: 'hi', xhigh: 'xhi', max: 'max' };
@@ -226,16 +325,21 @@ if (d.thinking?.enabled === false) modelBits.push(`${THEME.nothink}nothink${RESE
 if (modelBits.length) parts.push(modelBits.join(' '));
 
 // コンテキストウィンドウ。セッション開始直後や /compact 直後は null になる。
-// % だけでは絶対感が掴めないためトークン数を併記する。残量ではなく使用量を出すのは、
-// 色の閾値(CTX_WARN_TOKENS)が使用量で決まっており、両者が揃っていないと
-// 「なぜ黄色いのか」が読み取れないため。残量は 1M 窓ではほぼ動かず判断材料にならない。
+// 主として出すのは % ではなく使用トークン数。判断に効くのは「あと何割か」ではなく「何 k か」で、
+// 単価が跳ねる水準(CTX_WARN_TOKENS)も切り上げ時の目安も絶対量で決まっている。1M 窓では
+// 250k 使っていても 25% にしかならず、比率は色が変わった理由すら説明できない。
+// % を添えるのは窓そのものを使い切りそうなとき(PCT_WARN 以上)だけ。そこでは自動 compact が
+// 近いという別種の情報になるので、他の項目と同じく「既定から外れたときだけ出す」に従う。
+// 残量ではなく使用量を出すのは、色の閾値が使用量で決まっているため(残量では対応が読めない)。
 const cw = d.context_window;
 const ctx = cw?.used_percentage;
 if (typeof ctx === 'number' && isFinite(ctx)) {
   const p = Math.floor(ctx);
   const used = (cw.total_input_tokens || 0) + (cw.total_output_tokens || 0);
-  let s = `${ctxColor(p, used)}ctx ${p}%${RESET}`;
-  if (used > 0) s += ` ${THEME.tokens}${shortTokens(used)}${RESET}`;
+  const color = ctxColor(p, used);
+  // トークン数が取れないときだけ % で代替する。無言で消すと項目ごと失われる。
+  let s = used > 0 ? `${color}ctx ${shortTokens(used)}${RESET}` : `${color}ctx ${p}%${RESET}`;
+  if (used > 0 && p >= PCT_WARN) s += ` ${THEME.ctxPct}${p}%${RESET}`;
   parts.push(s);
 }
 
@@ -268,7 +372,7 @@ for (const [node, label] of [
   parts.push(s);
 }
 
-if (parts.length === 0) {
+if (parts.length - nonInputParts === 0) {
   write(`${THEME.fallback}(statusline: no fields)${RESET}`);
   process.exit(0);
 }
