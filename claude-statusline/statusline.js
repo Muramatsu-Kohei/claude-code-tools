@@ -3,8 +3,9 @@
 // settings.json の statusLine から `node <このファイル>` として呼ばれ、stdin で渡される JSON から
 // モデル・推論設定・コンテキスト使用率・コスト・差分行数・プラン利用枠(5時間/週次)を1行で出力する。
 // 出力例:
-//   claude | Opus5 hi | ctx 5% 950k | $0.28 +12/-3 | 5h 16% 11:54 | 7d 2% Wed 09:20
+//   claude @max | Opus5 hi | ctx 5% 950k | $0.28 +12/-3 | 5h 16% 11:54 | 7d 2% Wed 09:20
 // プラン枠の情報は claude.ai サブスク認証時にしか渡ってこないため、欠損時は黙って省く。
+// `@max` は account-guard を併用している場合だけ出るアカウントスロット名(後述の readAccountSlot)。
 //
 // 幅の方針: ステータスラインは常時表示で横幅が貴重なため、区切り(" | ")の数を増やさないよう
 // 関連する値をグループにまとめ、"Opus 5" は "Opus5" のように詰める。
@@ -28,6 +29,8 @@
 //  - 異常時も必ず1行出す。無出力にするとステータスラインが消え、原因の切り分けが不能になる。
 
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const ESC = '\x1b';
 
@@ -91,6 +94,7 @@ const RESET = c(ST.reset);
 const THEME = {
   sep: c(ST.dim),                 // 項目の区切り " | "
   dir: c(FG.cyan),                // カレントディレクトリ名
+  account: c(FG.magenta),         // アカウントスロット(account-guard 導入時のみ)
   model: c(ST.dim),               // モデル名
   effort: c(ST.dim),              // 推論エフォート(low/medium/high)
   effortHigh: c(FG.yellow),       // 推論エフォート(xhigh/max) -- 消費が跳ねるので警告色
@@ -197,14 +201,46 @@ function shortCost(v) {
   return `$${v.toFixed(2)}`;
 }
 
+// アカウントスロット。account-guard が `~/.claude/accounts/.current` に書く「前回 swap した先」。
+// 起動バナーの組織名は `~/.claude.json` の 24 時間キャッシュで、swap してもプラン名だけが先に
+// 変わり組織名は最大 1 日前のアカウントのまま残る(実測で確認済み)。バナーを信じて別プランの
+// 枠を溶かす取り違えを防ぐため、常時見えるここに「いまどのスロットか」を出す。
+// これは来歴であって現在のログインの証明ではない(swap を通さず /login し直すと古いまま残る)。
+// それでもバナーより新しく、swap 運用の範囲では最も確かな手掛かりになる。
+// account-guard を使っていない環境ではファイルごと存在しないので、そのときは何も出さない
+// (「既定から外れたときだけ出す」の方針どおり、無関係な利用者の幅を奪わない)。
+function readAccountSlot() {
+  try {
+    const home = os.homedir();
+    if (!home) return null;
+    const raw = fs.readFileSync(path.join(home, '.claude', 'accounts', '.current'), 'utf8');
+    const name = raw.trim();
+    // 壊れた・書き換えられたファイルから制御文字(ANSI エスケープ)や長大な文字列が
+    // 表示へ流れ込まないようにする。許す字種は account-guard のスロット名に合わせる。
+    return /^[a-zA-Z0-9_-]{1,20}$/.test(name) ? name : null;
+  } catch (e) {
+    return null; // 未導入(ENOENT)でも読めない場合でも、表示を諦めるだけにする。
+  }
+}
+
 const parts = [];
+
+// 先頭グループ。「どこで」「どのアカウントで」作業しているかをまとめ、区切りを増やさない。
+const headBits = [];
 
 // ディレクトリ名。パスの区切りは win32/posix の両方を見る。
 const dirPath = d.workspace?.current_dir || d.cwd;
 if (dirPath) {
   const leaf = String(dirPath).replace(/[\\/]+$/, '').split(/[\\/]/).pop();
-  if (leaf) parts.push(`${THEME.dir}${leaf}${RESET}`);
+  if (leaf) headBits.push(`${THEME.dir}${leaf}${RESET}`);
 }
+
+// `@` を付けるのはディレクトリ名との地続きを断つため。色だけに頼ると、色を落とす端末や
+// 配色を変えた環境で "claude max" がパスの一部に見える。
+const slot = readAccountSlot();
+if (slot) headBits.push(`${THEME.account}@${slot}${RESET}`);
+
+if (headBits.length) parts.push(headBits.join(' '));
 
 // モデルと推論設定を1グループにまとめる。区切りを増やさずに済み、
 // 「どのモデルをどの強度で回しているか」が一続きで読める。
