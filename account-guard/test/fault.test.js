@@ -273,7 +273,13 @@ console.log(`  (${CASES} ケース, ${((Date.now() - startedAt) / 1000).toFixed(
     //                  property test が回す操作列は swap.js のサブコマンドで、解除の経路自体を
     //                  通らない。解除そのものの状態を書く writeFileSync / renameSync は
     //                  WRAPPED_CALLS 側にあるので、書き込みの故障が検査から漏れるわけではない。
-    ['account-guard.js', new Set(['existsSync', 'appendFileSync'])],
+    // openSync / statSync / closeSync … 解除の状態ファイルを読み書きするあいだのロック
+    //                  (withUnlockLock)にだけ使う。appendFileSync と同じくこの property test の
+    //                  操作列(swap.js のサブコマンド)は通らない経路であることに加え、ここが
+    //                  失敗しても状態ファイルは書き換わらない ―― ロックを取れなければ中の
+    //                  読み書きを呼ばずに失敗するので、壊れ方は「解除できない」だけで、
+    //                  保護が緩む向きには倒れない。
+    ['account-guard.js', new Set(['existsSync', 'appendFileSync', 'openSync', 'statSync', 'closeSync'])],
     // credentials.js は existsSync を呼んでいない。probeFile の説明コメントが「fs.existsSync を
     // 使わない」理由を書いており、その文字列を下の正規表現が拾うだけ。コメントを削ってから
     // 拾う手もあるが、削りすぎれば本物の呼び出しを見逃す(危険側に倒れる)ので、拾いすぎた

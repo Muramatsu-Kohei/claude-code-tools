@@ -1611,4 +1611,160 @@ const TOOL_B = 'C:/org-tree/tool-b';
   check('異常終了時も Claude からの解除は拒否する', decision(res) === 'deny', JSON.stringify(res));
 }
 
+// --- 切り詰められた参照は解除の範囲内と見なさない ---
+//
+// ブレース展開・glob のブラケット・カンマ・引用符は、切り出したトークンの続きを実行時に作る。
+// 前方一致の範囲判定は「先頭が範囲内なら全体も範囲内」と答えるので、先頭だけを見て通すと
+// 解除していない兄弟ディレクトリに手が届く。同じ切り詰めが解除の状態ファイルの一致判定も
+// 外していた(下の「状態ファイルへの書き込み」)ので、両方を並べて確かめる。
+{
+  const SID = 'session-truncate';
+  const home = unlockedSandbox('unlock-truncate', TOOL_A, SID);
+  const shell = (command) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'Bash', tool_input: { command },
+  });
+
+  let res = shell(`cat ${TOOL_A}/x.py`);
+  check('解除範囲だけを触るコマンドは通す', decision(res) === null, JSON.stringify(res));
+
+  res = shell(`cat ${TOOL_A}/x.py && ls`);
+  check('シェルの区切りで続くコマンドも通す', decision(res) === null, JSON.stringify(res));
+
+  res = shell(`cat "${TOOL_A}"/x.py`);
+  check('引用符で割れたパスは繋げて解除範囲と見る', decision(res) === null, JSON.stringify(res));
+
+  res = shell(`cat ${TOOL_A}{,bc}/secret`);
+  check('ブレース展開で兄弟に届く形は拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell(`cat ${TOOL_A}[bc]/secret`);
+  check('glob のブラケットで兄弟に届く形は拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell(`cat ${TOOL_A},bc/secret`);
+  check('カンマで名前が続く形は拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell(`cat "${TOOL_A}"bc/secret`);
+  check('引用符の外で名前が伸びる形は拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+
+// --- cd の移動先を基準にした相対パス ---
+//
+// 移動してから相対で指す形は、フック入力の cwd で解決すると別の場所になる。絶対パスで
+// 同じ場所を指せば拒否されるので、書き方だけで結論が変わっていた。
+{
+  const SID = 'session-cd';
+  const home = unlockedSandbox('unlock-cd', TOOL_A, SID);
+  const shell = (command) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'Bash', tool_input: { command },
+  });
+
+  let res = shell(`cd ${TOOL_A} && cat sub/x.py`);
+  check('移動先が解除範囲なら、その配下の相対パスは通す', decision(res) === null, JSON.stringify(res));
+
+  res = shell(`cd ${TOOL_A} && cat ../tool-b/secret`);
+  check('移動先から解除範囲の外へ登る相対パスは拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+
+// --- 裸のツリー名は区切りを伴わない形だけを拾う ---
+//
+// 区切り付きの形は相対パスとして正しい深さで拾われている。そこへ重ねてツリールートまで
+// 積むと、配下を解除していても相対形だけが拒否される(絶対パスなら通るのに、という食い違い)。
+{
+  const SID = 'session-bare';
+  const home = unlockedSandbox('unlock-bare', TOOL_A, SID);
+  const shell = (command) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/',
+    tool_name: 'Bash', tool_input: { command },
+  });
+
+  let res = shell('cd org-tree/tool-a && ls');
+  check('親から解除範囲へ相対で降りる形は通す', decision(res) === null, JSON.stringify(res));
+
+  res = shell('cd org-tree && ls');
+  check('親からツリールートへ降りる裸の名前は拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+
+// --- 解除の状態ファイルへの書き込み ---
+{
+  const SID = 'session-state-write';
+  const home = unlockedSandbox('unlock-state-write', TOOL_A, SID);
+  const dir = path.join(home, '.claude', 'account-guard').replace(/\\/g, '/');
+  const shell = (command) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'Bash', tool_input: { command },
+  });
+
+  let res = shell(`echo {} > ${dir}/unlocks.json`);
+  check('状態ファイルへの書き込みは拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell(`echo {} > ${dir}/"unlocks.json"`);
+  check('引用符で割った状態ファイルへの書き込みも拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell(`echo {} > ${dir}/unlocks{.json,}`);
+  check('ブレース展開で作る状態ファイル名も拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell('ls C:/{a,b}');
+  check('無関係なブレース展開まで状態ファイル扱いしない', decision(res) === null, JSON.stringify(res));
+}
+
+// --- 解除コマンドの遮断は Bash / PowerShell 以外にも効く ---
+{
+  const SID = 'session-unknown-tool';
+  const home = unlockedSandbox('unlock-unknown-tool', TOOL_A, SID);
+
+  let res = runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'mcp__shell__exec', tool_input: { cmd: 'guard unlock "理由"' },
+  });
+  check('知らないツール経由の解除も拒否する', decision(res) === 'deny', JSON.stringify(res));
+  check('拒否の理由が解除の遮断であること', /解除/.test(reasonOf(res)), reasonOf(res));
+
+  res = runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'Read', tool_input: { file_path: 'C:/notes/guard unlock.md' },
+  });
+  check('パスのフィールドしか持たないツールは解除試行と見なさない',
+    decision(res) === null, JSON.stringify(res));
+}
+
+// --- セッション ID はフック入力を優先する ---
+//
+// 環境変数に別セッションの値が残っている環境で、両方を候補にすると解除が漏れる。
+{
+  const SID = 'session-hook-priority';
+  const home = unlockedSandbox('unlock-session-priority', TOOL_A, SID);
+  const env = homeEnv(home);
+  env.CLAUDE_CODE_SESSION_ID = SID;
+  const res = toResult(execGuardScript(GUARD, {
+    env,
+    input: {
+      hook_event_name: 'PreToolUse', session_id: 'another-session', cwd: TOOL_A,
+      tool_name: 'Read', tool_input: { file_path: 'x.py' },
+    },
+  }));
+  check('フック入力のセッションが違えば、環境変数が一致していても解除は効かない',
+    decision(res) === 'deny', JSON.stringify(res));
+}
+
+// --- 状態ファイルの読み書きは直列化する ---
+{
+  const SID = 'session-lock';
+  const home = sandbox('unlock-lock', { subscriptionType: 'pro', rules: ORG });
+  const lock = path.join(home, '.claude', 'account-guard', 'unlocks.lock');
+  fs.writeFileSync(lock, '', 'utf8');
+
+  const failed = guardCliFail(home, ['unlock', '--path', TOOL_A, 'テスト用の解除'], SID);
+  check('ロックが生きている間は解除を失敗させる',
+    failed !== null && /進行中/.test(failed.stderr), JSON.stringify(failed));
+  check('失敗した解除は状態ファイルを作らない', !fs.existsSync(unlocksFile(home)), '');
+
+  // 取り残されたロックは奪う。奪えないと、強制終了のたびに以後ずっと解除できなくなる。
+  const old = new Date(Date.now() - 120000);
+  fs.utimesSync(lock, old, old);
+  const out = String(guardCli(home, ['unlock', '--path', TOOL_A, 'テスト用の解除'], SID) || '');
+  check('古いロックは奪って解除できる', /解除しました/.test(out), out);
+  check('奪ったロックは処理の後に消える', !fs.existsSync(lock), '');
+}
+
 report();
