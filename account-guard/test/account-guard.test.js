@@ -1347,6 +1347,18 @@ const TOOL_B = 'C:/org-tree/tool-b';
   // cwd の解除は「そこで作業してよい」であって、同じツリーの範囲外を触ってよいことにはならない。
   res = read(SID, TOOL_A, '../tool-b/x.py');
   check('cwd が解除済みでも、範囲外を指す対象は拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // リダイレクトはパスの区切りとして扱う。空白を省いた `x>y` を 1 つのトークンとして
+  // 切り出していた頃は、前半が範囲内なら後半(範囲外)ごと範囲内と判定され、上の
+  // 「対象の一部が範囲外なら拒否する」が空白ひとつで無効になっていた。
+  res = shell(`cat ${TOOL_A}/x>${TOOL_B}/y`);
+  check('空白なしのリダイレクトで連結された範囲外は拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell(`cat ${TOOL_A}/x>>${TOOL_B}/y`);
+  check('追記リダイレクトで連結された範囲外は拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell(`diff ${TOOL_A}/x<${TOOL_B}/y`);
+  check('入力リダイレクトで連結された範囲外は拒否する', decision(res) === 'deny', JSON.stringify(res));
 }
 
 // Claude 自身が解除できないこと(歯止め 1: コマンドの遮断)
@@ -1425,9 +1437,36 @@ const TOOL_B = 'C:/org-tree/tool-b';
   res = call('Read', { file_path: file });
   check('unlocks.json の読み取りは止めない', decision(res) === null, JSON.stringify(res));
 
+  // リダイレクトを区切りとして扱わないと、`>` の前のパスと連結した 1 トークンになり、
+  // 状態ファイルとの一致判定(完全一致)をすり抜ける。
+  res = call('Bash', { command: `cat C:/tmp/x>${file.replace(/\\/g, '/')}` });
+  check('空白なしのリダイレクトでも状態ファイルへの書き込みは拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // `~` や `$HOME` は path.resolve が知らない。展開しないままだと cwd 配下の実在しない
+  // パスへ解決され、ホームを指すいちばん普通の書き方だけが素通りしていた。
+  res = call('Bash', { command: 'echo {} > ~/.claude/account-guard/unlocks.json' });
+  check('~ 表記でも状態ファイルへの書き込みは拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = call('Bash', { command: 'cp /tmp/x "$HOME/.claude/account-guard/unlocks.json"' });
+  check('$HOME 表記でも状態ファイルへの書き込みは拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = call('PowerShell', { command: 'Set-Content %USERPROFILE%\\.claude\\account-guard\\unlocks.json "{}"' });
+  check('%USERPROFILE% 表記でも状態ファイルへの書き込みは拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // 知らないツール(MCP のファイルシステムサーバなど)にも同じ歯止めを効かせる。書き込める
+  // ツール名を列挙して塞ぐ形だと、増えるたびに歯止めの外側が広がる。
+  res = call('mcp__fs__write_file', { path: file });
+  check('知らないツールからの状態ファイル書き込みも拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = call('MultiEdit', { file_path: file, edits: [] });
+  check('MultiEdit からの状態ファイル書き込みも拒否する', decision(res) === 'deny', JSON.stringify(res));
+
   // 同名でも別の場所のファイルは巻き込まない。
   res = call('Write', { file_path: 'C:/claude/ClaudeCode/unlocks.json', content: '{}' });
   check('別の場所にある同名ファイルは巻き込まない', decision(res) === null, JSON.stringify(res));
+
+  res = call('mcp__fs__write_file', { path: 'C:/claude/ClaudeCode/unlocks.json' });
+  check('知らないツールでも別の場所の同名ファイルは巻き込まない', decision(res) === null, JSON.stringify(res));
 }
 
 // CLI の異常系と、解除 → 確認 → 取り消しの一巡
@@ -1440,6 +1479,13 @@ const TOOL_B = 'C:/org-tree/tool-b';
   check('理由のない unlock は失敗する', f !== null && f.status === 1, JSON.stringify(f));
   check('理由が要ることを伝える', /理由が必要/.test(f?.stderr || ''), f?.stderr);
   check('失敗した解除は状態ファイルを作らない', !fs.existsSync(file), file);
+
+  // 知らないオプションを理由へ吸い込むと、`--path` の打ち間違いが「範囲指定のない解除」として
+  // 成立し、意図した範囲ではなく cwd(たいていもっと広い)が黙って開く。
+  f = guardCliFail(home, ['unlock', '--paht', TOOL_B, '理由'], SID);
+  check('知らないオプションは失敗させる', f !== null && f.status === 1, JSON.stringify(f));
+  check('打ち間違えたオプションをそのまま示す', /--paht/.test(f?.stderr || ''), f?.stderr);
+  check('打ち間違えた解除は状態ファイルを作らない', !fs.existsSync(file), file);
 
   f = guardCliFail(home, ['unlock', '--path', 'C:/elsewhere', '理由'], SID);
   check('保護ツリーの外は解除できない', f !== null && f.status === 1, JSON.stringify(f));
@@ -1463,6 +1509,12 @@ const TOOL_B = 'C:/org-tree/tool-b';
   check('status に解除の理由が出る', /リミット回避のため/.test(st), st);
   const stOther = guardCli(home, ['status'], 'session-someone-else');
   check('status は他セッションの解除を自分のものとして出さない', /解除: なし/.test(stOther), stOther);
+
+  // lock も同じ取り違えを起こす。向きは逆(範囲を指定したつもりで全部消える)だが、原因は
+  // 同じ「打ち間違えたオプションが黙って通ること」なので、判定は unlock と合流させてある。
+  f = guardCliFail(home, ['lock', '--paht', TOOL_A], SID);
+  check('lock でも知らないオプションは失敗させる', f !== null && f.status === 1, JSON.stringify(f));
+  check('失敗した lock は解除を消さない', JSON.parse(fs.readFileSync(file, 'utf8')).unlocks.length === 1, file);
 
   guardCli(home, ['unlock', '--path', TOOL_A, '二度目の理由'], SID);
   let state = JSON.parse(fs.readFileSync(file, 'utf8'));

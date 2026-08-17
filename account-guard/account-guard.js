@@ -174,6 +174,18 @@ function mentionsTree(haystack, tree) {
   return new RegExp(t + '(?![a-z0-9_.-])').test(normalize(haystack));
 }
 
+// パス風のトークンをどこで切るか。シェルのメタ文字はパスの一部になりえないので、必ず
+// トークンの終わりとして扱う。切り出しを行う 4 箇所(treeRefsIn / ABSOLUTE_PATH_TOKEN /
+// MSYS_PATH_TOKEN / RELATIVE_PATH_TOKEN)で同じものを使う ―― ここが箇所ごとにずれていると、
+// 片方だけが知っている書き方が抜け道になる。
+//
+// リダイレクト(`>` `<`)が抜けていた頃は、隣り合う 2 つのパスが 1 つのトークンに結合し、
+// 前方一致の範囲判定が「前半が範囲内なら後半も範囲内」と誤って答えていた。`cp <範囲内>/x
+// <範囲外>/y` は拒否できるのに、空白を詰めた `cat <範囲内>/x><範囲外>/y` は通る、という
+// 空白ひとつで結論が変わる状態になっていた(解除の状態ファイルの一致判定も同じ理由で外れた)。
+const TOKEN_STOP = '"\'`\\s,;|&()<>[\\]{}';
+const NOT_STOP = `[^${TOKEN_STOP}]`;
+
 // 文字列に現れる「ツリーを指す参照」をすべて取り出す。mentionsTree が真偽しか返さないのに対し、
 // こちらは当たった箇所そのものを返す。解除の判定に要る: シェルのコマンド文字列は 1 本で複数の
 // パスに触れるので、「ツリーに当たったか」だけを見ると、`tool-a` だけを解除した状態で
@@ -184,7 +196,7 @@ function mentionsTree(haystack, tree) {
 function treeRefsIn(text, tree) {
   const t = normalize(tree).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   // ツリー名に続く部分は、シェルの区切りに当たらない限りパスの一部として取り込む。
-  return normalize(text).match(new RegExp(t + '(?![a-z0-9_.-])[^"\'\\s,;|&()]*', 'g')) ?? [];
+  return normalize(text).match(new RegExp(`${t}(?![a-z0-9_.-])${NOT_STOP}*`, 'g')) ?? [];
 }
 
 // cwd がツリーの内側か。ツリー自身もツリー配下として扱う。
@@ -293,11 +305,27 @@ const COMMAND_FIELDS = {
 };
 
 // 文字列に埋もれた絶対パス。ドライブ文字から始まる形。
-const ABSOLUTE_PATH_TOKEN = /[a-z]:[\\/][^"'\s,]*/gi;
+const ABSOLUTE_PATH_TOKEN = new RegExp(`[a-z]:[\\\\/]${NOT_STOP}*`, 'gi');
 
 // Git Bash / MSYS 形式の絶対パス。直前がドライブのコロンや識別子の文字なら、それは
 // Windows パスの途中(`D:/c/...`)なので拾わない。
-const MSYS_PATH_TOKEN = /(?<![a-z0-9_.:\-])(?:\/cygdrive)?\/[a-z]\/[^"'\s,]*/gi;
+const MSYS_PATH_TOKEN = new RegExp(`(?<![a-z0-9_.:\\-])(?:/cygdrive)?/[a-z]/${NOT_STOP}*`, 'gi');
+
+// 文字列に現れるホーム表記(`~` / `$HOME` / `%USERPROFILE%`)をホームディレクトリへ展開する。
+//
+// path.resolve はこれらを知らないので、展開しないまま解決すると `<cwd>/~/.claude/...` という
+// 実在しないパスになる。トークンの切り出し側も `~` や `$` で始まる形を 1 つのパスとしては
+// 認識しない。つまり展開は「切り出す前の文字列」に対して行う必要がある。
+// これが無かった頃は、解除の状態ファイルへの書き込み遮断が
+// `echo {} > ~/.claude/account-guard/unlocks.json` という、ホームを指すいちばん普通の
+// 書き方だけを素通ししていた(絶対パスで書けば拒否される、という食い違い)。
+function expandHomeIn(value) {
+  if (!HOME || typeof value !== 'string') return value;
+  // パスの先頭として現れる形(直後が区切り)だけを展開する。`~user` や `$HOME_DIR` のような
+  // パスでない語まで置き換えると、無関係な文字列を cwd 配下のパスとして解決してしまう。
+  // 置換は関数で返す ―― HOME に `$&` 等が含まれると文字列指定では化ける。
+  return value.replace(/(?<![a-z0-9_.\-])(?:~|\$\{?HOME\}?|%USERPROFILE%|\$env:USERPROFILE)(?=[\\/])/gi, () => HOME);
+}
 
 // MSYS 形式を Windows 形式へ直す。そのまま path.resolve に渡すと `C:\c\...` と
 // 誤変換されるが、ドライブ表記に直してからなら渡せる。これをしないと `/c/x/../<tree>` の
@@ -319,12 +347,12 @@ function fromMsys(token) {
 // 散文中でツリー名に言及しただけで拒否される誤検知(PATH_FIELDS のコメント)が復活するため。
 // 直前が識別子の文字・コロン・区切りなら拾わない。これがないと `D:/<tree>` や
 // `https://host/<tree>` の途中を切り出し、別ドライブや URL を cwd 配下へ解決してしまう。
-const RELATIVE_PATH_TOKEN = /(?<![a-z0-9_.:\-\\/])[a-z0-9_.\-]*(?:[\\/][^"'`\s,;|&()]*)+/gi;
+const RELATIVE_PATH_TOKEN = new RegExp(`(?<![a-z0-9_.:\\-\\\\/])[a-z0-9_.\\-]*(?:[\\\\/]${NOT_STOP}*)+`, 'gi');
 
 // 相対パスを cwd 基準の絶対パスへ直す。解決できない値(null 文字を含む等)は捨てる。
 function resolveFrom(cwd, value) {
   try {
-    return path.resolve(cwd || process.cwd(), value);
+    return path.resolve(cwd || process.cwd(), expandHomeIn(value));
   } catch {
     return null;
   }
@@ -370,12 +398,16 @@ function targetStrings(toolName, toolInput, cwd, trees = []) {
 
   const out = [];
   for (const text of texts) {
-    const absolute = text.match(ABSOLUTE_PATH_TOKEN) ?? [];
-    const relative = text.match(RELATIVE_PATH_TOKEN) ?? [];
-    const msys = text.match(MSYS_PATH_TOKEN) ?? [];
+    // ホーム表記は切り出す前に展開する(expandHomeIn のコメント参照)。展開後の文字列を
+    // そのまま以降の判定にも使う ―― 元の文字列を併せて見ても、`~` を含む形は
+    // どのトークンにも当たらないので判定材料が増えない。
+    const scan = expandHomeIn(text);
+    const absolute = scan.match(ABSOLUTE_PATH_TOKEN) ?? [];
+    const relative = scan.match(RELATIVE_PATH_TOKEN) ?? [];
+    const msys = scan.match(MSYS_PATH_TOKEN) ?? [];
 
     // シェルや委譲は「保護ツリーを読め」という指示そのものを止めたいので文字列全体も見る。
-    if (commandFields) out.push({ value: text, kind: 'text' });
+    if (commandFields) out.push({ value: scan, kind: 'text' });
     else out.push(...absolute.map(asPath), ...msys.map(asPath));
 
     // 埋もれたパスは切り出して個別に解決する。文字列全体のままでは `.` / `..` を畳めず、
@@ -489,25 +521,25 @@ function isUnlockAttempt(input) {
 // 読みと書きを区別できないので、そのパスが現れた時点で拒否する。相対パス指定を取りこぼさないよう、
 // 判定は既存のパス検出(targetStrings)に合流させる ―― ここだけ別の検出を新設すると、片方だけが
 // 知っている書き方が抜け道になる。
+//
+// 塞ぐ側ではなく通す側を列挙するのは、知らないツールを既定で歯止めの内側に置くため。
+// 書き込むツール(Write / Edit / NotebookEdit)を列挙していた頃は、そこに載っていない
+// MCP のファイルシステムサーバや MultiEdit がすべて素通りし、状態ファイルを書き換えられた。
+// ツールは増えるので、増えるたびに穴が開く向きの列挙にしてはいけない。
+const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep']);
+
 function isUnlockStateWrite(input) {
   // HOME を導出できていないときの UNLOCKS はダミー値で、実在のパスと一致しない。その状態では
   // config.broken 側がすべて拒否するので、ここで無理に判定しなくてよい。
   if (homeUnresolved) return false;
   const tool = input.tool_name;
-  const ti = input.tool_input ?? {};
-  if (tool === 'Write' || tool === 'Edit' || tool === 'NotebookEdit') {
-    const target = ti.file_path ?? ti.notebook_path;
-    if (typeof target !== 'string' || !target) return false;
-    const abs = resolveFrom(input.cwd, target);
-    return Boolean(abs) && normalize(abs) === normalize(UNLOCKS);
-  }
-  if (tool === 'Bash' || tool === 'PowerShell') {
-    // trees に UNLOCKS を渡すと、裸のファイル名(`unlocks.json`)も cwd 基準で解決される。
-    // 別の場所の同名ファイルは違うパスに解決されるので巻き込まない。
-    return targetStrings(tool, ti, input.cwd, [UNLOCKS])
-      .some((t) => t.kind === 'path' && normalize(t.value) === normalize(UNLOCKS));
-  }
-  return false;
+  if (READ_ONLY_TOOLS.has(tool)) return false;
+  // trees に UNLOCKS を渡すと、裸のファイル名(`unlocks.json`)も cwd 基準で解決される。
+  // 別の場所の同名ファイルは違うパスに解決されるので巻き込まない。
+  // kind が 'text'(シェルのコマンド文字列そのもの)は見ない。文字列全体が状態ファイルの
+  // パスと完全一致することはないうえ、ここで部分一致を採ると単に言及しただけで拒否される。
+  return targetStrings(tool, input.tool_input ?? {}, input.cwd, [UNLOCKS])
+    .some((t) => t.kind === 'path' && normalize(t.value) === normalize(UNLOCKS));
 }
 
 // 壊れた設定を直す操作だけは通す。これがないと Claude Code の中から復旧できず、
@@ -1058,17 +1090,32 @@ function failUnlock(lines) {
 
 // `--path <dir>` / `--path=<dir>` を抜き出し、残りを理由として結合する。理由を引用符で囲み忘れて
 // 単語が分かれても意味が変わらないよう、残りは全部つなげて 1 つの理由として扱う。
+// 知らないオプションは理由へ吸い込まず、そのまま返して呼び出し側に失敗させる。`--paht` の
+// ような打ち間違いを理由の一部として受け取ると、範囲指定のない解除として成立し、指定した
+// つもりのディレクトリではなく cwd(たいていもっと広い)が黙って開く。
 function parseUnlockArgs(argv) {
   let target;
   let sawPath = false;
+  let unknownOption = null;
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--path') { sawPath = true; target = argv[++i]; continue; }
     if (a.startsWith('--path=')) { sawPath = true; target = a.slice('--path='.length); continue; }
+    if (!unknownOption && /^--?\S/.test(a)) { unknownOption = a; continue; }
     rest.push(a);
   }
-  return { sawPath, target, reason: rest.join(' ').trim() };
+  return { sawPath, target, reason: rest.join(' ').trim(), unknownOption };
+}
+
+// unlock と lock で共通の失敗。取り違えの向きは逆(unlock は意図より広く開き、lock は範囲を
+// 指定したつもりで全部消える)だが、原因は同じ「オプションの打ち間違いが黙って通ること」なので
+// 判定も文面も 1 箇所にまとめる。
+function failUnknownOption(option) {
+  return failUnlock([
+    `[account-guard] 知らないオプションです: ${option}(何もしていません)。`,
+    '指定できるのは --path <dir> だけです。理由は引用符で囲んで渡してください。',
+  ]);
 }
 
 function cmdUnlock(argv, config, account) {
@@ -1081,7 +1128,8 @@ function cmdUnlock(argv, config, account) {
     ]);
   }
 
-  const { sawPath, target, reason } = parseUnlockArgs(argv);
+  const { sawPath, target, reason, unknownOption } = parseUnlockArgs(argv);
+  if (unknownOption) return failUnknownOption(unknownOption);
   if (sawPath && !target) return failUnlock('[account-guard] --path にディレクトリを指定してください。');
   if (!reason) {
     return failUnlock([
@@ -1165,7 +1213,8 @@ function cmdLock(argv, account) {
       'Claude Code の中から実行してください(CLAUDE_CODE_SESSION_ID が空です)。',
     ]);
   }
-  const { sawPath, target } = parseUnlockArgs(argv);
+  const { sawPath, target, unknownOption } = parseUnlockArgs(argv);
+  if (unknownOption) return failUnknownOption(unknownOption);
   if (sawPath && !target) return failUnlock('[account-guard] --path にディレクトリを指定してください。');
   const abs = sawPath ? path.resolve(target) : null;
 
