@@ -265,9 +265,15 @@ console.log(`  (${CASES} ケース, ${((Date.now() - startedAt) / 1000).toFixed(
     //              ないので、操作列の warmup は必ず --yes 付きで走り、この経路自体を通らない
     //              (通らない呼び出しに故障を注入しても、現実には起きない状態を作るだけ)。
     ['swap.js', new Set(['writeSync', 'readSync'])],
-    // status の表示にだけ使うフォールバック。内部で例外を握りつぶす API なので、throw を
-    // 注入しても現実には起きない状態を作ることになる。
-    ['account-guard.js', new Set(['existsSync'])],
+    // existsSync    … status の表示にだけ使うフォールバック。内部で例外を握りつぶす API なので、
+    //                  throw を注入しても現実には起きない状態を作ることになる。
+    // appendFileSync … 解除の履歴(unlock.log)への追記にだけ使う。呼び出し側が try/catch で
+    //                  握り潰す設計で、書けなくても解除の成否は変わらない(履歴を書けないことを
+    //                  理由に解除を失敗させると、本筋と無関係な行き止まりを作る)。加えてこの
+    //                  property test が回す操作列は swap.js のサブコマンドで、解除の経路自体を
+    //                  通らない。解除そのものの状態を書く writeFileSync / renameSync は
+    //                  WRAPPED_CALLS 側にあるので、書き込みの故障が検査から漏れるわけではない。
+    ['account-guard.js', new Set(['existsSync', 'appendFileSync'])],
     // credentials.js は existsSync を呼んでいない。probeFile の説明コメントが「fs.existsSync を
     // 使わない」理由を書いており、その文字列を下の正規表現が拾うだけ。コメントを削ってから
     // 拾う手もあるが、削りすぎれば本物の呼び出しを見逃す(危険側に倒れる)ので、拾いすぎた

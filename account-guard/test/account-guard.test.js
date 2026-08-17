@@ -1245,4 +1245,318 @@ console.log('account-guard');
     /1\.\s*swap save <name>[\s\S]*2\.\s*\/login[\s\S]*3\.\s*swap save <別名>/.test(reason), reason);
 }
 
+// --- 一時解除(unlock) ---
+//
+// 解除で確かめたいのは 3 点。(1) 開けた範囲だけが開くこと ―― ツリー単位で開くと、ツリーの下に
+// 保護対象と非保護対象が混在している構成で全部が開いてしまう。(2) 解除がセッションに紐づくこと。
+// (3) Claude 自身は解除できないこと ―― 歯止めがコマンド遮断と状態ファイル保護の 2 層あるので、
+// 両方を別々に確かめる。
+
+// 解除の CLI を叩く。セッション ID は環境変数で渡す(unlock はフック入力を持たない経路)。
+// sessionId を省いたときは親の値も落として、「Claude Code の外から実行した」状況を作る。
+function guardCli(home, argv, sessionId) {
+  const env = homeEnv(home);
+  if (sessionId) env.CLAUDE_CODE_SESSION_ID = sessionId;
+  else delete env.CLAUDE_CODE_SESSION_ID;
+  return execGuardScript(GUARD, { argv, env });
+}
+
+// 失敗する CLI 呼び出し。非ゼロ終了は execGuardScript が例外にするので、そこから stderr を取る。
+// 成功してしまった場合は null を返す(呼び出し側が「失敗するはず」を検査できるように)。
+function guardCliFail(home, argv, sessionId) {
+  try {
+    guardCli(home, argv, sessionId);
+    return null;
+  } catch (e) {
+    return { status: e.status, stderr: String(e.stderr || '') };
+  }
+}
+
+// 解除を絡めたフック呼び出し。env のセッション ID は必ず落とす。実行環境(このテストを走らせて
+// いる Claude Code 自身)の値が候補に紛れ込むと、「別セッションでは解除が効かない」ことを
+// 確かめるテストが実行環境しだいで意味を変える。
+function runInSession(home, input) {
+  const env = homeEnv(home);
+  delete env.CLAUDE_CODE_SESSION_ID;
+  return toResult(execGuardScript(GUARD, { env, input }));
+}
+
+// 解除済みのサンドボックス。解除は CLI 経由で作る ―― 状態ファイルを直接書くと、実際に
+// 書かれる形式との食い違いに気づけないまま「テストだけ通る」ことになる。
+function unlockedSandbox(name, dir, sessionId) {
+  const home = sandbox(name, { subscriptionType: 'pro', rules: ORG });
+  guardCli(home, ['unlock', '--path', dir, 'テスト用の解除'], sessionId);
+  return home;
+}
+
+const reasonOf = (res) => res?.hookSpecificOutput?.permissionDecisionReason || '';
+const contextOf = (res) => res?.hookSpecificOutput?.additionalContext || '';
+const unlocksFile = (home) => path.join(home, '.claude', 'account-guard', 'unlocks.json');
+const TOOL_A = 'C:/org-tree/tool-a';
+const TOOL_B = 'C:/org-tree/tool-b';
+
+// 解除の範囲
+{
+  const SID = 'session-scope';
+  const home = unlockedSandbox('unlock-scope', TOOL_A, SID);
+  const read = (session, cwd, file) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: session, cwd,
+    tool_name: 'Read', tool_input: { file_path: file },
+  });
+  const shell = (command, cwd = 'C:/claude/ClaudeCode') => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd,
+    tool_name: 'Bash', tool_input: { command },
+  });
+
+  let res = read(SID, TOOL_A, 'x.py');
+  check('解除した範囲では cwd 判定を通す', decision(res) === null, JSON.stringify(res));
+  check('解除が効いた回は解除中であることを文脈に載せる',
+    /一時解除/.test(contextOf(res)) && contextOf(res).includes('tool-a'), JSON.stringify(res));
+
+  res = read(SID, TOOL_B, 'x.py');
+  check('解除していない兄弟ディレクトリは拒否したまま', decision(res) === 'deny', JSON.stringify(res));
+
+  res = read('session-other', TOOL_A, 'x.py');
+  check('別のセッションでは同じ解除が効かない', decision(res) === 'deny', JSON.stringify(res));
+
+  res = read(SID, 'C:/claude/ClaudeCode', TOOL_A + '/x.py');
+  check('ツリーの外からでも解除範囲を指す対象は通す', decision(res) === null, JSON.stringify(res));
+
+  res = read(SID, 'C:/claude/ClaudeCode', TOOL_B + '/x.py');
+  check('ツリーの外からでも解除範囲外を指す対象は拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // 「対象が複数あるなら全部が範囲内であること」。ここが緩いと、一部だけ解除した状態で
+  // 範囲外を巻き込むコマンドが通ってしまう。
+  res = shell(`cp ${TOOL_A}/x ${TOOL_B}/`);
+  check('対象の一部が範囲外なら拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell(`cat ${TOOL_A}/x`);
+  check('シェルでも対象が全部範囲内なら通す', decision(res) === null, JSON.stringify(res));
+
+  // 表記を変えるだけで範囲判定がずれないこと。拒否側(mentionsTree)と解除側(treeRefsIn)は
+  // 同じ正規化を通す約束なので、片方だけが当たる書き方があってはいけない。
+  res = shell('cat /c/org-tree/tool-b/x');
+  check('MSYS 表記でも範囲外は拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell('type C:\\org-tree\\tool-a\\x');
+  check('バックスラッシュ表記でも範囲内なら通す', decision(res) === null, JSON.stringify(res));
+
+  res = shell(`cat ${TOOL_A}/../tool-b/x`);
+  check('範囲内を経由して範囲外へ登る指定は拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // cwd の解除は「そこで作業してよい」であって、同じツリーの範囲外を触ってよいことにはならない。
+  res = read(SID, TOOL_A, '../tool-b/x.py');
+  check('cwd が解除済みでも、範囲外を指す対象は拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+
+// Claude 自身が解除できないこと(歯止め 1: コマンドの遮断)
+{
+  const SID = 'session-selfblock';
+  const home = unlockedSandbox('unlock-selfblock', TOOL_A, SID);
+  const shell = (command, cwd = 'C:/claude/ClaudeCode') => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd,
+    tool_name: 'Bash', tool_input: { command },
+  });
+
+  // この home は解除中。それでも解除の実行は拒否する(解除の延長・再発行を防ぐため)。
+  let res = runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: TOOL_A,
+    tool_name: 'Read', tool_input: { file_path: 'x.py' },
+  });
+  check('前提: このサンドボックスでは解除が効いている', decision(res) === null, JSON.stringify(res));
+
+  res = shell('guard unlock "理由"');
+  check('解除中のセッションでも guard unlock は拒否する', decision(res) === 'deny', JSON.stringify(res));
+  check('拒否の文面はユーザーが `!` で打つよう案内する',
+    /! guard unlock/.test(reasonOf(res)), reasonOf(res));
+  check('Claude から打てる手(lock / status)も併せて示す',
+    /guard lock/.test(reasonOf(res)) && /guard status/.test(reasonOf(res)), reasonOf(res));
+
+  res = shell('node C:/claude/ClaudeCode/account-guard/account-guard.js unlock --path C:/x "r"');
+  check('ラッパーを介さず本体を直接叩く解除も拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell('powershell -c "guard.cmd unlock r"');
+  check('別のシェルを噛ませた解除も拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell('guard lock');
+  check('取り消し(guard lock)は Claude からも通す', decision(res) === null, JSON.stringify(res));
+
+  res = shell('guard status');
+  check('状態の確認(guard status)は Claude からも通す', decision(res) === null, JSON.stringify(res));
+
+  // 設定が壊れていても遮断は効く。ここが config の状態に依存すると、「設定を壊せば解除できる」
+  // という迂回路ができる。
+  const broken = sandbox('unlock-selfblock-broken', { subscriptionType: 'pro', rawRules: '{ broken' });
+  res = runInSession(broken, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'Bash', tool_input: { command: 'guard unlock "理由"' },
+  });
+  check('設定が壊れていても解除の実行は拒否する', decision(res) === 'deny', JSON.stringify(res));
+  check('その拒否は設定破損ではなく解除の遮断として説明する',
+    /Claude 自身からは実行できません/.test(reasonOf(res)), reasonOf(res));
+}
+
+// Claude 自身が解除できないこと(歯止め 2: 状態ファイルの保護)
+{
+  const SID = 'session-statefile';
+  const home = unlockedSandbox('unlock-statefile', TOOL_A, SID);
+  const file = unlocksFile(home);
+  const call = (tool_name, tool_input, cwd = 'C:/claude/ClaudeCode') => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd, tool_name, tool_input,
+  });
+
+  check('前提: 解除の状態ファイルができている', fs.existsSync(file), file);
+
+  let res = call('Write', { file_path: file, content: '{"unlocks":[]}' });
+  check('unlocks.json への Write は拒否する', decision(res) === 'deny', JSON.stringify(res));
+  check('拒否の文面が状態ファイルであることを説明する',
+    /解除の状態ファイル/.test(reasonOf(res)), reasonOf(res));
+
+  res = call('Edit', { file_path: file });
+  check('unlocks.json への Edit は拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = call('Bash', { command: 'echo {} > unlocks.json' }, path.dirname(file));
+  check('相対パスで unlocks.json を書く経路も拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = call('Bash', { command: `echo {} > ${file.replace(/\\/g, '/')}` });
+  check('絶対パスで unlocks.json を書く経路も拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // 読み取りまで止める理由はない(status が出すのと同じ内容で、隠しても迂回の動機になるだけ)。
+  res = call('Read', { file_path: file });
+  check('unlocks.json の読み取りは止めない', decision(res) === null, JSON.stringify(res));
+
+  // 同名でも別の場所のファイルは巻き込まない。
+  res = call('Write', { file_path: 'C:/claude/ClaudeCode/unlocks.json', content: '{}' });
+  check('別の場所にある同名ファイルは巻き込まない', decision(res) === null, JSON.stringify(res));
+}
+
+// CLI の異常系と、解除 → 確認 → 取り消しの一巡
+{
+  const SID = 'session-cli';
+  const home = sandbox('unlock-cli', { subscriptionType: 'pro', rules: ORG });
+  const file = unlocksFile(home);
+
+  let f = guardCliFail(home, ['unlock', '--path', TOOL_A], SID);
+  check('理由のない unlock は失敗する', f !== null && f.status === 1, JSON.stringify(f));
+  check('理由が要ることを伝える', /理由が必要/.test(f?.stderr || ''), f?.stderr);
+  check('失敗した解除は状態ファイルを作らない', !fs.existsSync(file), file);
+
+  f = guardCliFail(home, ['unlock', '--path', 'C:/elsewhere', '理由'], SID);
+  check('保護ツリーの外は解除できない', f !== null && f.status === 1, JSON.stringify(f));
+
+  // issue #6(ドライブ文字を落とした指定が広い範囲に一致する)を解除側へ持ち込まない。
+  // config の tree 側は過剰に拒否する方向の誤りで済むが、解除側の同じ緩さは保護が外れる向き。
+  f = guardCliFail(home, ['unlock', '--path', '/org-tree', '理由'], SID);
+  check('ドライブ文字のない --path は受け付けない', f !== null && f.status === 1, JSON.stringify(f));
+  f = guardCliFail(home, ['unlock', '--path', 'org-tree', '理由'], SID);
+  check('相対パスの --path も受け付けない', f !== null && f.status === 1, JSON.stringify(f));
+
+  f = guardCliFail(home, ['unlock', '--path', TOOL_A, '理由'], null);
+  check('セッション ID を取れないなら解除しない', f !== null && f.status === 1, JSON.stringify(f));
+  check('セッション ID が理由であることを伝える', /セッション ID/.test(f?.stderr || ''), f?.stderr);
+
+  const out = guardCli(home, ['unlock', '--path', TOOL_A, 'リミット回避のため'], SID);
+  check('解除は範囲と取り消し方を出す', /解除しました/.test(out) && /guard lock/.test(out), out);
+
+  const st = guardCli(home, ['status'], SID);
+  check('status に解除中の範囲が出る', /org-tree[\\/]tool-a/.test(st), st);
+  check('status に解除の理由が出る', /リミット回避のため/.test(st), st);
+  const stOther = guardCli(home, ['status'], 'session-someone-else');
+  check('status は他セッションの解除を自分のものとして出さない', /解除: なし/.test(stOther), stOther);
+
+  guardCli(home, ['unlock', '--path', TOOL_A, '二度目の理由'], SID);
+  let state = JSON.parse(fs.readFileSync(file, 'utf8'));
+  check('同じ範囲を重ねて解除しても件数は増えない', state.unlocks.length === 1, JSON.stringify(state));
+  check('重ねた解除は理由を新しいもので置き換える', state.unlocks[0].reason === '二度目の理由', JSON.stringify(state));
+
+  const log = fs.readFileSync(path.join(home, '.claude', 'account-guard', 'unlock.log'), 'utf8');
+  check('解除は履歴に残る', /unlock\t/.test(log) && /リミット回避のため/.test(log), log);
+
+  const lockOut = guardCli(home, ['lock'], SID);
+  check('lock は取り消した範囲を出す', /取り消しました/.test(lockOut), lockOut);
+  state = JSON.parse(fs.readFileSync(file, 'utf8'));
+  check('lock で解除が消える', state.unlocks.length === 0, JSON.stringify(state));
+  check('取り消しも履歴に残る',
+    /\tlock\t/.test(fs.readFileSync(path.join(home, '.claude', 'account-guard', 'unlock.log'), 'utf8')), log);
+
+  // 取り消しは自分のセッションのぶんだけ。他セッションの解除まで消すと、片方の作業が黙って止まる。
+  guardCli(home, ['unlock', '--path', TOOL_A, '別セッションの解除'], 'session-elsewhere');
+  guardCli(home, ['lock'], SID);
+  state = JSON.parse(fs.readFileSync(file, 'utf8'));
+  check('lock は他セッションの解除を消さない',
+    state.unlocks.length === 1 && state.unlocks[0].sessionId === 'session-elsewhere', JSON.stringify(state));
+
+  // 範囲を指定した取り消しは完全一致。配下を指定して親の解除が消えると、範囲の見立てが狂う。
+  guardCli(home, ['unlock', '--path', TOOL_A, 'また解除'], SID);
+  guardCli(home, ['lock', '--path', TOOL_A + '/inner'], SID);
+  state = JSON.parse(fs.readFileSync(file, 'utf8'));
+  check('lock --path は配下の指定では親の解除を消さない',
+    state.unlocks.some((u) => u.sessionId === SID), JSON.stringify(state));
+  guardCli(home, ['lock', '--path', TOOL_A], SID);
+  state = JSON.parse(fs.readFileSync(file, 'utf8'));
+  check('lock --path は完全一致なら消す',
+    !state.unlocks.some((u) => u.sessionId === SID), JSON.stringify(state));
+
+  // 状態を保存できないときに「解除しました」と出すと、拒否され続ける理由が分からなくなる。
+  const blocked = sandbox('unlock-write-blocked', { subscriptionType: 'pro', rules: ORG });
+  fs.mkdirSync(unlocksFile(blocked) + '.tmp', { recursive: true });
+  const wf = guardCliFail(blocked, ['unlock', '--path', TOOL_A, '理由'], 'session-blocked');
+  check('状態ファイルを書けなければ解除は失敗する', wf !== null && wf.status === 1, JSON.stringify(wf));
+  check('保存できなかったことを伝える', /解除を保存できません/.test(wf?.stderr || ''), wf?.stderr);
+
+  // 壊れた状態ファイルを黙って書き直すと、他セッションの解除と履歴をまとめて消してしまう。
+  const corrupt = sandbox('unlock-corrupt', { subscriptionType: 'pro', rules: ORG });
+  fs.writeFileSync(unlocksFile(corrupt), '{ broken', 'utf8');
+  const cf = guardCliFail(corrupt, ['unlock', '--path', TOOL_A, '理由'], 'session-corrupt');
+  check('壊れた状態ファイルは黙って書き直さない', cf !== null && cf.status === 1, JSON.stringify(cf));
+  check('壊れた状態ファイルの中身は残したまま',
+    fs.readFileSync(unlocksFile(corrupt), 'utf8') === '{ broken', fs.readFileSync(unlocksFile(corrupt), 'utf8'));
+  const cres = runInSession(corrupt, {
+    hook_event_name: 'PreToolUse', session_id: 'session-corrupt', cwd: TOOL_A,
+    tool_name: 'Read', tool_input: { file_path: 'x.py' },
+  });
+  check('壊れた状態ファイルでは解除が効かず拒否側に倒れる', decision(cres) === 'deny', JSON.stringify(cres));
+}
+
+// ガード自身が異常終了した経路(縮小判定)にも解除を効かせる
+{
+  fs.mkdirSync(BASE, { recursive: true });
+  const CRASH = path.join(BASE, 'ag-crash-unlock.js');
+  const credModule = JSON.stringify(path.join(__dirname, '..', 'credentials.js'));
+  fs.writeFileSync(
+    CRASH,
+    fs.readFileSync(GUARD, 'utf8')
+      .replace("require('./credentials')", `require(${credModule})`)
+      .replace('function main() {', "function main() {\n  throw new Error('boom');"),
+    'utf8'
+  );
+  const runCrash = (home, input) => {
+    const env = homeEnv(home);
+    delete env.CLAUDE_CODE_SESSION_ID;
+    return toResult(execGuardScript(CRASH, { env, input }));
+  };
+
+  const SID = 'session-crash';
+  const home = unlockedSandbox('unlock-crash', TOOL_A, SID);
+
+  let res = runCrash(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: TOOL_A,
+    tool_name: 'Read', tool_input: { file_path: 'x.py' },
+  });
+  // 反映しないと「ガードが壊れている間だけ解除が無視されて詰む」穴が残る。
+  check('異常終了しても解除済みの cwd は通す', res === null, JSON.stringify(res));
+
+  res = runCrash(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: TOOL_B,
+    tool_name: 'Read', tool_input: { file_path: 'x.py' },
+  });
+  check('異常終了時も解除範囲外の cwd は拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = runCrash(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'Bash', tool_input: { command: 'guard unlock "理由"' },
+  });
+  check('異常終了時も Claude からの解除は拒否する', decision(res) === 'deny', JSON.stringify(res));
+}
+
 report();

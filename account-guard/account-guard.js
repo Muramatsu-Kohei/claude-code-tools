@@ -115,7 +115,20 @@ const ACCOUNT_UNKNOWN = credentials ? credentials.ACCOUNT_UNKNOWN : 'unknown';
 // 拒否に倒す値なので、保護ツリーへの操作は deny され、設定漏れに気づける。
 const currentAccount = credentials ? credentials.currentAccount : () => ACCOUNT_UNKNOWN;
 
-const CONFIG = path.join(homeUnresolved ? '(home-unresolved)' : HOME, '.claude', 'account-guard', 'config.json');
+const GUARD_DIR = path.join(homeUnresolved ? '(home-unresolved)' : HOME, '.claude', 'account-guard');
+const CONFIG = path.join(GUARD_DIR, 'config.json');
+
+// 一時解除(unlock)の状態。unlocks.json が現に効いている解除の集合で、unlock.log は
+// 追記型の履歴。config.json と同じディレクトリに置くのは、どちらも「ガードの判定を変える
+// 設定」で、保護も後始末も同じ場所で扱えるため。
+const UNLOCKS = path.join(GUARD_DIR, 'unlocks.json');
+const UNLOCK_LOG = path.join(GUARD_DIR, 'unlock.log');
+
+// 解除エントリを残す日数。解除は sessionId で照合するので他セッションのぶんは元々効かない。
+// これは失効のためではなく、ファイルが際限なく伸びるのを防ぐためだけの掃除。
+// 有効期限を設けないのは意図的で、想定用途(リミット回復まで数時間)の途中で切れる期限は
+// 再解除を促し、「とりあえず解除」を習慣化させる。歯止めのつもりが逆に効く。
+const UNLOCK_KEEP_DAYS = 7;
 
 // 既定では何も保護しない。守るべきツリーは環境ごとに違ううえ、実在するパスを
 // 公開リポジトリに焼き込みたくないため、設定ファイルで明示させる。
@@ -161,11 +174,92 @@ function mentionsTree(haystack, tree) {
   return new RegExp(t + '(?![a-z0-9_.-])').test(normalize(haystack));
 }
 
+// 文字列に現れる「ツリーを指す参照」をすべて取り出す。mentionsTree が真偽しか返さないのに対し、
+// こちらは当たった箇所そのものを返す。解除の判定に要る: シェルのコマンド文字列は 1 本で複数の
+// パスに触れるので、「ツリーに当たったか」だけを見ると、`tool-a` だけを解除した状態で
+// `cp <tree>/tool-a/x <tree>/tool-b/` のような呼び出しまで通してしまう。
+//
+// 一致の条件(ツリー名の直後が識別子の文字でないこと)は mentionsTree と同じにする。境界の
+// 見方がずれると「拒否には当たるのに解除の判定では見えない参照」ができ、そこだけ素通りする。
+function treeRefsIn(text, tree) {
+  const t = normalize(tree).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // ツリー名に続く部分は、シェルの区切りに当たらない限りパスの一部として取り込む。
+  return normalize(text).match(new RegExp(t + '(?![a-z0-9_.-])[^"\'\\s,;|&()]*', 'g')) ?? [];
+}
+
 // cwd がツリーの内側か。ツリー自身もツリー配下として扱う。
 function isInsideTree(cwd, tree) {
   const c = normalize(cwd);
   const t = normalize(tree);
   return c === t || c.startsWith(t + '/');
+}
+
+// ドライブ文字から始まる絶対パスか。
+//
+// issue #6 のとおり path.isAbsolute は Windows でも `/org-tree` に true を返すため、それだけを
+// 根拠にすると「ドライブ不問・パスの途中でも一致する」広すぎる範囲を作れてしまう。config.json の
+// tree 側では過剰に拒否する方向の誤りで済むが、解除の範囲に同じ緩さを持ち込むと逆向き ――
+// 意図より広く保護が外れる ―― になる。解除側は書くときも読むときもドライブ文字を必須にする。
+function hasDriveLetter(p) {
+  return /^[a-z]:[\\/]/i.test(String(p));
+}
+
+// 解除を紐づけるセッションの ID。
+//
+// フック入力の session_id が本筋だが、解除を作る `guard unlock` はフック入力を持たないので
+// 環境変数 CLAUDE_CODE_SESSION_ID から取る。両方を候補にして「どちらかに一致すれば有効」と
+// するのは、この 2 つが同じ値である保証を実装が前提にしないため。どちらも「今このプロセスを
+// 起動したセッション」のものなので、候補が 2 つあっても解除が別セッションへ漏れることはない。
+function sessionCandidates(input) {
+  const pick = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+  const fromHook = pick(input && input.session_id);
+  const fromEnv = pick(process.env.CLAUDE_CODE_SESSION_ID);
+  return [fromHook, fromEnv].filter((v, i, a) => v && a.indexOf(v) === i);
+}
+
+// 現に効いている解除のパス一覧。
+//
+// 読めない・壊れている・セッションを特定できないときは空を返す。つまり解除が無かったことに
+// なり、判定は従来どおり拒否側に倒れる。ここで例外を投げると reportCrash の縮小判定に落ちて
+// かえって保護が緩むので、投げずに握り潰すのが正しい向き。
+function activeUnlocks(input) {
+  const ids = sessionCandidates(input);
+  if (!ids.length) return [];
+  try {
+    const data = JSON.parse(fs.readFileSync(UNLOCKS, 'utf8'));
+    if (!Array.isArray(data?.unlocks)) return [];
+    return data.unlocks
+      .filter((u) => u && ids.includes(u.sessionId) && typeof u.path === 'string' && hasDriveLetter(u.path));
+  } catch {
+    // 未作成(解除なし)・壊れている・権限。いずれも「解除されていない」として扱う。
+    return [];
+  }
+}
+
+function unlockedPaths(input) {
+  return activeUnlocks(input).map((u) => u.path);
+}
+
+// このパスが解除の範囲に入っているか。解除は「ツリー配下の任意のディレクトリ」単位なので、
+// 判定はツリーと同じ前方一致(isInsideTree)を使う。
+function coveredByUnlock(value, unlocked) {
+  return unlocked.some((u) => isInsideTree(value, u));
+}
+
+// ツリーに当たった対象が、すべて解除の範囲に収まっているか。1 つでも外れていれば解除しない。
+//
+// 厳しめだが、`tool-a` を解除した状態で `tool-a` と `tool-b` を同時に触るコマンドが通る穴を
+// 塞ぐにはこれが要る。kind が 'text'(シェルのコマンド文字列そのもの)の対象は、それ自体を
+// パスとして扱えないので、中に現れるツリー参照を取り出して 1 つずつ見る。参照を 1 つも
+// 取り出せなかったときは通さない ―― 拒否には当たったのに解除の判定では見えない、という
+// 食い違いが起きている状態なので、安全側に倒す。
+function unlockCoversTargets(tree, hits, unlocked) {
+  if (!hits.length) return false;
+  return hits.every((t) => {
+    if (t.kind === 'path') return coveredByUnlock(t.value, unlocked);
+    const refs = treeRefsIn(t.value, tree);
+    return refs.length > 0 && refs.every((ref) => coveredByUnlock(ref, unlocked));
+  });
 }
 
 // ツールごとに「操作対象のパス」が入るフィールド。判定はここだけを見る。
@@ -243,6 +337,12 @@ function resolveFrom(cwd, value) {
 // 素通りしていた(絶対パス版だけが拒否され、テストも絶対パスしか見ていなかった)。
 // trees は設定中の保護ツリー一覧。区切りを含まない「裸のツリー名」を拾うためだけに使う
 // (下のコメント参照)。判定そのものは呼び出し側がルールごとに行う。
+// 判定対象を 1 件ずつ表す。kind は解除の判定でだけ意味を持つ(拒否そのものはどちらも同じに扱う)。
+//   'path' … パスとして解決済み、またはパスとして書かれた値。そのまま範囲判定にかけられる
+//   'text' … シェルのコマンド文字列そのもの。1 本に複数のパスが混ざりうるので、範囲判定は
+//            中のツリー参照を取り出してから行う(unlockCoversTargets 参照)
+const asPath = (value) => ({ value, kind: 'path' });
+
 function targetStrings(toolName, toolInput, cwd, trees = []) {
   const ti = toolInput ?? {};
   const pathFields = PATH_FIELDS[toolName];
@@ -256,7 +356,7 @@ function targetStrings(toolName, toolInput, cwd, trees = []) {
       if (typeof v !== 'string' || !v) continue;
       out.push(v, resolveFrom(cwd, v));
     }
-    return out.filter(Boolean);
+    return out.filter(Boolean).map(asPath);
   }
 
   // ここから先はパスがどの位置に現れるか決まっていない文字列。
@@ -275,16 +375,16 @@ function targetStrings(toolName, toolInput, cwd, trees = []) {
     const msys = text.match(MSYS_PATH_TOKEN) ?? [];
 
     // シェルや委譲は「保護ツリーを読め」という指示そのものを止めたいので文字列全体も見る。
-    if (commandFields) out.push(text);
-    else out.push(...absolute, ...msys);
+    if (commandFields) out.push({ value: text, kind: 'text' });
+    else out.push(...absolute.map(asPath), ...msys.map(asPath));
 
     // 埋もれたパスは切り出して個別に解決する。文字列全体のままでは `.` / `..` を畳めず、
     // `C:/x/../<tree>/secret` や `/c/./<tree>` のような形が素通りしていた
     // (mentionsTree は文字列を突き合わせるだけで、パスとしての正規化はしない)。
-    for (const token of [...absolute, ...relative]) out.push(resolveFrom(cwd, token));
+    for (const token of [...absolute, ...relative]) out.push(asPath(resolveFrom(cwd, token)));
     for (const token of msys) {
       const win = fromMsys(token);
-      if (win) out.push(win, resolveFrom(cwd, win));
+      if (win) out.push(asPath(win), asPath(resolveFrom(cwd, win)));
     }
   }
 
@@ -307,9 +407,9 @@ function targetStrings(toolName, toolInput, cwd, trees = []) {
     // 前後の境界を見るのは、別ドライブの `D:/<ツリー名>` を切り出して cwd 配下へ
     // 解決してしまうことと、`<ツリー名>-backup` のような別ディレクトリに当てることを防ぐため
     const re = new RegExp(`(?<![\\w.\\-\\\\/:])${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w.\\-])`, 'i');
-    if (texts.some((t) => re.test(t))) out.push(resolveFrom(cwd, base));
+    if (texts.some((t) => re.test(t))) out.push(asPath(resolveFrom(cwd, base)));
   }
-  return out.filter(Boolean);
+  return out.filter((t) => t.value);
 }
 
 // 設定を読む。`broken` は「保護すべきなのに読めない」状態を表す。
@@ -358,6 +458,58 @@ function loadConfig() {
   return { rules, broken: false };
 }
 
+// Claude 自身に解除を実行させない。
+//
+// 依拠するのは「PreToolUse フックは Claude のツール呼び出しにだけ発火し、ユーザーの `!` 実行では
+// 発火しない」という実測。ここで落とせば経路そのものが分かれ、Claude からは解除できず、ユーザーは
+// `!` で打てる。承認ダイアログ(permissions.ask)にしないのは、押せば通る以上「もっともらしい理由を
+// 添えて要求する」が流し読みで通る余地が残るため。歯止めは経路の分離に置く。
+//
+// 解除中のセッションでも拒否する。Claude が解除を延長・再発行できると、ユーザーが範囲を絞って
+// 開けた意味がなくなる。この判定が解除フィルタより先に来るのはそのため。
+//
+// 過剰検出は許容する。`grep "guard unlock" README.md` のような参照目的のコマンドも止まるが、
+// 実害は「その文字列を含むコマンドを打てない」ことだけで、必要ならユーザーに `!` で代行を頼める。
+// コマンド文字列から意図を読み分けようとすると、その解析自体が迂回の余地になる。
+function isUnlockAttempt(input) {
+  const tool = input.tool_name;
+  if (tool !== 'Bash' && tool !== 'PowerShell') return false;
+  const cmd = input.tool_input?.command;
+  if (typeof cmd !== 'string' || !cmd) return false;
+  // 語として現れることだけを見る。`guard` は `account-guard` の一部としても現れるが、直前の
+  // ハイフンは語の境界にならないので、両方の綴りを別々に試す。
+  const word = (w) => new RegExp(`(?:^|[^a-z0-9_-])${w}(?![a-z0-9_-])`, 'i').test(cmd);
+  return (word('guard') || word('account-guard')) && word('unlock');
+}
+
+// 解除の状態ファイルを直接書き換える経路を塞ぐ。上のコマンド遮断をすり抜けても、unlocks.json を
+// Write すれば同じことができてしまうので、書き込み側も塞いで歯止めを 2 層にする。
+//
+// 読み取りは止めない(status が表示するのと同じ内容で、隠す意味がない)。ただし Bash / PowerShell は
+// 読みと書きを区別できないので、そのパスが現れた時点で拒否する。相対パス指定を取りこぼさないよう、
+// 判定は既存のパス検出(targetStrings)に合流させる ―― ここだけ別の検出を新設すると、片方だけが
+// 知っている書き方が抜け道になる。
+function isUnlockStateWrite(input) {
+  // HOME を導出できていないときの UNLOCKS はダミー値で、実在のパスと一致しない。その状態では
+  // config.broken 側がすべて拒否するので、ここで無理に判定しなくてよい。
+  if (homeUnresolved) return false;
+  const tool = input.tool_name;
+  const ti = input.tool_input ?? {};
+  if (tool === 'Write' || tool === 'Edit' || tool === 'NotebookEdit') {
+    const target = ti.file_path ?? ti.notebook_path;
+    if (typeof target !== 'string' || !target) return false;
+    const abs = resolveFrom(input.cwd, target);
+    return Boolean(abs) && normalize(abs) === normalize(UNLOCKS);
+  }
+  if (tool === 'Bash' || tool === 'PowerShell') {
+    // trees に UNLOCKS を渡すと、裸のファイル名(`unlocks.json`)も cwd 基準で解決される。
+    // 別の場所の同名ファイルは違うパスに解決されるので巻き込まない。
+    return targetStrings(tool, ti, input.cwd, [UNLOCKS])
+      .some((t) => t.kind === 'path' && normalize(t.value) === normalize(UNLOCKS));
+  }
+  return false;
+}
+
 // 壊れた設定を直す操作だけは通す。これがないと Claude Code の中から復旧できず、
 // エディタや git を外部から使うしか手がなくなる(全停止させたときに実際に困った)。
 function isConfigRepair(input) {
@@ -400,8 +552,16 @@ function isEscapeHatch(input, config) {
 
 // このツール呼び出しが保護ツリーに触れるか判定し、触れるなら拒否理由を返す。
 // 触れない、または現在のアカウントが許可されているなら null。
-function violation(input, account, config) {
+// unlocked は現セッションで解除中のパス一覧、notes は解除が実際に効いた(本来なら拒否していた)
+// ことを呼び出し元へ伝えるための出力先。unlocked を引数で受けるのは、呼び出し元がその一覧を
+// 案内文にも使うため ―― ここで読み直すと、読めなかったときに判定と文面で食い違いが出る。
+function violation(input, account, config, unlocked, notes = []) {
   const cwd = input.cwd || process.cwd();
+
+  // 解除に関わる操作は、設定の状態にも解除の有無にも関係なく真っ先に落とす。解除中のセッションで
+  // あっても拒否する(isUnlockAttempt のコメント)ので、下の解除フィルタより前でなければならない。
+  if (isUnlockAttempt(input)) return { unlockAttempt: true };
+  if (isUnlockStateWrite(input)) return { unlockState: true };
 
   // 設定が壊れているときは、どのツリーを守るべきかが分からない。素通しにすると
   // 保護が丸ごと外れるので、修復操作を除いて拒否する。HOME 未解決もこの扱いに合流するが、
@@ -424,28 +584,43 @@ function violation(input, account, config) {
   // 居ながら、このツリーのファイルを触ることがある)ため、ヒットしたルールだけでなく
   // 全ルールから探す。ここを「ヒットしたルール = cwd のツリー」と決め打ちしていたせいで、
   // 保護ツリーが 2 つ以上ある構成では注記が出ず、案内どおり打つと同じ deny に戻っていた。
-  const cwdRule = config.rules.find((r) => !r.allow.includes(account) && isInsideTree(cwd, r.tree));
+  // 解除済みの cwd では swap の注記は要らない(その cwd のままで swap を打てる)ので、
+  // 解除を反映した上で「拒否対象のツリーの内側にいるか」を見る。
+  const cwdRule = config.rules.find((r) => !r.allow.includes(account) && isInsideTree(cwd, r.tree)
+    && !coveredByUnlock(cwd, unlocked));
   const cwdTree = cwdRule ? cwdRule.tree : null;
 
   for (const rule of config.rules) {
     if (rule.allow.includes(account)) continue;
 
+    // 解除フィルタは、判定の冒頭ではなくヒットが確定した後に置く。冒頭で早期 return すると
+    // 「どのパスが原因で拒否されたか」が分からず、解除の範囲を絞れているかも確かめられない。
     if (isInsideTree(cwd, rule.tree)) {
-      return {
-        tree: rule.tree,
-        reason: `作業ディレクトリが ${rule.tree} 配下にあります`,
-        allow: rule.allow,
-        cwdTree: rule.tree,
-      };
+      if (!coveredByUnlock(cwd, unlocked)) {
+        return {
+          tree: rule.tree,
+          reason: `作業ディレクトリが ${rule.tree} 配下にあります`,
+          allow: rule.allow,
+          cwdTree: rule.tree,
+        };
+      }
+      notes.push(`作業ディレクトリ(${cwd})`);
     }
-    if (targets.some((s) => mentionsTree(s, rule.tree))) {
-      return {
-        tree: rule.tree,
-        reason: `操作の対象が ${rule.tree} 配下です`,
-        allow: rule.allow,
-        // cwd はこのツリーの内側ではないが、別の保護ツリーの内側かもしれない。
-        cwdTree,
-      };
+
+    // cwd が解除されていても、操作の対象は別に見る。cwd の解除は「そのディレクトリで作業してよい」
+    // であって、同じツリーの解除範囲外を触ってよいことにはならない。
+    const hits = targets.filter((t) => mentionsTree(t.value, rule.tree));
+    if (hits.length) {
+      if (!unlockCoversTargets(rule.tree, hits, unlocked)) {
+        return {
+          tree: rule.tree,
+          reason: `操作の対象が ${rule.tree} 配下です`,
+          allow: rule.allow,
+          // cwd はこのツリーの内側ではないが、別の保護ツリーの内側かもしれない。
+          cwdTree,
+        };
+      }
+      notes.push(`操作の対象(${rule.tree} 配下)`);
     }
   }
   return null;
@@ -555,6 +730,8 @@ function noCredentialsAtStakeMessage(head, situation, hit, needForce) {
 }
 
 function denyMessage(hit, account) {
+  if (hit.unlockAttempt) return unlockAttemptMessage();
+  if (hit.unlockState) return unlockStateMessage();
   if (hit.broken) return hit.homeUnresolved ? homeUnresolvedMessage() : brokenConfigMessage();
 
   const allowed = hit.allow.length ? hit.allow.join(' / ') : '(許可アカウントの設定なし)';
@@ -729,6 +906,57 @@ function homeUnresolvedMessage() {
   ].join('\n');
 }
 
+// 解除を実行しようとしたときの文面。Claude がこれを読んで「自分では解除できない、ユーザーに
+// 依頼する」と判断できることが目的なので、代わりに打てる手(lock / status)まで書く。
+function unlockAttemptMessage() {
+  return [
+    '[account-guard] 保護の一時解除(unlock)は Claude 自身からは実行できません。',
+    '',
+    '解除はユーザーが `!` で直接打つ操作に限っています(ユーザーの `!` 実行にはこのフックが',
+    '発火しないため、経路そのものが分かれています)。解除が必要なら、次をユーザーに依頼してください。',
+    '  ! guard unlock "<理由>"              … いまの作業ディレクトリを、このセッションに限って解除する',
+    '  ! guard unlock --path <dir> "<理由>" … 範囲を指定して解除する',
+    '',
+    '解除中のセッションでもこの拒否は変わりません(解除の延長・再発行を防ぐため)。',
+    '`guard lock`(解除の取り消し)と `guard status`(状態の確認)は Claude からも実行できます。',
+    '',
+    // 過剰検出であることを書かないと、参照目的で止まった場合に原因が分からず同じコマンドを
+    // 打ち直すことになる(この文面が出る回のうち、実際の解除要求でないものは珍しくない)。
+    '参照目的でこの語を含むコマンドを打った場合も、意図を区別できないため同じく拒否されます。',
+    '回避しようとせず、必要ならユーザーに `!` での代行を依頼してください。',
+  ].join('\n');
+}
+
+// 解除の状態ファイルへの書き込みを止めたときの文面。コマンド遮断をすり抜けてファイルを直接
+// 書く経路を塞ぐための拒否なので、「別の書き方なら通る」と読めない文面にする。
+function unlockStateMessage() {
+  return [
+    '[account-guard] 解除の状態ファイルへの書き込みは拒否しました。',
+    `${UNLOCKS} はガードの判定そのものを決めるファイルで、Claude からの書き換えを常に禁じています。`,
+    '',
+    '解除の追加・取り消しはコマンドで行ってください。',
+    '  ! guard unlock "<理由>" … ユーザーが打つ(解除の追加)',
+    '  guard lock              … 解除の取り消し(Claude からも実行できます)',
+    '  guard status            … 現在の解除状態の確認',
+    '',
+    '読み取りは禁じていないので、中身を確認するだけなら Read で開けます。',
+    '回避しようとせず、必要ならユーザーに状況を伝えてください。',
+  ].join('\n');
+}
+
+// 解除が実際に効いた(本来なら拒否していた)回にだけ返す注記。毎回出すと文脈を圧迫するうえ、
+// 「解除中である」という重要な事実が日常の雑音に埋もれる。
+function unlockAppliedMessage(unlocked, notes) {
+  return [
+    '[account-guard] この操作は保護ツリーに触れていますが、現在のセッションで一時解除されている',
+    'ため許可しました。解除中の範囲は次のとおりです。',
+    ...unlocked.map((p) => `  ${p}`),
+    `解除が効いた理由: ${[...new Set(notes)].join(' / ')}`,
+    '',
+    '範囲外のパスは従来どおり拒否されます。解除を取り消すには `guard lock` を実行してください。',
+  ].join('\n');
+}
+
 function brokenConfigMessage() {
   return [
     '[account-guard] 設定ファイルを読めないため、操作を拒否しました。',
@@ -757,10 +985,256 @@ function readHookInput() {
   return hookInputCache;
 }
 
+// --- 解除の追加・取り消し(手打ち用。フックからは呼ばれない) ---
+
+// 状態ファイルの全エントリ。壊れていれば投げる。呼び出し元(unlock / lock)はそこで中止する:
+// 壊れたファイルを黙って書き直すと、他セッションの解除まで巻き込んで消すことになる。
+// 判定側(activeUnlocks)が同じ状況を握り潰して空を返すのと向きが違うのは、あちらが「解除が
+// 効かない = 保護が強いまま」なのに対し、こちらは書き換えで状態を失うため。
+function readAllUnlocks() {
+  let text;
+  try {
+    text = fs.readFileSync(UNLOCKS, 'utf8');
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return []; // まだ 1 度も解除していない
+    throw e;
+  }
+  const data = JSON.parse(text);
+  if (!Array.isArray(data?.unlocks)) throw new Error('unlocks が配列ではありません');
+  return data.unlocks;
+}
+
+// 書き込みは一時ファイル経由で差し替える(swap.js の writeAtomic と同じ方針)。中身は秘密では
+// ないので mode は落とさない。rename まで届かなかったときに .tmp を残さないのは、次回の読み取りが
+// 書きかけを拾わないようにするため。
+function writeUnlocks(list) {
+  fs.mkdirSync(path.dirname(UNLOCKS), { recursive: true });
+  const tmp = UNLOCKS + '.tmp';
+  let renamed = false;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify({ unlocks: list }, null, 2) + '\n', 'utf8');
+    fs.renameSync(tmp, UNLOCKS);
+    renamed = true;
+  } finally {
+    if (!renamed) { try { fs.unlinkSync(tmp); } catch {} }
+  }
+}
+
+// 古いエントリを落とす。他セッションのぶんは sessionId が違うので元々効かず、これは失効では
+// なくファイルが際限なく伸びるのを防ぐためだけの掃除。掃除の機会を unlock / lock の実行時に
+// 限るのは、判定側(フック)は 1 回のツール呼び出しごとに走るので、そこで書き込みを起こすと
+// 判定のたびにファイルを書き換えることになるため。
+//
+// at を読めないエントリも落とす。この状態ファイルを書くのは unlock / lock だけなので、日時が
+// 壊れているものは手書きの改竄が疑わしく、残す理由がない。
+function pruneUnlocks(list, now) {
+  const limit = now - UNLOCK_KEEP_DAYS * 86400000;
+  return list.filter((u) => {
+    if (!u || typeof u.path !== 'string' || !u.path) return false;
+    const at = Date.parse(u.at);
+    return Number.isFinite(at) && at >= limit;
+  });
+}
+
+// 追記型の履歴。いつ・どのセッションが・どの範囲を・どのアカウントで・なぜ解除したかを残す。
+// 書けなくても解除自体は成立させる。履歴は付随情報で、これを理由に失敗させると「ログを書けない
+// から作業できない」という本筋と無関係な行き止まりを作る。
+function appendUnlockLog(action, entry) {
+  const cell = (v) => String(v ?? '').replace(/\s+/g, ' ').trim();
+  const line = [entry.at, action, cell(entry.sessionId), cell(entry.account), cell(entry.path), cell(entry.reason)]
+    .join('\t');
+  try {
+    fs.mkdirSync(path.dirname(UNLOCK_LOG), { recursive: true });
+    fs.appendFileSync(UNLOCK_LOG, line + '\n', 'utf8');
+  } catch { /* 履歴が書けないことは解除の成否に影響させない */ }
+}
+
+// エラーは stderr に出し、終了コードだけ立てて自然に抜ける(swap.js と同じ理由: Windows では
+// 出力先がパイプだと書き込みが非同期になり、process.exit を即座に呼ぶと最後の行が届かない)。
+function failUnlock(lines) {
+  for (const line of [].concat(lines)) console.error(line);
+  process.exitCode = 1;
+}
+
+// `--path <dir>` / `--path=<dir>` を抜き出し、残りを理由として結合する。理由を引用符で囲み忘れて
+// 単語が分かれても意味が変わらないよう、残りは全部つなげて 1 つの理由として扱う。
+function parseUnlockArgs(argv) {
+  let target;
+  let sawPath = false;
+  const rest = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--path') { sawPath = true; target = argv[++i]; continue; }
+    if (a.startsWith('--path=')) { sawPath = true; target = a.slice('--path='.length); continue; }
+    rest.push(a);
+  }
+  return { sawPath, target, reason: rest.join(' ').trim() };
+}
+
+function cmdUnlock(argv, config, account) {
+  const ids = sessionCandidates({});
+  if (!ids.length) {
+    return failUnlock([
+      '[account-guard] セッション ID を取得できないため、解除できません。',
+      '解除は必ずセッションに紐づけます(CLAUDE_CODE_SESSION_ID が空です)。',
+      'Claude Code の中から、先頭に `!` を付けて実行してください。',
+    ]);
+  }
+
+  const { sawPath, target, reason } = parseUnlockArgs(argv);
+  if (sawPath && !target) return failUnlock('[account-guard] --path にディレクトリを指定してください。');
+  if (!reason) {
+    return failUnlock([
+      '[account-guard] 解除には理由が必要です(何も解除していません)。',
+      '  guard unlock "<理由>"              … いまの作業ディレクトリを解除する',
+      '  guard unlock --path <dir> "<理由>" … 範囲を指定して解除する',
+    ]);
+  }
+  if (config.broken) {
+    return failUnlock([
+      '[account-guard] 設定を読めないため、解除する範囲がどの保護ツリーに属するか判定できません。',
+      `${CONFIG} を直してから、もう一度実行してください。`,
+    ]);
+  }
+
+  // --path はドライブ文字から始まる絶対パスだけを受け付ける(hasDriveLetter のコメント参照)。
+  // 既定の cwd は process.cwd() なので必ずこの形になる。
+  const raw = sawPath ? target : process.cwd();
+  if (!hasDriveLetter(raw)) {
+    return failUnlock([
+      `[account-guard] --path はドライブ文字から始まる絶対パスで指定してください(受け取った値: ${raw})。`,
+      '相対パスやドライブ文字を省いた形は、意図より広い範囲に効くことがあるため受け付けません。',
+    ]);
+  }
+  const abs = path.resolve(raw);
+
+  const owner = config.rules.find((r) => isInsideTree(abs, r.tree));
+  if (!owner) {
+    // どの保護ツリーにも属さない場所を「念のため」解除してしまうと、範囲を絞った意味が薄れる。
+    // 黙って全体を解除することはしない(仕様)。
+    return failUnlock(sawPath ? [
+      `[account-guard] ${abs} はどの保護ツリーの内側でもありません(何も解除していません)。`,
+      '保護されていない場所は解除する必要がありません。`guard status` で保護ツリーを確認できます。',
+    ] : [
+      '[account-guard] 解除対象を特定できません。いまの作業ディレクトリはどの保護ツリーにも属しません。',
+      '  guard unlock --path <dir> "<理由>" のように範囲を指定してください。',
+    ]);
+  }
+
+  let all;
+  try {
+    all = readAllUnlocks();
+  } catch (e) {
+    return failUnlock([
+      `[account-guard] 解除の状態ファイルを読めません(${e.code || e.message})。`,
+      `${UNLOCKS} を直すか削除してから、もう一度実行してください。`,
+      '(黙って書き直すと、他のセッションの解除まで消えます)',
+    ]);
+  }
+
+  const now = Date.now();
+  const entry = { sessionId: ids[0], path: abs, reason, account, at: new Date(now).toISOString() };
+  // 同じセッションの同じ範囲は重ねず、理由と日時を新しいもので置き換える。
+  const kept = pruneUnlocks(all, now)
+    .filter((u) => !(ids.includes(u.sessionId) && normalize(u.path) === normalize(abs)));
+  try {
+    writeUnlocks([...kept, entry]);
+  } catch (e) {
+    return failUnlock(`[account-guard] 解除を保存できません(${e.code || e.message}): ${UNLOCKS}`);
+  }
+  appendUnlockLog('unlock', entry);
+
+  console.log(`[account-guard] 解除しました: ${abs}`);
+  console.log(`  保護ツリー: ${owner.tree}(許可: ${owner.allow.length ? owner.allow.join(' / ') : 'なし'})`);
+  console.log(`  現在のアカウント: ${account}`);
+  console.log(`  理由: ${reason}`);
+  console.log('  このセッションでだけ有効です。セッションが終われば自動的に失効します。');
+  console.log('  取り消すには guard lock(範囲を指定するなら guard lock --path <dir>)。');
+  // 元々許可されているツリーを解除しても実害はないが、「解除したのに何も変わらない」と
+  // 受け取られると、効いていないのは別の原因だと探し始めることになる。
+  if (owner.allow.includes(account)) {
+    console.log('  なお現在のアカウントはこのツリーで元々許可されているため、いまは解除の効果がありません。');
+  }
+}
+
+function cmdLock(argv, account) {
+  const ids = sessionCandidates({});
+  if (!ids.length) {
+    return failUnlock([
+      '[account-guard] セッション ID を取得できないため、取り消す解除を特定できません。',
+      'Claude Code の中から実行してください(CLAUDE_CODE_SESSION_ID が空です)。',
+    ]);
+  }
+  const { sawPath, target } = parseUnlockArgs(argv);
+  if (sawPath && !target) return failUnlock('[account-guard] --path にディレクトリを指定してください。');
+  const abs = sawPath ? path.resolve(target) : null;
+
+  let all;
+  try {
+    all = readAllUnlocks();
+  } catch (e) {
+    return failUnlock([
+      `[account-guard] 解除の状態ファイルを読めません(${e.code || e.message})。`,
+      `${UNLOCKS} を直すか削除してください(削除すれば解除はすべて無効になります)。`,
+    ]);
+  }
+
+  // --path は完全一致で照合する。配下を指定して親の解除を消せるようにすると、「取り消したつもり
+  // なのに範囲が残る/意図より広く消える」のどちらかが必ず起きる。
+  const removed = all.filter((u) => u && ids.includes(u.sessionId)
+    && (!abs || normalize(u.path) === normalize(abs)));
+  if (!removed.length) {
+    console.log(abs
+      ? `[account-guard] ${abs} に対する解除はありません(照合は完全一致です。guard status で範囲を確認できます)。`
+      : '[account-guard] このセッションで有効な解除はありません。');
+    return;
+  }
+
+  const now = Date.now();
+  try {
+    writeUnlocks(pruneUnlocks(all.filter((u) => !removed.includes(u)), now));
+  } catch (e) {
+    return failUnlock(`[account-guard] 解除の取り消しを保存できません(${e.code || e.message}): ${UNLOCKS}`);
+  }
+  for (const u of removed) appendUnlockLog('lock', { ...u, account, at: new Date(now).toISOString() });
+
+  console.log('[account-guard] 解除を取り消しました。');
+  for (const u of removed) console.log(`  ${u.path}`);
+}
+
+// status の一部。判定を変えている要素なので、保護ルールと並べて必ず出す。
+function printUnlockStatus() {
+  if (homeUnresolved) {
+    console.log('解除: ホームディレクトリを特定できないため、状態を確認できません');
+    return;
+  }
+  if (!sessionCandidates({}).length) {
+    console.log('解除: セッション ID を取得できないため確認できません(Claude Code の外から実行しています)');
+    return;
+  }
+  const active = activeUnlocks({});
+  if (!active.length) {
+    console.log('解除: なし(このセッションで解除中の範囲はありません)');
+    return;
+  }
+  console.log('解除: このセッションでは次の範囲だけ保護を外しています');
+  for (const u of active) {
+    console.log(`  ${u.path}`);
+    console.log(`    理由: ${u.reason || '(記録なし)'} / 解除時のアカウント: ${u.account || '不明'} / ${u.at || '日時不明'}`);
+  }
+  console.log('  取り消すには guard lock(範囲を指定するなら guard lock --path <dir>)。');
+}
+
 function main() {
   const mode = process.argv[2] || '';
   const account = currentAccount();
   const config = loadConfig();
+
+  // 解除の追加・取り消し。どちらも手打ち用で、フックからは呼ばれない。unlock はユーザーが `!` で
+  // 打つ経路だけを想定している(Claude のツール呼び出しは isUnlockAttempt が先に拒否するので、
+  // そもそもここへ届かない)。lock は安全側に戻す操作なので Claude からも打てる。
+  if (mode === 'unlock') { cmdUnlock(process.argv.slice(3), config, account); return; }
+  if (mode === 'lock') { cmdLock(process.argv.slice(3), account); return; }
 
   // 手元での確認用。フックからは呼ばれない。
   if (mode === 'status') {
@@ -783,6 +1257,9 @@ function main() {
       console.log('  未ログインではなく、判別する手段が無い状態です。`/login` では直りません。');
       console.log('  account-guard.js の隣に credentials.js を置いてください。');
     }
+    // 解除は判定を変える要素なので、設定の表示より先に出す。config が壊れている・HOME を
+    // 特定できないときは下で早期 return するため、ここに置かないと解除だけが見えなくなる。
+    printUnlockStatus();
     // HOME が解決できないときの CONFIG はダミーの相対パスで、実在しない。共通の書式に
     // 任せると「未作成 — 保護は無効」と出るが、実態は逆でこの状態は全操作を拒否している。
     // しかも「設定ファイル自身の編集以外は拒否」と案内しても、実在しないパスでは
@@ -824,7 +1301,9 @@ function main() {
     }
     const probe = process.argv[3];
     if (probe) {
-      const hit = violation({ cwd: probe, tool_input: {} }, account, config);
+      // 解除も反映して判定する。status は「なぜ拒否される/されない」を確かめに来る入り口なので、
+      // 実際の判定と食い違う結果を出すと、解除が効いているかどうかを確かめる手段が無くなる。
+      const hit = violation({ cwd: probe, tool_input: {} }, account, config, unlockedPaths({}));
       console.log(`判定(cwd=${probe}): ${hit ? '拒否 — ' + hit.reason : '通過'}`);
     }
     return;
@@ -837,8 +1316,26 @@ function main() {
   // PreToolUse 以外のイベントには「操作の対象」が無いので cwd だけで判定する。
   // SessionStart / CwdChanged の入力にツール引数は含まれず、含まれない値を見に行くと
   // 判定の根拠が曖昧になるため、明示的に絞る。
-  const hit = violation(isPreTool ? input : { cwd: input.cwd, tool_input: {} }, account, config);
-  if (!hit) return; // 何も出力しなければ通常の権限フローに委ねられる。
+  // 解除はセッションに紐づくので、PreToolUse 以外の経路でも同じ入力から読む(session_id は
+  // SessionStart / CwdChanged の入力にも入る)。
+  const unlocked = unlockedPaths(input);
+  const notes = [];
+  const hit = violation(
+    isPreTool ? input : { cwd: input.cwd, session_id: input.session_id, tool_input: {} },
+    account, config, unlocked, notes
+  );
+  if (!hit) {
+    // 解除が実際に効いた(本来なら拒否していた)回だけ、解除中であることを文脈に載せる。毎回
+    // 出すと雑音になり、肝心の「いま保護が外れている」が埋もれる。
+    // PreToolUse の additionalContext が文脈へ載るかは Claude Code の実装次第だが、載らなくても
+    // 害はない(permissionDecision を返さないので、判定は通常の権限フローに委ねられたまま)。
+    if (notes.length) {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: { hookEventName: event, additionalContext: unlockAppliedMessage(unlocked, notes) },
+      }));
+    }
+    return; // 何も出力しなければ通常の権限フローに委ねられる。
+  }
 
   // 拒否できるのは PreToolUse だけ。SessionStart / CwdChanged は公式に
   // "No blocking or decision control" とされており、将来このフックを別のイベントに
@@ -885,15 +1382,28 @@ function reportCrash(e) {
   // 逃げ道の判定は isEscapeHatch に集約してあり、main(violation)と揃う(過去にここだけ
   // isConfigRepair しか見ずにドリフトした経緯は isEscapeHatch のコメント参照)。
   // 保護ルール未設定なら find が何も返さず、何も拒否しない。
+  // ガードが壊れている間だけ解除の遮断が外れる、という穴を作らない。判定は通常経路と同じ関数に
+  // 合流させる(ここだけ別の条件を書くと、片方を直したときにドリフトする ―― isEscapeHatch を
+  // 切り出した経緯と同じ)。
+  const unlockBlocked = isUnlockAttempt(input) ? 'attempt' : isUnlockStateWrite(input) ? 'state' : null;
+
+  // 解除はこの縮小判定にも効かせる。反映しないと「ガードが壊れている間だけ解除が無視されて
+  // 詰む」穴が残る。読めなければ unlockedPaths が空を返し、従来どおり拒否側に倒れる。
+  const unlocked = unlockedPaths(input);
   const repairable = isEscapeHatch(input, config);
-  const hit = config.broken
-    ? repairable
-      ? null
-      : { tree: CONFIG, broken: true, homeUnresolved: !!config.homeUnresolved }
-    : config.rules.find((r) => !r.allow.includes(account) && isInsideTree(cwd, r.tree));
+  const hit = unlockBlocked
+    ? { unlockBlocked }
+    : config.broken
+      ? repairable
+        ? null
+        : { tree: CONFIG, broken: true, homeUnresolved: !!config.homeUnresolved }
+      : config.rules.find((r) => !r.allow.includes(account) && isInsideTree(cwd, r.tree)
+        && !coveredByUnlock(cwd, unlocked));
   if (!hit) return;
 
-  const detail = [
+  const detail = hit.unlockBlocked
+    ? (hit.unlockBlocked === 'attempt' ? unlockAttemptMessage() : unlockStateMessage())
+    : [
     `[account-guard] ガードが異常終了しました(原因: ${e && e.message})。`,
     // HOME 未解決のときの CONFIG はダミー値なので、そのパスを「読めない設定ファイル」として
     // 出すと存在しない場所を直しに行かせることになる。原因も逃げ道も違うので文面を分ける。
