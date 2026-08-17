@@ -421,8 +421,12 @@ const asPath = (value, truncated = false) => ({ value, kind: 'path', truncated }
 // 実行順や条件分岐は再現しない。現れた移動先をすべて独立した基準として積み、相対トークンは
 // そのすべてで解決する。過剰に積む(実際には移動しない基準でも解決してしまう)向きの誤りに
 // 倒すのは、順序を追う実装にすると、その解析の粗さがそのまま抜け道になるため。
+// 先頭の区切りには改行も含める。`&&` だけを見ていた頃は、同じ内容を複数行で書くと cd が
+// 拾われず、相対パスがフック入力の cwd で解決されて素通りしていた(ヒアドキュメントや
+// 複数行のスクリプトは実際にこの形で来る)。`m` フラグではなくクラスに `\n` を足すのは、
+// `^` の意味を変えると「行頭のように見えるだけの位置」まで拾い、基準が増えすぎるため。
 const CD_COMMAND = new RegExp(
-  `(?:^|[;&|(])\\s*(?:cd|chdir|pushd|set-location|sl|push-location)\\s+(?:-[a-z]+\\s+)*(${NOT_STOP}+)`,
+  `(?:^|[;&|(\\n])\\s*(?:cd|chdir|pushd|set-location|sl|push-location)\\s+(?:-[a-z]+\\s+)*(${NOT_STOP}+)`,
   'gi'
 );
 
@@ -435,6 +439,39 @@ function cwdCandidates(texts, cwd) {
       const dest = resolveFrom(cwd, fromMsys(m[1]) || m[1]);
       if (dest && !out.includes(dest)) out.push(dest);
     }
+  }
+  return out;
+}
+
+// ブレース展開は 1 本の記述を複数のパスに分けて実行する。切り出しはブレースをトークンの
+// 終わりとして扱う(SAFE_TOKEN_END)ので、ツリー名そのものが割れた `C:/{org-tree,other}/secret`
+// からは `C:/` までしか取れず、コマンド文字列にも連続した `c:/org-tree` は現れない ――
+// ツリーへの言及が 1 つも見つからないまま、解除の範囲どころか拒否そのものが素通りする。
+// 判定の前に展開して、展開後の文字列も判定材料に加える。
+//
+// 展開しきることは狙わない(入れ子・連番・掛け合わせは際限がなく、正確に真似ようとするほど
+// 実装のずれが抜け道になる)。実際に書かれる単純な `{a,b}` を左から順に潰し、深さと本数の
+// 上限で打ち切る。打ち切っても元の文字列は従来どおり見るので、判定が緩むことはない。
+const BRACE_ALTERNATION = /\{([^{}]*,[^{}]*)\}/;
+const BRACE_MAX_DEPTH = 4;
+const BRACE_MAX_VARIANTS = 32;
+
+function braceVariants(text) {
+  const out = [];
+  let frontier = [text];
+  for (let depth = 0; depth < BRACE_MAX_DEPTH; depth++) {
+    const next = [];
+    for (const t of frontier) {
+      const m = BRACE_ALTERNATION.exec(t);
+      if (!m) continue;
+      for (const alt of m[1].split(',')) {
+        next.push(t.slice(0, m.index) + alt + t.slice(m.index + m[0].length));
+      }
+    }
+    if (!next.length) break;
+    out.push(...next);
+    if (out.length >= BRACE_MAX_VARIANTS) return out.slice(0, BRACE_MAX_VARIANTS);
+    frontier = next;
   }
   return out;
 }
@@ -482,6 +519,14 @@ function targetStrings(toolName, toolInput, cwd, trees = []) {
     ? commandFields.map((f) => ti[f]).filter((v) => typeof v === 'string')
     : [JSON.stringify(ti)]
   ).map((t) => expandHomeIn(isShell ? t.replace(/["'`]/g, '') : t));
+
+  // ブレースの展開もシェルのコマンド文字列に限る(引用符除去と同じ理由)。知らないツールで
+  // 見る JSON にはオブジェクトの `{...}` がそのまま含まれ、展開すると実在しない文字列を
+  // 判定材料に増やしてしまう。PowerShell は実際にはブレース展開しないが、展開版を足す向きの
+  // 誤りは拒否側にしか倒れないので Bash と分けない。
+  if (isShell) {
+    for (const t of [...texts]) texts.push(...braceVariants(t));
+  }
 
   // 相対パスの基準は cwd だけとは限らない(cwdCandidates のコメント)。
   const bases = cwdCandidates(texts, cwd);
@@ -1059,11 +1104,11 @@ function homeUnresolvedMessage() {
   ].join('\n');
 }
 
-// 解除を実行しようとしたときの文面。Claude がこれを読んで「自分では解除できない、ユーザーに
-// 依頼する」と判断できることが目的なので、代わりに打てる手(lock / status)まで書く。
+// 解除を実行しようとしたときの文面。Claude がこれを読んで「ここは自分で通す場所ではない、
+// ユーザーに依頼する」と判断できることが目的なので、代わりに打てる手(lock / status)まで書く。
 function unlockAttemptMessage() {
   return [
-    '[account-guard] 保護の一時解除(unlock)は Claude 自身からは実行できません。',
+    '[account-guard] 保護の一時解除(unlock)は Claude からの実行を止めています。',
     '',
     '解除はユーザーが `!` で直接打つ操作に限っています(ユーザーの `!` 実行にはこのフックが',
     '発火しないため、経路そのものが分かれています)。解除が必要なら、次をユーザーに依頼してください。',
@@ -1076,7 +1121,13 @@ function unlockAttemptMessage() {
     // 過剰検出であることを書かないと、参照目的で止まった場合に原因が分からず同じコマンドを
     // 打ち直すことになる(この文面が出る回のうち、実際の解除要求でないものは珍しくない)。
     '参照目的でこの語を含むコマンドを打った場合も、意図を区別できないため同じく拒否されます。',
-    '回避しようとせず、必要ならユーザーに `!` での代行を依頼してください。',
+    // この遮断はコマンド文字列の照合でしかなく、間接的な呼び出しまでは止められない。書かずに
+    // 「実行できません」とだけ伝えると、技術的に不可能だと読めてしまう ―― 実際には要請であり、
+    // 守るかどうかは Claude 側に委ねられている。そこを曖昧にしない。
+    '',
+    'なおこの遮断は文字列の照合なので、呼び出しを間接化すれば機械的には止まりません。',
+    'それでも回避しないでください。ここはユーザーの承認を経るための境界です。',
+    '必要ならユーザーに `!` での代行を依頼してください。',
   ].join('\n');
 }
 
@@ -1185,13 +1236,18 @@ const LOCK_STALE_MS = 30000;
 // 待たずに失敗させるのは、待つ実装だと取り残されたロックでコマンドが固まるため。代わりに
 // 古いロックは奪う。プロセスが強制終了されるとロックは残るので、奪えないと以後ずっと
 // 解除できなくなり、ロックのほうが本体より厄介な行き止まりになる。
+//
+// ロックの取得で落ちた例外には印を付けて上げる。呼び出し元は「読みで落ちた」既定の案内として
+// 状態ファイルの修復・削除を勧めるが、ロックはまだ状態ファイルに触れる前の段階であり、
+// 削除を勧めると他セッションの解除まで巻き添えで消させることになる(readAllUnlocks の
+// コメントにある、この設計が避けたかった結末そのもの)。
 function withUnlockLock(fn) {
-  fs.mkdirSync(path.dirname(UNLOCK_LOCK), { recursive: true });
   let fd;
   try {
+    fs.mkdirSync(path.dirname(UNLOCK_LOCK), { recursive: true });
     fd = fs.openSync(UNLOCK_LOCK, 'wx');
   } catch (e) {
-    if (e.code !== 'EEXIST') throw e;
+    if (e.code !== 'EEXIST') { e.lockFailure = true; throw e; }
     let age = Infinity;
     try { age = Date.now() - fs.statSync(UNLOCK_LOCK).mtimeMs; } catch { /* 消えた = 奪ってよい */ }
     if (age < LOCK_STALE_MS) {
@@ -1201,7 +1257,12 @@ function withUnlockLock(fn) {
     }
     try { fs.unlinkSync(UNLOCK_LOCK); } catch { /* 相手が先に消したなら、そのまま取り直す */ }
     // ここで再び EEXIST なら、奪おうとした先を別のプロセスが取った。呼び出し元へそのまま上げる。
-    fd = fs.openSync(UNLOCK_LOCK, 'wx');
+    try {
+      fd = fs.openSync(UNLOCK_LOCK, 'wx');
+    } catch (e2) {
+      e2.lockFailure = true;
+      throw e2;
+    }
   }
   try {
     return fn();
@@ -1279,6 +1340,15 @@ function lockedMessage() {
   ];
 }
 
+// ロックそのものを作れなかったとき(権限不足、あるいは古いロックを奪おうとした先を別の
+// プロセスに取られたとき)。状態ファイルにはまだ触れていないので、その修復や削除を勧めない。
+function lockFailureMessage(e) {
+  return [
+    `[account-guard] 解除の排他ロックを取得できません(${e.code || e.message})。何もしていません。`,
+    `数秒おいてから、もう一度実行してください。続くなら ${UNLOCK_LOCK} を確認してください。`,
+  ];
+}
+
 function failUnknownOption(option) {
   return failUnlock([
     `[account-guard] 知らないオプションです: ${option}(何もしていません)。`,
@@ -1353,6 +1423,9 @@ function cmdUnlock(argv, config, account) {
     });
   } catch (e) {
     if (e.code === 'ELOCKED') return failUnlock(lockedMessage());
+    // ロックの取得で落ちた場合は stage がまだ 'read' のままだが、状態ファイルは読んでいない
+    // (withUnlockLock のコメント)。読みの案内より先に判定する。
+    if (e.lockFailure) return failUnlock(lockFailureMessage(e));
     if (stage === 'read') {
       return failUnlock([
         `[account-guard] 解除の状態ファイルを読めません(${e.code || e.message})。`,
@@ -1409,6 +1482,8 @@ function cmdLock(argv, account) {
     });
   } catch (e) {
     if (e.code === 'ELOCKED') return failUnlock(lockedMessage());
+    // cmdUnlock と同じ理由でロック取得の失敗を先に分ける(withUnlockLock のコメント)。
+    if (e.lockFailure) return failUnlock(lockFailureMessage(e));
     if (stage === 'read') {
       return failUnlock([
         `[account-guard] 解除の状態ファイルを読めません(${e.code || e.message})。`,
@@ -1613,11 +1688,28 @@ function reportCrash(e) {
   // ガードが壊れている間だけ解除の遮断が外れる、という穴を作らない。判定は通常経路と同じ関数に
   // 合流させる(ここだけ別の条件を書くと、片方を直したときにドリフトする ―― isEscapeHatch を
   // 切り出した経緯と同じ)。
-  const unlockBlocked = isUnlockAttempt(input) ? 'attempt' : isUnlockStateWrite(input) ? 'state' : null;
+  //
+  // ただしこの 3 つは targetStrings 系(expandHomeIn / tokensIn / cwdCandidates / ブレース展開)を
+  // 通る。最初の例外がそこから出ていた場合、ここで同じ例外が再発して reportCrash 自体が落ち、
+  // 外側の catch は stderr に書くだけ ―― 拒否が出力されず呼び出しは通ってしまう。縮小判定の
+  // 本体である cwd の拒否まで巻き添えにしないよう、個別に握りつぶして安全側の既定に倒す
+  // (解除の遮断は失われるが、cwd がツリー内なら下の find が拒否する)。
+  let unlockBlocked = null;
+  try {
+    unlockBlocked = isUnlockAttempt(input) ? 'attempt' : isUnlockStateWrite(input) ? 'state' : null;
+  } catch {
+    unlockBlocked = null;
+  }
 
   // 解除はこの縮小判定にも効かせる。反映しないと「ガードが壊れている間だけ解除が無視されて
   // 詰む」穴が残る。読めなければ unlockedPaths が空を返し、従来どおり拒否側に倒れる。
-  const unlocked = unlockedPaths(input);
+  // 例外時も同じく空にする ―― 解除なしと見なすので拒否側。
+  let unlocked = [];
+  try {
+    unlocked = unlockedPaths(input);
+  } catch {
+    unlocked = [];
+  }
   const repairable = isEscapeHatch(input, config);
   const hit = unlockBlocked
     ? { unlockBlocked }

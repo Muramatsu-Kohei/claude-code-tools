@@ -1121,6 +1121,50 @@ console.log('account-guard');
     /settings\.json/.test(crashReason), crashReason);
 }
 
+// --- 異常終了の縮小判定は、切り出しが道連れになっても cwd の拒否を残す ---
+//
+// reportCrash は解除の遮断(isUnlockAttempt / isUnlockStateWrite)と解除範囲(unlockedPaths)も
+// 見るが、これらは targetStrings 系の切り出しを通る。最初の例外がその切り出しから出ていた場合、
+// reportCrash 自身が同じ例外で落ち、外側の catch は stderr に書くだけ ―― 拒否が出力されず、
+// 呼び出しはそのまま通る。ガードが壊れたときこそ効いてほしい cwd の拒否が、壊れ方によって
+// 消えることになる。切り出しごと壊した版で、その拒否が残ることを確かめる。
+{
+  const DIR = path.join(BASE, 'crash-targets');
+  fs.mkdirSync(DIR, { recursive: true });
+  const original = fs.readFileSync(GUARD, 'utf8');
+  const withMain = original.replace(
+    'function main() {',
+    'function main() {\n  throw new Error("injected for test");'
+  );
+  const injected = withMain.replace(
+    'function targetStrings(toolName, toolInput, cwd, trees = []) {',
+    'function targetStrings(toolName, toolInput, cwd, trees = []) {\n  throw new Error("injected into targetStrings");'
+  );
+  if (withMain === original || injected === withMain) {
+    throw new Error('注入に失敗しました(テストの前提が崩れています)');
+  }
+  fs.writeFileSync(path.join(DIR, 'account-guard.js'), injected, 'utf8');
+  fs.copyFileSync(path.join(__dirname, '..', 'credentials.js'), path.join(DIR, 'credentials.js'));
+
+  const tree = path.join(BASE, 'crash-targets-tree');
+  fs.mkdirSync(tree, { recursive: true });
+  const home = sandbox('crash-targets-home', {
+    subscriptionType: 'pro', rules: [{ tree, allow: [] }],
+  });
+  // ツールは Edit にする。Read は READ_ONLY_TOOLS として isUnlockStateWrite が早い段階で
+  // false を返すため切り出しに届かず、注入した例外が起きないまま通ってしまう(この形で
+  // 書いたときは、壊した版でも落ちない ―― 何も確かめていないテストになっていた)。
+  const res = toResult(execGuardScript(path.join(DIR, 'account-guard.js'), {
+    env: homeEnv(home),
+    input: {
+      hook_event_name: 'PreToolUse', cwd: tree,
+      tool_name: 'Edit', tool_input: { file_path: 'x.py' },
+    },
+  }));
+  check('切り出しごと壊れても cwd が保護ツリー内なら拒否する',
+    decision(res) === 'deny', JSON.stringify(res));
+}
+
 // credentials を読み取れなかっただけの状態を「壊れている」と同一視しない。中身が健全なまま
 // 手が届いていないだけ(ウイルス対策のロック・ACL の一時変更・EBUSY)のことがあり、そこで
 // 「失われる認証情報はない」と断言して /login を勧めると、まだ退避していないアカウントの
@@ -1405,7 +1449,7 @@ const TOOL_B = 'C:/org-tree/tool-b';
   });
   check('設定が壊れていても解除の実行は拒否する', decision(res) === 'deny', JSON.stringify(res));
   check('その拒否は設定破損ではなく解除の遮断として説明する',
-    /Claude 自身からは実行できません/.test(reasonOf(res)), reasonOf(res));
+    /Claude からの実行を止めています/.test(reasonOf(res)), reasonOf(res));
 }
 
 // Claude 自身が解除できないこと(歯止め 2: 状態ファイルの保護)
@@ -1645,6 +1689,12 @@ const TOOL_B = 'C:/org-tree/tool-b';
 
   res = shell(`cat "${TOOL_A}"bc/secret`);
   check('引用符の外で名前が伸びる形は拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // ブレースがツリー名そのものを割る形。切り出せるのは `c:/` までで、コマンド文字列にも
+  // 連続した `c:/org-tree` は現れない ―― ツリーへの言及が 1 つも見つからないまま通ると、
+  // 解除の範囲どころか拒否そのものが素通りする。
+  res = shell('cat C:/{org-tree,other}/secret');
+  check('ブレースでツリー名を割る形も拒否する', decision(res) === 'deny', JSON.stringify(res));
 }
 
 // --- cd の移動先を基準にした相対パス ---
@@ -1664,6 +1714,12 @@ const TOOL_B = 'C:/org-tree/tool-b';
 
   res = shell(`cd ${TOOL_A} && cat ../tool-b/secret`);
   check('移動先から解除範囲の外へ登る相対パスは拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // 改行もコマンドの区切り。`&&` 版だけを見ていた頃は、同じ内容を複数行で書くと cd が
+  // 拾われず、相対パスがフック入力の cwd で解決されて素通りしていた(書き方だけで結論が
+  // 変わる状態)。ヒアドキュメントや複数行のスクリプトは実際にこの形で来る。
+  res = shell(`echo hi\ncd ${TOOL_A}\ncat ../tool-b/secret`);
+  check('改行区切りでも cd の移動先を基準にする', decision(res) === 'deny', JSON.stringify(res));
 }
 
 // --- 裸のツリー名は区切りを伴わない形だけを拾う ---
@@ -1706,6 +1762,14 @@ const TOOL_B = 'C:/org-tree/tool-b';
 
   res = shell('ls C:/{a,b}');
   check('無関係なブレース展開まで状態ファイル扱いしない', decision(res) === null, JSON.stringify(res));
+
+  // 裸名での書き込みは cd の移動先で解決して初めて状態ファイルに届く。区切りが `&&` か
+  // 改行かで結論が変わってはいけない(cd の基準積みと同じ穴)。
+  res = shell(`cd ${dir} && echo {} > unlocks.json`);
+  check('移動してからの裸名の書き込みも拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell(`cd ${dir}\necho {} > unlocks.json`);
+  check('改行で移動してからの裸名の書き込みも拒否する', decision(res) === 'deny', JSON.stringify(res));
 }
 
 // --- 解除コマンドの遮断は Bash / PowerShell 以外にも効く ---
@@ -1765,6 +1829,27 @@ const TOOL_B = 'C:/org-tree/tool-b';
   const out = String(guardCli(home, ['unlock', '--path', TOOL_A, 'テスト用の解除'], SID) || '');
   check('古いロックは奪って解除できる', /解除しました/.test(out), out);
   check('奪ったロックは処理の後に消える', !fs.existsSync(lock), '');
+}
+
+// --- ロックを取得できないときの案内 ---
+//
+// ロックの取得はまだ状態ファイルに触れる前の段階。ここで「状態ファイルを直すか削除して
+// ください」と案内すると、従った人は他セッションの解除まで消すことになる(この設計が
+// 避けたかった結末そのもの)。ロックの場所をディレクトリで塞いで再現する ―― 奪おうとしても
+// 消せず、取り直しも失敗する。
+{
+  const SID = 'session-lock-fail';
+  const home = sandbox('unlock-lock-fail', { subscriptionType: 'pro', rules: ORG });
+  const lock = path.join(home, '.claude', 'account-guard', 'unlocks.lock');
+  fs.mkdirSync(lock, { recursive: true });
+  const old = new Date(Date.now() - 120000);
+  fs.utimesSync(lock, old, old);
+
+  const failed = guardCliFail(home, ['unlock', '--path', TOOL_A, 'テスト用の解除'], SID);
+  check('ロックを取得できなければ解除を失敗させる',
+    failed !== null && /ロックを取得できません/.test(failed.stderr), JSON.stringify(failed));
+  check('ロックの失敗で状態ファイルの修復や削除を勧めない',
+    failed !== null && !/直すか削除/.test(failed.stderr), JSON.stringify(failed));
 }
 
 report();
