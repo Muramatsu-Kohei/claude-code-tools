@@ -504,6 +504,13 @@ function cwdCandidates(texts, cwd) {
 // ように選択肢を 32 個並べる、`{a,{b,{c,{d,{e,<ツリー名>}}}}}` のように 5 段重ねる、の
 // どちらでも素通りした)。上限を上げても同じ手が使えるので、打ち切りは「判定できなかった」
 // として扱い、拒否側に倒すしかない(targetStrings の undecidable)。
+// シェルが実際に展開するのは引用符の外のブレースだけ。引用符を外した文字列で数えると、
+// JS / JSON のオブジェクトリテラル・jq のフィルタ・PowerShell のスクリプトブロックまで
+// ブレースとして数えられ、5 個並んだだけで「判定できない」に倒れていた(そのどれもシェルは
+// 展開しない)。閉じない引用符はそこから先を丸ごと囲みと見なす ―― 展開されないという結論は
+// 同じなので、数え方としてはこれで足りる。
+const stripQuotedSpans = (text) => text.replace(/"[^"]*"?|'[^']*'?|`[^`]*`?/g, ' ');
+
 const BRACE_ALTERNATION = /\{([^{}]*,[^{}]*)\}/;
 const BRACE_MAX_DEPTH = 4;
 const BRACE_MAX_VARIANTS = 32;
@@ -532,7 +539,12 @@ function braceVariants(text) {
   return { variants: out, truncated: frontier.some((t) => BRACE_ALTERNATION.test(t)) };
 }
 
-function targetStrings(toolName, toolInput, cwd, trees = []) {
+// markUndecidable は「対象を判定できなかった」印(下の braceTruncated)を混ぜてよいかどうか。
+// 既定は false。この印は trees の各要素を操作対象として偽造するので、trees に保護ツリー以外を
+// 渡す呼び出し ―― isUnlockStateWrite は解除の状態ファイル自身を渡す ―― でそのまま混ぜると、
+// 無関係なコマンドが「状態ファイルへの書き込み」として拒否される(保護ルールが空でも起きる)。
+// 判定不能を拒否に倒す意味があるのはツリー保護の判定だけなので、そこからの呼び出しに限る。
+function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = false) {
   const ti = toolInput ?? {};
   const pathFields = PATH_FIELDS[toolName];
   const commandFields = COMMAND_FIELDS[toolName];
@@ -571,23 +583,23 @@ function targetStrings(toolName, toolInput, cwd, trees = []) {
   // `{"path":"org-tree/secret"}` と `{"p":"/c/org-tree/x"}` が素通りした)。自然文である
   // Agent / Task の prompt も、引用符が連結を意味しないので同じく外さない。
   const isShell = toolName === 'Bash' || toolName === 'PowerShell';
-  const texts = (commandFields
+  const rawTexts = commandFields
     ? commandFields.map((f) => ti[f]).filter((v) => typeof v === 'string')
-    : [JSON.stringify(ti)]
-  ).map((t) => expandHomeIn(isShell ? t.replace(/["'`]/g, '') : t));
+    : [JSON.stringify(ti)];
+  const texts = rawTexts.map((t) => expandHomeIn(isShell ? t.replace(/["'`]/g, '') : t));
 
   // ブレースの展開もシェルのコマンド文字列に限る(引用符除去と同じ理由)。知らないツールで
   // 見る JSON にはオブジェクトの `{...}` がそのまま含まれ、展開すると実在しない文字列を
   // 判定材料に増やしてしまう。PowerShell は実際にはブレース展開しないが、展開版を足す向きの
   // 誤りは拒否側にしか倒れないので Bash と分けない。
-  let braceTruncated = false;
   if (isShell) {
-    for (const t of [...texts]) {
-      const { variants, truncated } = braceVariants(t);
-      texts.push(...variants);
-      if (truncated) braceTruncated = true;
-    }
+    for (const t of [...texts]) texts.push(...braceVariants(t).variants);
   }
+  // 打ち切りの有無は引用符の外にあるブレースだけで数える(stripQuotedSpans のコメント)。
+  // 展開そのものは引用符を外した文字列に対して行ってよい ―― 判定材料が増える向きの誤りなので
+  // 保護が緩むことはない。数え方だけを実際に展開される範囲に合わせる。
+  const braceTruncated = isShell
+    && rawTexts.some((t) => braceVariants(stripQuotedSpans(t)).truncated);
 
   // 相対パスの基準は cwd だけとは限らない(cwdCandidates のコメント)。
   const bases = cwdCandidates(texts, cwd);
@@ -649,7 +661,7 @@ function targetStrings(toolName, toolInput, cwd, trees = []) {
   // できない(braceVariants のコメント)。どのツリーを指しているかも分からないので、全ツリーの
   // ルートを対象として積む。切り詰めの印を付けるのは、解除の範囲判定(unlockCoversTargets)も
   // 通さないため ―― 展開してみるまで何を触るか分からないので、範囲内である根拠が無い。
-  if (braceTruncated) {
+  if (markUndecidable && braceTruncated) {
     for (const tree of trees) out.push({ ...asPath(normalize(tree), true), undecidable: 'brace' });
   }
   return out.filter((t) => t.value);
@@ -856,7 +868,7 @@ function violation(input, account, config, unlocked = [], notes = []) {
   // やり直しやガード外しに向かってしまう。適用しなかったことまで文面に出す。
   const runtimeNote = runtimeCd ? '(cd の移動先が実行時に決まるため、一時解除を適用できません)' : '';
 
-  const targets = targetStrings(input.tool_name, input.tool_input, cwd, config.rules.map((r) => r.tree));
+  const targets = targetStrings(input.tool_name, input.tool_input, cwd, config.rules.map((r) => r.tree), true);
 
   // 案内する swap は Bash 経由なので、cwd が拒否対象ツリーの内側だとその呼び出し自体が
   // 同じ判定に当たって拒否される。当たったルールが cwd を含むとは限らない(別の保護ツリーに

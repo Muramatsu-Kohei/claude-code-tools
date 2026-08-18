@@ -1137,8 +1137,8 @@ console.log('account-guard');
     'function main() {\n  throw new Error("injected for test");'
   );
   const injected = withMain.replace(
-    'function targetStrings(toolName, toolInput, cwd, trees = []) {',
-    'function targetStrings(toolName, toolInput, cwd, trees = []) {\n  throw new Error("injected into targetStrings");'
+    'function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = false) {',
+    'function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = false) {\n  throw new Error("injected into targetStrings");'
   );
   if (withMain === original || injected === withMain) {
     throw new Error('注入に失敗しました(テストの前提が崩れています)');
@@ -1800,6 +1800,22 @@ const TOOL_B = 'C:/org-tree/tool-b';
   // 無関係なコマンドまで一律に拒否していないことを確かめる。
   res = shell('cat C:/{a,b}/x');
   check('上限の内側で無関係なブレースは通す', decision(res) === null, JSON.stringify(res));
+
+  // 判定不能の印は保護ツリーの判定にだけ効かせる。印は trees の各要素を操作対象として偽造する
+  // ので、解除の状態ファイル自身を trees に渡す判定(isUnlockStateWrite)にも流れると、それが
+  // そのまま状態ファイルへの一致になり、保護ツリーと無関係なコマンドが「状態ファイルへの
+  // 書き込み」として拒否される。保護ルールが空でも起きる誤拒否だった。
+  // このサンドボックスは C:/org-tree を保護しているので、判定不能によるツリー側の拒否は正しい
+  // 挙動。ここで確かめたいのは理由の取り違えで、「状態ファイルへの書き込み」として拒否されて
+  // いないこと ―― そちらは保護ルールが空でも発火するので、誤拒否の影響範囲が桁違いに広い。
+  res = shell('mkdir -p a/{x,y}/{1,2}/{p,q}/{r,s}/{t,u}');
+  const braceReason = res?.hookSpecificOutput?.permissionDecisionReason ?? '';
+  check('打ち切りを状態ファイルへの書き込みと取り違えない', !braceReason.includes('状態ファイル'), braceReason);
+
+  // 引用符の中のブレースはシェルが展開しない。数に入れると、JS のオブジェクトリテラルや
+  // jq のフィルタ・PowerShell のスクリプトブロックを含むコマンドが判定不能扱いになる。
+  res = shell('node -e "const a={x:1,y:2}; const b={p:3,q:4}; const c={r:5,s:6}; const d={t:7,u:8}; const e={v:9,w:0};"');
+  check('引用符の中のブレースは打ち切りに数えない', decision(res) === null, JSON.stringify(res));
 }
 
 // --- 裸のツリー名は区切りを伴わない形だけを拾う ---
