@@ -430,6 +430,39 @@ const CD_COMMAND = new RegExp(
   'gi'
 );
 
+// 解除の範囲判定に使えるのは「どこを触るかが字面から決まる」コマンドだけ。cd の移動先に
+// 実行時にしか決まらない要素($VAR / ${VAR} / %VAR% / $(...) / `...` / (Get-Item …))が
+// 入ると、相対パスの基準が定まらない。resolveFrom はそれを字面どおりのディレクトリ名として
+// 解決してしまうので、解除したディレクトリの「配下」に実在しない基準ができ、ツリー内のどこを
+// 指す相対パスも解除の範囲内に見えていた ―― `tool-a` だけを解除した状態で
+// `cd $PARENT && cat tool-b/secret` が通り、兄弟ディレクトリが読めていた。
+//
+// 移動先の切り出しは CD_COMMAND と分ける。CD_COMMAND のキャプチャは TOKEN_STOP で切れるので、
+// バッククォートや `$(` で始まる移動先はキャプチャに現れない(`` cd `dirname $PWD` `` では
+// CD_COMMAND 自体がマッチしない)。ここでは次のコマンド区切りまでを移動先の記述として丸ごと
+// 見る。引用符を外す前の値を見るのも同じ理由で、外した後では `` `pwd` `` が `pwd` という
+// ディレクトリ名に化け、実行時要素だったことが分からなくなる。
+//
+// `(` まで実行時要素に数えるのは PowerShell の `(Get-Item …).FullName` を取り逃さないため。
+// 引用符なしで括弧を含むディレクトリ名を書くことはまず無いが、誤って数えても拒否側に倒れる
+// (解除が効かなくなるだけで、保護が緩む向きには倒れない)。
+const CD_DEST_RAW = new RegExp(
+  `(?:^|[;&|(\\n])\\s*(?:cd|chdir|pushd|set-location|sl|push-location)\\s+([^;&|\\n]*)`,
+  'gi'
+);
+const RUNTIME_DEST = /[$%`(]/;
+
+function hasRuntimeCd(toolName, toolInput) {
+  const ti = toolInput ?? {};
+  const commandFields = COMMAND_FIELDS[toolName];
+  // 知らないツールは targetStrings と同じく引数全体を見る。どの引数がコマンドかは判断
+  // できないので、cd の記述がどこに入っていても拾える形に倒す。
+  const texts = commandFields
+    ? commandFields.map((f) => ti[f]).filter((v) => typeof v === 'string')
+    : [JSON.stringify(ti)];
+  return texts.some((t) => [...t.matchAll(CD_DEST_RAW)].some((m) => RUNTIME_DEST.test(m[1])));
+}
+
 // 相対パスの解決に使う基準ディレクトリ一覧。先頭は必ずフック入力の cwd。
 function cwdCandidates(texts, cwd) {
   const out = [cwd];
@@ -451,7 +484,14 @@ function cwdCandidates(texts, cwd) {
 //
 // 展開しきることは狙わない(入れ子・連番・掛け合わせは際限がなく、正確に真似ようとするほど
 // 実装のずれが抜け道になる)。実際に書かれる単純な `{a,b}` を左から順に潰し、深さと本数の
-// 上限で打ち切る。打ち切っても元の文字列は従来どおり見るので、判定が緩むことはない。
+// 上限で打ち切る。
+//
+// 打ち切ったことは呼び出し側に伝える。ここが真偽を返さず黙って諦めていた頃は、上限そのものが
+// 抜け道だった ―― ツリー名が割れているとき、判定材料は展開後の variant しかないのに、
+// 上限を超えた variant は誰も見ないまま捨てられていた(`C:/{d0,…,d39,<ツリー名>}/secret` の
+// ように選択肢を 32 個並べる、`{a,{b,{c,{d,{e,<ツリー名>}}}}}` のように 5 段重ねる、の
+// どちらでも素通りした)。上限を上げても同じ手が使えるので、打ち切りは「判定できなかった」
+// として扱い、拒否側に倒すしかない(targetStrings の undecidable)。
 const BRACE_ALTERNATION = /\{([^{}]*,[^{}]*)\}/;
 const BRACE_MAX_DEPTH = 4;
 const BRACE_MAX_VARIANTS = 32;
@@ -470,10 +510,14 @@ function braceVariants(text) {
     }
     if (!next.length) break;
     out.push(...next);
-    if (out.length >= BRACE_MAX_VARIANTS) return out.slice(0, BRACE_MAX_VARIANTS);
+    if (out.length >= BRACE_MAX_VARIANTS) {
+      return { variants: out.slice(0, BRACE_MAX_VARIANTS), truncated: true };
+    }
     frontier = next;
   }
-  return out;
+  // 本数の上限に当たらずに抜けても、深さの上限で展開しきれていないことがある。展開の
+  // 打ち切りはこの 2 経路しかないので、どちらも同じ印にまとめる。
+  return { variants: out, truncated: frontier.some((t) => BRACE_ALTERNATION.test(t)) };
 }
 
 function targetStrings(toolName, toolInput, cwd, trees = []) {
@@ -524,8 +568,13 @@ function targetStrings(toolName, toolInput, cwd, trees = []) {
   // 見る JSON にはオブジェクトの `{...}` がそのまま含まれ、展開すると実在しない文字列を
   // 判定材料に増やしてしまう。PowerShell は実際にはブレース展開しないが、展開版を足す向きの
   // 誤りは拒否側にしか倒れないので Bash と分けない。
+  let braceTruncated = false;
   if (isShell) {
-    for (const t of [...texts]) texts.push(...braceVariants(t));
+    for (const t of [...texts]) {
+      const { variants, truncated } = braceVariants(t);
+      texts.push(...variants);
+      if (truncated) braceTruncated = true;
+    }
   }
 
   // 相対パスの基準は cwd だけとは限らない(cwdCandidates のコメント)。
@@ -582,6 +631,14 @@ function targetStrings(toolName, toolInput, cwd, trees = []) {
     if (texts.some((t) => re.test(t))) {
       for (const b of bases) out.push(asPath(resolveFrom(b, base)));
     }
+  }
+
+  // 展開を打ち切ったときは、見ていない variant にツリー名が割れて入っている可能性を排除
+  // できない(braceVariants のコメント)。どのツリーを指しているかも分からないので、全ツリーの
+  // ルートを対象として積む。切り詰めの印を付けるのは、解除の範囲判定(unlockCoversTargets)も
+  // 通さないため ―― 展開してみるまで何を触るか分からないので、範囲内である根拠が無い。
+  if (braceTruncated) {
+    for (const tree of trees) out.push({ ...asPath(normalize(tree), true), undecidable: 'brace' });
   }
   return out.filter((t) => t.value);
 }
@@ -753,7 +810,10 @@ function isEscapeHatch(input, config) {
 // unlocked は現セッションで解除中のパス一覧、notes は解除が実際に効いた(本来なら拒否していた)
 // ことを呼び出し元へ伝えるための出力先。unlocked を引数で受けるのは、呼び出し元がその一覧を
 // 案内文にも使うため ―― ここで読み直すと、読めなかったときに判定と文面で食い違いが出る。
-function violation(input, account, config, unlocked, notes = []) {
+// unlocked に既定値を置くのは、渡し忘れたときに coveredByUnlock が TypeError を投げ、
+// reportCrash 経由で cwd だけを見る縮小判定へ静かに落ちるのを防ぐため(このファイルの方針は
+// 「分からないときは拒否側」なので、例外で判定が緩むのは向きが逆)。
+function violation(input, account, config, unlocked = [], notes = []) {
   const cwd = input.cwd || process.cwd();
 
   // 解除に関わる操作は、設定の状態にも解除の有無にも関係なく真っ先に落とす。解除中のセッションで
@@ -775,6 +835,15 @@ function violation(input, account, config, unlocked, notes = []) {
     };
   }
 
+  // 解除は「触る場所が字面から決まる」ことを前提にする(hasRuntimeCd のコメント)。決まらない
+  // コマンドでは解除を適用せず、解除を入れる前と同じ「保護ツリーの中は無条件に拒否」へ戻す。
+  // 解除が無いときは判定が変わらないので、余計な拒否は生まない。
+  const runtimeCd = unlocked.length > 0 && hasRuntimeCd(input.tool_name, input.tool_input);
+  const scoped = runtimeCd ? [] : unlocked;
+  // 解除中に拒否されると、理由が書かれていない限り「解除が壊れている」ように見え、解除の
+  // やり直しやガード外しに向かってしまう。適用しなかったことまで文面に出す。
+  const runtimeNote = runtimeCd ? '(cd の移動先が実行時に決まるため、一時解除を適用できません)' : '';
+
   const targets = targetStrings(input.tool_name, input.tool_input, cwd, config.rules.map((r) => r.tree));
 
   // 案内する swap は Bash 経由なので、cwd が拒否対象ツリーの内側だとその呼び出し自体が
@@ -785,7 +854,7 @@ function violation(input, account, config, unlocked, notes = []) {
   // 解除済みの cwd では swap の注記は要らない(その cwd のままで swap を打てる)ので、
   // 解除を反映した上で「拒否対象のツリーの内側にいるか」を見る。
   const cwdRule = config.rules.find((r) => !r.allow.includes(account) && isInsideTree(cwd, r.tree)
-    && !coveredByUnlock(cwd, unlocked));
+    && !coveredByUnlock(cwd, scoped));
   const cwdTree = cwdRule ? cwdRule.tree : null;
 
   for (const rule of config.rules) {
@@ -794,10 +863,10 @@ function violation(input, account, config, unlocked, notes = []) {
     // 解除フィルタは、判定の冒頭ではなくヒットが確定した後に置く。冒頭で早期 return すると
     // 「どのパスが原因で拒否されたか」が分からず、解除の範囲を絞れているかも確かめられない。
     if (isInsideTree(cwd, rule.tree)) {
-      if (!coveredByUnlock(cwd, unlocked)) {
+      if (!coveredByUnlock(cwd, scoped)) {
         return {
           tree: rule.tree,
-          reason: `作業ディレクトリが ${rule.tree} 配下にあります`,
+          reason: `作業ディレクトリが ${rule.tree} 配下にあります${runtimeNote}`,
           allow: rule.allow,
           cwdTree: rule.tree,
         };
@@ -809,10 +878,12 @@ function violation(input, account, config, unlocked, notes = []) {
     // であって、同じツリーの解除範囲外を触ってよいことにはならない。
     const hits = targets.filter((t) => mentionsTree(t.value, rule.tree));
     if (hits.length) {
-      if (!unlockCoversTargets(rule.tree, hits, unlocked)) {
+      if (!unlockCoversTargets(rule.tree, hits, scoped)) {
         return {
           tree: rule.tree,
-          reason: `操作の対象が ${rule.tree} 配下です`,
+          reason: hits.some((t) => t.undecidable === 'brace')
+            ? `ブレース展開を展開しきれないため、対象が ${rule.tree} 配下かどうか判定できません`
+            : `操作の対象が ${rule.tree} 配下です${runtimeNote}`,
           allow: rule.allow,
           // cwd はこのツリーの内側ではないが、別の保護ツリーの内側かもしれない。
           cwdTree,

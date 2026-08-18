@@ -1722,6 +1722,72 @@ const TOOL_B = 'C:/org-tree/tool-b';
   check('改行区切りでも cd の移動先を基準にする', decision(res) === 'deny', JSON.stringify(res));
 }
 
+// --- 移動先が実行時に決まる cd では解除を適用しない ---
+//
+// resolveFrom は `$PARENT` を字面どおりのディレクトリ名として解決するので、解除したディレクトリ
+// の「配下」に実在しない基準ができ、ツリー内のどこを指す相対パスも解除の範囲内に見えていた
+// (`tool-a` だけを解除した状態で兄弟の `tool-b` が読めた)。基準が定まらないコマンドでは解除を
+// 無かったものとして扱い、解除を入れる前と同じ「保護ツリーの中は無条件に拒否」へ戻す。
+{
+  const SID = 'session-runtime-cd';
+  const home = unlockedSandbox('unlock-runtime-cd', TOOL_A, SID);
+  const shell = (command) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: TOOL_A,
+    tool_name: 'Bash', tool_input: { command },
+  });
+
+  let res = shell('cd .. && cat tool-b/secret');
+  check('静的に解決できる cd では従来どおり範囲外を拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // バッククォートと `$(` で始まる形は CD_COMMAND のキャプチャに現れない(TOKEN_STOP で
+  // 切れる)。移動先の切り出しを分けた理由がこれなので、両方を並べて確かめる。
+  for (const [label, dest] of [
+    ['$VAR', '$PARENT'],
+    ['${VAR}', '${PARENT}'],
+    ['%VAR%', '%PARENT%'],
+    ['$(...)', '$(dirname $PWD)'],
+    ['バッククォート', '`dirname $PWD`'],
+  ]) {
+    res = shell(`cd ${dest} && cat tool-b/secret`);
+    check(`移動先が ${label} の cd では解除を適用しない`, decision(res) === 'deny', JSON.stringify(res));
+  }
+
+  // 解除が効く形まで巻き込んでいないことを確かめる。実行時要素を拒否側に倒す判定は、
+  // 「cd を含むコマンドは全部拒否」に膨らませると解除そのものが使えなくなる。
+  res = shell('cat x.py');
+  check('cd を含まないコマンドは解除範囲のまま通す', decision(res) === null, JSON.stringify(res));
+
+  res = shell('cd sub && cat x.py');
+  check('移動先が静的な cd は解除範囲のまま通す', decision(res) === null, JSON.stringify(res));
+}
+
+// --- 展開を打ち切ったブレースは判定不能として拒否する ---
+//
+// ツリー名がブレースで割れていると、判定材料は展開後の variant しかない(元の文字列には
+// 連続したツリー名が現れない)。上限を超えて捨てた variant は誰も見ないので、選択肢を並べる
+// だけで拒否そのものをすり抜けられていた。上限を上げても同じ手が使えるため、打ち切りは
+// 「判定できなかった」として拒否側に倒す。
+{
+  const SID = 'session-brace-cap';
+  const home = unlockedSandbox('unlock-brace-cap', TOOL_A, SID);
+  const shell = (command) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'Bash', tool_input: { command },
+  });
+
+  const many = Array.from({ length: 40 }, (_, i) => `d${i}`).join(',');
+  let res = shell(`cat C:/{${many},org-tree}/secret`);
+  check('本数の上限を超えるブレースは拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = shell('cat C:/{a,{b,{c,{d,{e,org-tree}}}}}/secret');
+  check('深さの上限を超えるブレースは拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // 上限の内側は従来どおり展開して判定する。打ち切りを拒否に倒したことで、ブレースを含む
+  // 無関係なコマンドまで一律に拒否していないことを確かめる。
+  res = shell('cat C:/{a,b}/x');
+  check('上限の内側で無関係なブレースは通す', decision(res) === null, JSON.stringify(res));
+}
+
 // --- 裸のツリー名は区切りを伴わない形だけを拾う ---
 //
 // 区切り付きの形は相対パスとして正しい深さで拾われている。そこへ重ねてツリールートまで
