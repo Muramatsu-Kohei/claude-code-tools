@@ -1759,6 +1759,20 @@ const TOOL_B = 'C:/org-tree/tool-b';
 
   res = shell('cd sub && cat x.py');
   check('移動先が静的な cd は解除範囲のまま通す', decision(res) === null, JSON.stringify(res));
+
+  // パスのフィールドが決まっているツールでは cd は関係しない(相対パスの基準は cwd だけ)。
+  // 引数全体を見ると、書き込む「文面」に cd の例が入っているだけで解除が効かなくなり、
+  // 解除した範囲のドキュメントにコマンド例を書けなくなる。
+  //
+  // 文面は区切り記号を挟んだ形にする。移動先の切り出しは cd の直前に行頭か区切りを要求する
+  // ので、`{"content":"cd …` のように引用符が直前に来る形では検出されない ―― 素の
+  // `cd $PARENT` で書くと、判定に関わらず必ず通る(=感度の無い)テストになる。
+  res = runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: TOOL_A,
+    tool_name: 'Write',
+    tool_input: { file_path: `${TOOL_A}/note.md`, content: 'echo hi; cd $PARENT && ls' },
+  });
+  check('パスのフィールドを持つツールは文面の cd で解除を失わない', decision(res) === null, JSON.stringify(res));
 }
 
 // --- 展開を打ち切ったブレースは判定不能として拒否する ---

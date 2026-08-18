@@ -454,9 +454,21 @@ const RUNTIME_DEST = /[$%`(]/;
 
 function hasRuntimeCd(toolName, toolInput) {
   const ti = toolInput ?? {};
+  // パスのフィールドが決まっているツールでは、そのフィールドが操作対象そのもので、相対パスの
+  // 基準は cwd しかない ―― cd は関係しない。ここで引数全体を見ると、`Write` の content に
+  // 書いた `cd $x` のような「文面」で解除が効かなくなる(targetStrings が PATH_FIELDS を
+  // 優先するのと同じ理由で、判断の根拠にしてよいのは操作対象のフィールドだけ)。
+  if (PATH_FIELDS[toolName]) return false;
   const commandFields = COMMAND_FIELDS[toolName];
   // 知らないツールは targetStrings と同じく引数全体を見る。どの引数がコマンドかは判断
   // できないので、cd の記述がどこに入っていても拾える形に倒す。
+  //
+  // ただし `{"command":"cd $X && …"}` のように引用符が cd の直前に来る形は、移動先の切り出しに
+  // 当たらない(行頭か区切りを要求するため)。いまはそれでも穴にならない ―― 知らないツールから
+  // 取り出した参照は JSON の `"` で必ず切り詰め扱いになり(SAFE_TOKEN_END)、解除の範囲判定を
+  // 通らないので、解除の有無に関係なく拒否される。逆に言えば、JSON の `"` を切り詰めの対象外に
+  // する(= 知らないツールでも解除を効かせる)なら、この検出も同時に JSON 対応させなければ
+  // そこが穴になる。
   const texts = commandFields
     ? commandFields.map((f) => ti[f]).filter((v) => typeof v === 'string')
     : [JSON.stringify(ti)];
