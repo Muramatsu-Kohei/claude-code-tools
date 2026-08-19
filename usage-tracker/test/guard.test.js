@@ -47,7 +47,15 @@ function sandbox(name, acct) {
 // collect.js が書くはずの状態ファイルを偽装する。
 // ageMin は「この状態が何分前に書かれたか」。guard.js は 15 分より古い状態を捨てるので、
 // stale 判定のテストではここを動かす。
-function writeState(home, acct, { five = 0, seven = 0, ageMin = 0, fiveResetMin = 120, sevenResetMin = 3000 } = {}) {
+// fiveResetAt / sevenResetAt には epoch 秒の絶対値を渡せる。リセット時刻は guard.js が
+// 「枠が変わったか」を判定するキーなので、同じ枠の中での挙動(発火フラグの持ち越し)を
+// 見るテストでは、複数回の書き込みで同じ値を使わないと検証にならない — 既定の相対指定は
+// 呼ぶたび Date.now() から引き直すため、書き込みの間に秒境界をまたぐと別の枠に化ける。
+function writeState(home, acct, {
+  five = 0, seven = 0, ageMin = 0,
+  fiveResetMin = 120, sevenResetMin = 3000,
+  fiveResetAt = null, sevenResetAt = null,
+} = {}) {
   const now = Date.now();
   fs.writeFileSync(
     path.join(home, '.claude', 'usage-tracker', `collect-state-${acct}.json`),
@@ -57,8 +65,8 @@ function writeState(home, acct, { five = 0, seven = 0, ageMin = 0, fiveResetMin 
       five_pct: five,
       seven_pct: seven,
       // リセット時刻は Unix epoch 秒(実測で来る形)。負の分数を渡せば「リセット済みの枠」になる。
-      five_reset: Math.floor((now + fiveResetMin * 60000) / 1000),
-      seven_reset: Math.floor((now + sevenResetMin * 60000) / 1000),
+      five_reset: fiveResetAt ?? Math.floor((now + fiveResetMin * 60000) / 1000),
+      seven_reset: sevenResetAt ?? Math.floor((now + sevenResetMin * 60000) / 1000),
     }),
     'utf8'
   );
@@ -109,7 +117,7 @@ function message(r) {
 const wrapsNow = (m) => m.includes('ただちに以下を実行してください');
 
 // ---- アカウント別の既定閾値 ----
-// 週次枠が持つ 5h枠の本数が team 8.0 / max 10.3 と違うため、「残りが 5h枠1本」の点は
+// 週次枠が持つ 5h枠の本数が team 8.0 / max 10.3 と違うため、「残りが 5h枠1本前後」の点は
 // team 90% / max 92% にずれる。ここが同じ値に戻ると、max では 5h枠 1.5 本分を残した
 // 段階で促してしまう(旧既定 85% で実際に起きていた)。
 console.log('\nアカウント別の既定閾値(週次枠)');
@@ -132,6 +140,14 @@ console.log('\nアカウント別の既定閾値(週次枠)');
   const home = sandbox('week-unknown', null);
   writeState(home, 'unknown', { seven: 90 });
   check('アカウント判別不能: team の閾値(90%)に倒れる', message(run(home, { sid: 'a' })).includes('週次枠: 90%'));
+}
+{
+  // subscriptionType は外部由来の文字列がそのまま入る。プロトタイプのキー名だと素引きは
+  // Object 自身を掴み、閾値が全て undefined になってどの段も発火しない = ガードが黙って
+  // 無効になる。「安全側に倒す」ための経路が最も危険な形で裏切るので、ここを固定する。
+  const home = sandbox('week-proto', 'constructor');
+  writeState(home, 'constructor', { seven: 90 });
+  check('プロトタイプのキー名でも team の閾値に倒れる', message(run(home, { sid: 'a' })).includes('週次枠: 90%'));
 }
 
 console.log('\n既定閾値(5時間枠)');
@@ -218,12 +234,17 @@ console.log('\n促さない条件');
 console.log('\n発火の重複抑止');
 {
   const home = sandbox('once', 'max');
-  writeState(home, 'max', { seven: 92 });
+  // このブロックが見たいのは「同じ枠の中でフラグが効くか」。枠の同一性はリセット時刻で
+  // 決まるので、書き込みのたびに Date.now() から引き直すと、たまたま秒境界をまたいだ
+  // 実行だけ別の枠と見なされ、フラグを読まずとも促してしまう。そうなると抑止を壊しても
+  // 通るテストになるため、この枠のリセット時刻は1つに固定して全ての書き込みで使い回す。
+  const sevenResetAt = Math.floor((Date.now() + 3000 * 60000) / 1000);
+  writeState(home, 'max', { seven: 92, sevenResetAt });
   check('1回目は促す', message(run(home, { sid: 'x' })) !== '');
   check('同じ枠・同じ段では2回目を促さない', message(run(home, { sid: 'x' })) === '');
   check('別セッションには促す(フラグはセッションごと)', message(run(home, { sid: 'y' })) !== '');
 
-  writeState(home, 'max', { seven: 97 });
+  writeState(home, 'max', { seven: 97, sevenResetAt });
   const up = message(run(home, { sid: 'x' }));
   check('段が上がれば同じセッションでも促す', up.includes('【最終】'), up);
   check('最終段のあとに警告段は出さない', message(run(home, { sid: 'x' })) === '');
@@ -234,7 +255,7 @@ console.log('\n発火の重複抑止');
     path.join(home, '.claude', '.credentials.json'),
     JSON.stringify({ claudeAiOauth: { subscriptionType: 'team' } }), 'utf8'
   );
-  writeState(home, 'team', { seven: 92 });
+  writeState(home, 'team', { seven: 92, sevenResetAt });
   check('アカウントが変われば発火フラグを引き継がない', message(run(home, { sid: 'x' })) !== '');
 }
 
