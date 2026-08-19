@@ -1560,6 +1560,19 @@ const TOOL_B = 'C:/org-tree/tool-b';
   check('lock でも知らないオプションは失敗させる', f !== null && f.status === 1, JSON.stringify(f));
   check('失敗した lock は解除を消さない', JSON.parse(fs.readFileSync(file, 'utf8')).unlocks.length === 1, file);
 
+  // `--path` を書き忘れた形はオプションの判定に当たらない。裸の引数は lock では意味を持たず、
+  // 黙って捨てると範囲を絞ったつもりのまま全部消えて「取り消しました」と返る。
+  f = guardCliFail(home, ['lock', TOOL_A], SID);
+  check('lock は --path なしの範囲指定を失敗させる', f !== null && f.status === 1, JSON.stringify(f));
+  check('--path を欠いた lock は解除を消さない',
+    JSON.parse(fs.readFileSync(file, 'utf8')).unlocks.length === 1, file);
+
+  // --path の形も unlock と揃える。ドライブ文字を欠くと cwd 基準で解決され、まだ開いている
+  // 範囲に対して「解除はありません」と返っていた(消えないので実害は誤解だけだが、
+  // 取り消したつもりで作業を続けることになる)。
+  f = guardCliFail(home, ['lock', '--path', '/org-tree/tool-a'], SID);
+  check('lock でもドライブ文字のない --path は受け付けない', f !== null && f.status === 1, JSON.stringify(f));
+
   guardCli(home, ['unlock', '--path', TOOL_A, '二度目の理由'], SID);
   let state = JSON.parse(fs.readFileSync(file, 'utf8'));
   check('同じ範囲を重ねて解除しても件数は増えない', state.unlocks.length === 1, JSON.stringify(state));
@@ -1720,6 +1733,31 @@ const TOOL_B = 'C:/org-tree/tool-b';
   // 変わる状態)。ヒアドキュメントや複数行のスクリプトは実際にこの形で来る。
   res = shell(`echo hi\ncd ${TOOL_A}\ncat ../tool-b/secret`);
   check('改行区切りでも cd の移動先を基準にする', decision(res) === 'deny', JSON.stringify(res));
+
+  // ラッパーの引数として渡された cd も基準にする。引用符は判定より前に外れるので
+  // `bash -c "cd <dir> && …"` は cd の直前が `-c ` になり、行頭にも区切りにも当たらなかった。
+  // 移動先が拾われないと基準は cwd だけになり、解除範囲の外を指す相対パスが解除の内側に
+  // 解決されて、兄弟ディレクトリが実際に読めていた。
+  for (const [label, command] of [
+    ['bash -c', `bash -c "cd ${TOOL_A} && cat ../tool-b/secret"`],
+    ['sh -c', `sh -c 'cd ${TOOL_A}; cat ../tool-b/secret'`],
+    ['eval', `eval "cd ${TOOL_A} && cat ../tool-b/secret"`],
+    ['sudo', `sudo cd ${TOOL_A} && cat ../tool-b/secret`],
+  ]) {
+    res = shell(command);
+    check(`${label} 越しの cd も移動先を基準にする`, decision(res) === 'deny', JSON.stringify(res));
+  }
+
+  // 解除した場所を cwd にして、ラッパー越しに上へ登る形。上と裏返しの経路で、cwd が解除の
+  // 範囲内なのでツリーの内側にいること自体は通り、対象の判定だけが頼りになる。
+  const inTree = (command) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: TOOL_A,
+    tool_name: 'Bash', tool_input: { command },
+  });
+  res = inTree('bash -c "cd .. && cat tool-b/secret"');
+  check('解除した場所からラッパー越しに登る形も拒否する', decision(res) === 'deny', JSON.stringify(res));
+  res = inTree('cat sub/x.py');
+  check('解除の範囲内なら cwd 基準の相対パスは通す', decision(res) === null, JSON.stringify(res));
 }
 
 // --- 移動先が実行時に決まる cd では解除を適用しない ---
@@ -1789,12 +1827,22 @@ const TOOL_B = 'C:/org-tree/tool-b';
     tool_name: 'Bash', tool_input: { command },
   });
 
-  const many = Array.from({ length: 40 }, (_, i) => `d${i}`).join(',');
+  // 選択肢の数と入れ子の深さは、上限(BRACE_MAX_VARIANTS / BRACE_MAX_DEPTH)を実際に超える値で
+  // 書く。上限を引き上げたときにここが上限の内側に収まると、展開しきった結果ツリー名が見つかって
+  // 拒否されるだけになり、「打ち切りを拒否に倒す」ことを検証しないまま緑になる。
+  const many = Array.from({ length: 300 }, (_, i) => `d${i}`).join(',');
   let res = shell(`cat C:/{${many},org-tree}/secret`);
   check('本数の上限を超えるブレースは拒否する', decision(res) === 'deny', JSON.stringify(res));
 
-  res = shell('cat C:/{a,{b,{c,{d,{e,org-tree}}}}}/secret');
+  res = shell('cat C:/{a,{b,{c,{d,{e,{f,{g,{h,{i,org-tree}}}}}}}}}/secret');
   check('深さの上限を超えるブレースは拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // 判定できなかったときは、見出しも「判定できなかった」と言う。断定形のままだと、対象が
+  // 本当にツリー配下にあると読めてしまい、書き方を変えれば通ることに気づけない。
+  const undecidableReason = res?.hookSpecificOutput?.permissionDecisionReason ?? '';
+  check('判定不能の拒否は見出しでも断定しない',
+    /判定できないため拒否/.test(undecidableReason) && !/^\[account-guard\] C:\/org-tree は別アカウント専用/.test(undecidableReason),
+    undecidableReason);
 
   // 上限の内側は従来どおり展開して判定する。打ち切りを拒否に倒したことで、ブレースを含む
   // 無関係なコマンドまで一律に拒否していないことを確かめる。
@@ -1808,9 +1856,26 @@ const TOOL_B = 'C:/org-tree/tool-b';
   // このサンドボックスは C:/org-tree を保護しているので、判定不能によるツリー側の拒否は正しい
   // 挙動。ここで確かめたいのは理由の取り違えで、「状態ファイルへの書き込み」として拒否されて
   // いないこと ―― そちらは保護ルールが空でも発火するので、誤拒否の影響範囲が桁違いに広い。
-  res = shell('mkdir -p a/{x,y}/{1,2}/{p,q}/{r,s}/{t,u}');
+  res = shell('mkdir -p a/{x,y}/{1,2}/{p,q}/{r,s}/{t,u}/{v,w}/{2,3}/{4,5}');
   const braceReason = res?.hookSpecificOutput?.permissionDecisionReason ?? '';
   check('打ち切りを状態ファイルへの書き込みと取り違えない', !braceReason.includes('状態ファイル'), braceReason);
+
+  // 上限は「ふつうに書く Bash が打ち切りに当たらない」ところまで上げてある。累積で数えるため
+  // 2 択のグループ 4 個で頭打ちだった頃は、保護ツリーに一切触れないこの形が拒否されていた。
+  res = shell('mkdir -p a/{x,y} b/{x,y} c/{x,y} d/{x,y} e/{x,y}');
+  check('保護ツリーに触れない 5 グループのブレースは通す', decision(res) === null, JSON.stringify(res));
+
+  // ブレース展開をするのは Bash であって PowerShell ではない。PowerShell のハッシュテーブルや
+  // パイプのスクリプトブロックは引用符に囲まれていないので stripQuotedSpans では落ちず、
+  // 打ち切りとして数えると、保護ツリーと無関係なふつうのコマンドが判定不能で拒否される。
+  const ps = (command) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'PowerShell', tool_input: { command },
+  });
+  res = ps('$a=@{x=1;y=2}; $b=@{p=1,2}; $c=@{q=3,4}; $d=@{r=5,6}; $e=@{s=7,8}; $f=@{t=9,10}');
+  check('PowerShell のハッシュテーブルは打ち切りに数えない', decision(res) === null, JSON.stringify(res));
+  res = ps('Get-Process | ? { $_.Id -gt 1, 2 } | % { $_.Name, $_.Id } | % { $_, 1 } | % { $_, 2 } | % { $_, 3 }');
+  check('PowerShell のスクリプトブロックは打ち切りに数えない', decision(res) === null, JSON.stringify(res));
 
   // 引用符の中のブレースはシェルが展開しない。数に入れると、JS のオブジェクトリテラルや
   // jq のフィルタ・PowerShell のスクリプトブロックを含むコマンドが判定不能扱いになる。

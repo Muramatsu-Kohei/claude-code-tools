@@ -425,10 +425,17 @@ const asPath = (value, truncated = false) => ({ value, kind: 'path', truncated }
 // 拾われず、相対パスがフック入力の cwd で解決されて素通りしていた(ヒアドキュメントや
 // 複数行のスクリプトは実際にこの形で来る)。`m` フラグではなくクラスに `\n` を足すのは、
 // `^` の意味を変えると「行頭のように見えるだけの位置」まで拾い、基準が増えすぎるため。
-const CD_COMMAND = new RegExp(
-  `(?:^|[;&|(\\n])\\s*(?:cd|chdir|pushd|set-location|sl|push-location)\\s+(?:-[a-z]+\\s+)*(${NOT_STOP}+)`,
-  'gi'
-);
+// cd の直前に認める位置。行頭とコマンド区切りに加えて「空白のあと」も認める。区切りだけを
+// 見ていた頃は、ラッパーの引数として渡された cd が丸ごと見えなかった ―― 引用符は判定より前に
+// 外れるので `bash -c "cd .. && cat tool-b/secret"` は `bash -c cd .. && …` になり、cd の直前が
+// `-c ` で区切りにも行頭にも当たらない。基準が cwd のままになるため相対パスが解除範囲内に
+// 解決され、解除したディレクトリの外を実際に読めていた(`sh -c`・`eval`・`sudo` でも同じ)。
+// ラッパーを名前で列挙しないのは、列挙から漏れた 1 つがそのまま穴として残るため。
+// 空白のあとをすべて候補にすると、コマンド位置でない `cd` という語まで基準に積むことになるが、
+// それは基準が増える向きの誤りで、範囲判定は候補が増えるほど拒否側に倒れる(上の設計方針)。
+const CD_HEAD = '(?:^|[;&|(\\n]|\\s)\\s*(?:cd|chdir|pushd|set-location|sl|push-location)\\s+';
+
+const CD_COMMAND = new RegExp(`${CD_HEAD}(?:-[a-z]+\\s+)*(${NOT_STOP}+)`, 'gi');
 
 // 解除の範囲判定に使えるのは「どこを触るかが字面から決まる」コマンドだけ。cd の移動先に
 // 実行時にしか決まらない要素($VAR / ${VAR} / %VAR% / $(...) / `...` / (Get-Item …))が
@@ -446,10 +453,7 @@ const CD_COMMAND = new RegExp(
 // `(` まで実行時要素に数えるのは PowerShell の `(Get-Item …).FullName` を取り逃さないため。
 // 引用符なしで括弧を含むディレクトリ名を書くことはまず無いが、誤って数えても拒否側に倒れる
 // (解除が効かなくなるだけで、保護が緩む向きには倒れない)。
-const CD_DEST_RAW = new RegExp(
-  `(?:^|[;&|(\\n])\\s*(?:cd|chdir|pushd|set-location|sl|push-location)\\s+([^;&|\\n]*)`,
-  'gi'
-);
+const CD_DEST_RAW = new RegExp(`${CD_HEAD}([^;&|\\n]*)`, 'gi');
 const RUNTIME_DEST = /[$%`(]/;
 
 function hasRuntimeCd(toolName, toolInput) {
@@ -464,7 +468,7 @@ function hasRuntimeCd(toolName, toolInput) {
   // できないので、cd の記述がどこに入っていても拾える形に倒す。
   //
   // ただし `{"command":"cd $X && …"}` のように引用符が cd の直前に来る形は、移動先の切り出しに
-  // 当たらない(行頭か区切りを要求するため)。いまはそれでも穴にならない ―― 知らないツールから
+  // 当たらない(CD_HEAD が行頭・区切り・空白のいずれかを要求するので、`"` の直後は当たらない)。いまはそれでも穴にならない ―― 知らないツールから
   // 取り出した参照は JSON の `"` で必ず切り詰め扱いになり(SAFE_TOKEN_END)、解除の範囲判定を
   // 通らないので、解除の有無に関係なく拒否される。逆に言えば、JSON の `"` を切り詰めの対象外に
   // する(= 知らないツールでも解除を効かせる)なら、この検出も同時に JSON 対応させなければ
@@ -512,8 +516,13 @@ function cwdCandidates(texts, cwd) {
 const stripQuotedSpans = (text) => text.replace(/"[^"]*"?|'[^']*'?|`[^`]*`?/g, ' ');
 
 const BRACE_ALTERNATION = /\{([^{}]*,[^{}]*)\}/;
-const BRACE_MAX_DEPTH = 4;
-const BRACE_MAX_VARIANTS = 32;
+// 上限は「打ち切りが即拒否になる」ことを踏まえて決める。本数は各段の累積で数えるので、2 択の
+// グループ n 個で 2+4+…+2^n になり、32 では 4 グループで頭打ちだった ―― `mkdir -p a/{x,y}
+// b/{x,y} c/{x,y} d/{x,y} e/{x,y}` のように保護ツリーに一切触れないふつうの Bash が拒否される。
+// 256 なら 2 択 7 グループまで展開しきる。上限を上げても打ち切り自体は拒否のままなので
+// (上のコメント)、ここで買えるのは誤拒否の減少だけで、抜け道は広がらない。
+const BRACE_MAX_DEPTH = 8;
+const BRACE_MAX_VARIANTS = 256;
 
 function braceVariants(text) {
   const out = [];
@@ -590,15 +599,22 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
 
   // ブレースの展開もシェルのコマンド文字列に限る(引用符除去と同じ理由)。知らないツールで
   // 見る JSON にはオブジェクトの `{...}` がそのまま含まれ、展開すると実在しない文字列を
-  // 判定材料に増やしてしまう。PowerShell は実際にはブレース展開しないが、展開版を足す向きの
-  // 誤りは拒否側にしか倒れないので Bash と分けない。
+  // 判定材料に増やしてしまう。PowerShell は実際にはブレース展開しないが、展開版を足すだけなら
+  // 判定材料が増えるだけなので Bash と分けない(展開しきれなかったときの印は別。即拒否に
+  // つながるので Bash に限る ―― 下の braceTruncated 参照)。
   if (isShell) {
     for (const t of [...texts]) texts.push(...braceVariants(t).variants);
   }
   // 打ち切りの有無は引用符の外にあるブレースだけで数える(stripQuotedSpans のコメント)。
   // 展開そのものは引用符を外した文字列に対して行ってよい ―― 判定材料が増える向きの誤りなので
   // 保護が緩むことはない。数え方だけを実際に展開される範囲に合わせる。
-  const braceTruncated = isShell
+  //
+  // 数えるのは Bash だけにする。ブレース展開をするシェルは Bash であって PowerShell ではなく、
+  // PowerShell の `@{x=1;y=2}` や `| % { $_.Name, $_.Id }` は引用符に囲まれていないので
+  // stripQuotedSpans では落ちない。展開版を足すだけなら材料が増えるだけで済んでいたが、
+  // markUndecidable が入って以降は打ち切りが即拒否になるため、保護ツリーに一切触れない
+  // ふつうの PowerShell が 5 個並べただけで拒否されていた(拒否側なら安全、が成り立たない)。
+  const braceTruncated = toolName === 'Bash'
     && rawTexts.some((t) => braceVariants(stripQuotedSpans(t)).truncated);
 
   // 相対パスの基準は cwd だけとは限らない(cwdCandidates のコメント)。
@@ -903,9 +919,14 @@ function violation(input, account, config, unlocked = [], notes = []) {
     const hits = targets.filter((t) => mentionsTree(t.value, rule.tree));
     if (hits.length) {
       if (!unlockCoversTargets(rule.tree, hits, scoped)) {
+        // 判定できなかったのか、配下だと分かったのかは呼び出し側にも伝える。理由文だけに
+        // 混ぜていた頃は、denyMessage の見出しが「操作の対象は配下です」と断定したまま
+        // 本文で「判定できません」と続き、読んだ側がどちらを信じればよいか分からなかった。
+        const undecidable = hits.some((t) => t.undecidable === 'brace');
         return {
           tree: rule.tree,
-          reason: hits.some((t) => t.undecidable === 'brace')
+          undecidable,
+          reason: undecidable
             ? `ブレース展開を展開しきれないため、対象が ${rule.tree} 配下かどうか判定できません`
             : `操作の対象が ${rule.tree} 配下です${runtimeNote}`,
           allow: rule.allow,
@@ -1028,11 +1049,20 @@ function denyMessage(hit, account) {
   if (hit.broken) return hit.homeUnresolved ? homeUnresolvedMessage() : brokenConfigMessage();
 
   const allowed = hit.allow.length ? hit.allow.join(' / ') : '(許可アカウントの設定なし)';
-  const head = [
-    `[account-guard] ${hit.tree} は別アカウント専用のツリーです。`,
-    `${hit.reason}が、現在ログイン中のアカウントは "${account}" です(許可: ${allowed})。`,
-    '',
-  ];
+  // 判定不能で拒否したときは見出しも「判定できなかった」にする。断定形の見出しのまま本文で
+  // 判定不能と続けると、対象が実際にツリー配下にあると読めてしまい、書き方を変えれば通ると
+  // 気づけない(実際には字面を判定できる形に直せば通る)。
+  const head = hit.undecidable
+    ? [
+      `[account-guard] 対象が ${hit.tree} 配下かどうか判定できないため拒否しました。`,
+      `${hit.reason}。${hit.tree} は別アカウント専用のツリーで、現在ログイン中のアカウントは "${account}" です(許可: ${allowed})。`,
+      '',
+    ]
+    : [
+      `[account-guard] ${hit.tree} は別アカウント専用のツリーです。`,
+      `${hit.reason}が、現在ログイン中のアカウントは "${account}" です(許可: ${allowed})。`,
+      '',
+    ];
 
   // 判別不能の原因が「credentials.js を隣に置き忘れた・形式が壊れている」ときは、
   // ログインし直しても直らない。ここで /login を促すと、正しいアカウントで入っている人に
@@ -1553,9 +1583,27 @@ function cmdLock(argv, account) {
       'Claude Code の中から実行してください(CLAUDE_CODE_SESSION_ID が空です)。',
     ]);
   }
-  const { sawPath, target, unknownOption } = parseUnlockArgs(argv);
+  const { sawPath, target, reason, unknownOption } = parseUnlockArgs(argv);
   if (unknownOption) return failUnknownOption(unknownOption);
   if (sawPath && !target) return failUnlock('[account-guard] --path にディレクトリを指定してください。');
+  // 裸の引数は捨てずに止める。unlock では理由が入る位置だが lock に理由は無く、`guard lock <dir>`
+  // と書いた人は範囲を絞ったつもりでいる。黙って捨てると sawPath が false のまま全部消して
+  // 「取り消しました」と返るので、取り違えに気づく機会がない(打ち間違いを弾く上の判定は
+  // `--paht` のようなオプション形しか拾えず、この形は素通りする)。
+  if (reason) {
+    return failUnlock([
+      `[account-guard] 範囲を指定するには --path が要ります(何もしていません): ${reason}`,
+      `範囲を絞るなら guard lock --path <dir>、このセッションの解除をすべて取り消すなら引数なしの guard lock です。`,
+    ]);
+  }
+  // --path の形も cmdUnlock と揃える。ここだけ緩いと `--path /org-tree/tool-a` が cwd 基準で
+  // 解決され、実際にはまだ開いている範囲に対して「解除はありません」と返っていた。
+  if (sawPath && !hasDriveLetter(target)) {
+    return failUnlock([
+      `[account-guard] --path はドライブ文字から始まる絶対パスで指定してください(受け取った値: ${target})。`,
+      '相対パスやドライブ文字を省いた形は、意図より広い範囲に効くことがあるため受け付けません。',
+    ]);
+  }
   const abs = sawPath ? path.resolve(target) : null;
 
   const now = Date.now();
