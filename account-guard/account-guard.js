@@ -305,12 +305,23 @@ function coveredByUnlock(value, unlocked) {
 // 切り詰められた参照(SAFE_TOKEN_END のコメント)も同じく通さない。前方一致は「先頭が
 // 範囲内なら全体も範囲内」と答えるが、切り詰められた文字列の続きは展開してみるまで
 // 分からず、範囲内である根拠がない。
+// 対象の参照が切り詰められていて、範囲内である根拠が得られないか。
+//
+// 「解除を通さない条件」と「拒否の見出しを判定不能にする条件」は同じものを指す。別々に
+// 書くと片方だけ直って食い違い、拒否はされるのに見出しは断定形、という読み手が判断を
+// 誤る状態になる(SAFE_TOKEN_END のコメントにある「印を 1 箇所で付けて双方に配る」と同じ理由)。
+function hasTruncatedRef(t, tree) {
+  if (t.kind === 'path') return t.truncated;
+  return treeRefsIn(t.value, tree).some((r) => r.truncated);
+}
+
 function unlockCoversTargets(tree, hits, unlocked) {
   if (!hits.length) return false;
   return hits.every((t) => {
-    if (t.kind === 'path') return !t.truncated && coveredByUnlock(t.value, unlocked);
+    if (hasTruncatedRef(t, tree)) return false;
+    if (t.kind === 'path') return coveredByUnlock(t.value, unlocked);
     const refs = treeRefsIn(t.value, tree);
-    return refs.length > 0 && refs.every((r) => !r.truncated && coveredByUnlock(r.value, unlocked));
+    return refs.length > 0 && refs.every((r) => coveredByUnlock(r.value, unlocked));
   });
 }
 
@@ -922,13 +933,21 @@ function violation(input, account, config, unlocked = [], notes = []) {
         // 判定できなかったのか、配下だと分かったのかは呼び出し側にも伝える。理由文だけに
         // 混ぜていた頃は、denyMessage の見出しが「操作の対象は配下です」と断定したまま
         // 本文で「判定できません」と続き、読んだ側がどちらを信じればよいか分からなかった。
-        const undecidable = hits.some((t) => t.undecidable === 'brace');
+        // 判定不能の原因は 2 通りある。ブレース展開を展開しきれなかった場合と、対象の指定が
+        // そこで終わっておらず(glob・カンマ・括弧が続く)切り出した文字列が先頭部分でしか
+        // ない場合。後者を見ていなかったため、切り詰めで拒否したときだけ見出しが断定形に
+        // 戻り、書き方を直せば通ると気づけなかった。
+        const braceHit = hits.some((t) => t.undecidable === 'brace');
+        const truncatedHit = hits.some((t) => hasTruncatedRef(t, rule.tree));
+        const undecidable = braceHit || truncatedHit;
         return {
           tree: rule.tree,
           undecidable,
-          reason: undecidable
+          reason: braceHit
             ? `ブレース展開を展開しきれないため、対象が ${rule.tree} 配下かどうか判定できません`
-            : `操作の対象が ${rule.tree} 配下です${runtimeNote}`,
+            : truncatedHit
+              ? `対象の指定がそこで終わっておらず、実際に触る場所を特定できないため、${rule.tree} 配下かどうか判定できません`
+              : `操作の対象が ${rule.tree} 配下です${runtimeNote}`,
           allow: rule.allow,
           // cwd はこのツリーの内側ではないが、別の保護ツリーの内側かもしれない。
           cwdTree,

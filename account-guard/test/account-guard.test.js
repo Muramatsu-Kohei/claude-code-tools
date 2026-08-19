@@ -1697,6 +1697,13 @@ const TOOL_B = 'C:/org-tree/tool-b';
   res = shell(`cat ${TOOL_A}[bc]/secret`);
   check('glob のブラケットで兄弟に届く形は拒否する', decision(res) === 'deny', JSON.stringify(res));
 
+  // 切り詰めで拒否したときは見出しも「判定できない」でなければならない。断定形のままだと
+  // 「配下だと分かった」と読め、字面を判定できる形に直せば通ることに気づけない。ブレース展開は
+  // 別経路(undecidable: 'brace')で既に判定不能にしていたので、こちらだけが断定形に戻っていた。
+  const truncatedReason = res?.hookSpecificOutput?.permissionDecisionReason ?? '';
+  check('切り詰めの拒否は見出しも判定不能にする',
+    /判定できないため拒否/.test(truncatedReason), truncatedReason);
+
   res = shell(`cat ${TOOL_A},bc/secret`);
   check('カンマで名前が続く形は拒否する', decision(res) === 'deny', JSON.stringify(res));
 
