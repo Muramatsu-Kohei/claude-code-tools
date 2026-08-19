@@ -39,28 +39,47 @@ const STATE_DIR = path.join(DIR, 'guard-state');
 // 各枠を2段構えで見る。1段目で気付かせ、無視されても2段目で最後にもう一度促す。
 // 1段目だけだと、そこで作業を続ける判断をしたセッションは警告なしで上限に激突する。
 //
-// 閾値はアカウントごとに上書きできる。枠の容量比(5h枠1本が週次の何%を食うか)は
-// プランによって違うため、下の既定値をそのまま全アカウントに当てると余裕の見積もりを
-// 誤る。`CLAUDE_USAGE_GUARD_WEEK_THRESHOLD_PRO` のようにアカウント名のサフィックスを
-// 付けた環境変数があればそれを優先し、無ければ全アカウント共通の値を使う。
+// 閾値はアカウントごとに変わる。枠の容量比(5h枠1本が週次の何%を食うか)がプランで
+// 違うため、同じ「残り x%」でも意味が違う。既定値は下の DEFAULTS に実測から置き、
+// `CLAUDE_USAGE_GUARD_WEEK_THRESHOLD_MAX` のようにアカウント名のサフィックスを付けた
+// 環境変数か、サフィックス無しの共通変数があればそちらを優先する。
+//
+// 既定値の根拠(usage-tracker のログ 2026-07-31〜08-19 の実測。analyze.js で再計算できる):
+//   5h枠1本を使い切ったときに進む週次 pt … team 12.4 / max 9.8 / pro 9.8
+//   → 週次枠が持つ 5h枠の本数        … team  8.0 / max 10.3 / pro 10.2
+//   1リクエストあたりの消費          … 5h枠 平均 1.5pt / 週次 平均 0.1pt
+// 週次の1段目は「残りが 5h枠1本を切ったら知らせる」を狙う。旧既定の 85% は Team 時代に
+// 決めた値だが、どのプランでも残り 15% は 5h枠 1.2〜1.5 本分あり、まだ数時間は普通に
+// 作業できる段階で促してしまっていた(容量の大きい max ほどこのずれが大きい)。
+const DEFAULTS = {
+  // 週次 90% で残り 12.4pt ≒ 5h枠ちょうど1本。
+  team: { five: 92, fiveFinal: 97, week: 90, weekFinal: 97 },
+  // 週次 92% で残り 9.8pt ≒ 5h枠ちょうど1本。
+  max: { five: 92, fiveFinal: 97, week: 92, weekFinal: 97 },
+  pro: { five: 92, fiveFinal: 97, week: 92, weekFinal: 97 },
+};
+// 未知のアカウントは実測が無いので、最も容量の小さい team の値を当てて安全側に倒す。
+const BASE = DEFAULTS[ACCOUNT] || DEFAULTS.team;
+
 function threshold(name, fallback) {
   const suffix = /^[a-zA-Z0-9_]+$/.test(ACCOUNT) ? `${name}_${ACCOUNT.toUpperCase()}` : null;
   return Number(suffix && process.env[suffix]) || Number(process.env[name]) || fallback;
 }
 
-// 5h枠は既定 90%。/wrap を完走させる余裕を残しつつ、早すぎて邪魔にならない値。
-const FIVE_THRESHOLD = threshold('CLAUDE_USAGE_GUARD_THRESHOLD', 90);
-const FIVE_FINAL = threshold('CLAUDE_USAGE_GUARD_FINAL_THRESHOLD', 97);
-// 週次枠の1段目は既定 85%。Team アカウントでの実測「5h枠を満タンにすると週次が約12%
-// 進む」に基づく値で、15% 残っていれば満タン1回強の余裕がある。ここではまだ畳ませず、
-// 残量だけ意識させる。他プランでこの比率が違う場合は上記のサフィックス付き環境変数で
-// 調整する(analyze.js をアカウント別に走らせれば実測値が出る)。
-const WEEK_THRESHOLD = threshold('CLAUDE_USAGE_GUARD_WEEK_THRESHOLD', 85);
-// 週次枠の2段目は既定 97%。5h枠のガードは週次枠切れを一切防げない(週次が尽きるとき
-// 5h枠は低いままでありうる)ため、この段がないと週次の枠切れは必ず予告なしに来る。
-// 週次1pt は 5h枠の約8.3pt に相当するので、残り3%あれば /wrap には桁違いに足りる。
-// 99% にしないのは、使用率が整数で返るうえ collect-state に最大15分の遅れがあるため。
-const WEEK_FINAL = threshold('CLAUDE_USAGE_GUARD_WEEK_FINAL_THRESHOLD', 97);
+// 5h枠の1段目。実測では 90% から枠切れまで中央 11〜12 分・最短 4 分しかなく、ここは
+// 「余裕がある段階」ではないので大きくは上げられない。92% でも中央 9 分は残り、/wrap
+// 1回(数リクエスト = 5h枠で 5〜10pt)には間に合う。
+const FIVE_THRESHOLD = threshold('CLAUDE_USAGE_GUARD_THRESHOLD', BASE.five);
+// 5h枠の2段目。95% を超えると枠切れまで 0 分のことがあるため、これ以上は上げない。
+const FIVE_FINAL = threshold('CLAUDE_USAGE_GUARD_FINAL_THRESHOLD', BASE.fiveFinal);
+// 週次枠の1段目。ここではまだ畳ませず、残量だけ意識させる。
+const WEEK_THRESHOLD = threshold('CLAUDE_USAGE_GUARD_WEEK_THRESHOLD', BASE.week);
+// 週次枠の2段目。5h枠のガードは週次枠切れを一切防げない(週次が尽きるとき 5h枠は低い
+// ままでありうる)ため、この段がないと週次の枠切れは必ず予告なしに来る。週次1pt は
+// 5h枠の約 8〜10pt に相当するので、残り3%あれば /wrap には桁違いに足りる。99% にしない
+// のは、使用率が整数で返るうえ collect-state に最大15分の遅れがあるため(実測で週次は
+// 30分に最大 7〜10pt 進むので、98% では気付いた時点で尽きていることがある)。
+const WEEK_FINAL = threshold('CLAUDE_USAGE_GUARD_WEEK_FINAL_THRESHOLD', BASE.weekFinal);
 // collect.js のハートビートは10分間隔。それを超えて古い値は信用しない。
 // 古い値で促すと、枠が切り替わった直後に誤発火しかねない。
 const STALE_MS = 15 * 60 * 1000;
