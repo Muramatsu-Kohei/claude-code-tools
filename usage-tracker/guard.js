@@ -47,13 +47,13 @@ const STATE_DIR = path.join(DIR, 'guard-state');
 // 環境変数か、サフィックス無しの共通変数があればそちらを優先する。
 //
 // 既定値の根拠(usage-tracker のログ 2026-07-31〜08-19 の実測。analyze.js で再計算できる):
-//   5h枠1本を使い切ったときに進む週次 pt … team 12.4 / max 9.8 / pro 9.8
+//   5h枠1本を使い切ったときに進む週次 pt … team 12.4 / max 9.7 / pro 9.8
 //   → 週次枠が持つ 5h枠の本数        … team  8.0 / max 10.3 / pro 10.2
 //   1リクエストあたりの消費          … 5h枠 平均 1.5pt / 週次 平均 0.1pt
 // 週次の1段目は「残りが 5h枠1本前後になったら知らせる」を狙う。旧既定の 85% は Team
 // 時代に決めた値だが、どのプランでも残り 15% は 5h枠 1.2〜1.5 本分あり、まだ数時間は
 // 普通に作業できる段階で促してしまっていた(容量の大きい max ほどこのずれが大きい)。
-// 現行値はちょうど1本の点(team 87.6% / max・pro 90.2%)ではなく、その少し先の
+// 現行値はちょうど1本の点(team 87.6% / max 90.3% / pro 90.2%)ではなく、その少し先の
 // 約 0.8 本に置いてある。週次には最終段(97%)が控えていて取りこぼしても最後にもう一度
 // 促せるため、1段目を厳密に1本へ合わせる利得は小さい。それより早すぎる警告を毎回
 // 無視する習慣がつく方が高くつく。
@@ -69,7 +69,12 @@ const DEFAULTS = {
 // 素の [] で引くと `constructor` のようなプロトタイプのキーで Object 自身を掴む。すると
 // BASE.five 等が全て undefined になり、閾値が定まらずどの段も発火しない — 安全側に
 // 倒すための行が、ガードを黙って丸ごと無効にする形で裏切る。自前のキーだけを見る。
-const BASE = Object.prototype.hasOwnProperty.call(DEFAULTS, ACCOUNT) ? DEFAULTS[ACCOUNT] : DEFAULTS.team;
+//
+// 併せて小文字に寄せてから引く。下の threshold() は環境変数名を toUpperCase() で作るため、
+// 大小の揺れた値(`Max` 等)が来ると「環境変数での上書きは効くのに既定値だけ team に
+// 落ちる」というちぐはぐな状態になる。両方の経路が同じ正規化を通るようにする。
+const ACCOUNT_KEY = String(ACCOUNT).toLowerCase();
+const BASE = Object.prototype.hasOwnProperty.call(DEFAULTS, ACCOUNT_KEY) ? DEFAULTS[ACCOUNT_KEY] : DEFAULTS.team;
 
 function threshold(name, fallback) {
   const suffix = /^[a-zA-Z0-9_]+$/.test(ACCOUNT) ? `${name}_${ACCOUNT.toUpperCase()}` : null;

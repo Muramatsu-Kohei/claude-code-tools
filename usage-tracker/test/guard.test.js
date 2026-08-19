@@ -124,9 +124,14 @@ console.log('\nアカウント別の既定閾値(週次枠)');
 {
   const home = sandbox('week-team', 'team');
   writeState(home, 'team', { seven: 89 });
-  check('team: 89% では促さない', message(run(home, { sid: 'a' })) === '', run(home, { sid: 'a' }).out);
+  // 実行結果は変数に取ってから check に渡す。第3引数(失敗時の手掛かり)はその場で
+  // 評価されるので、そこで guard を呼び直すと同じ sid の2回目になり、発火フラグが
+  // 立っている分だけ空文字が返る — 落ちたときに限って手掛かりが消える。
+  const below = message(run(home, { sid: 'a' }));
+  check('team: 89% では促さない', below === '', below);
   writeState(home, 'team', { seven: 90 });
-  check('team: 90% で促す', message(run(home, { sid: 'b' })).includes('週次枠: 90%'), message(run(home, { sid: 'c' })));
+  const at = message(run(home, { sid: 'b' }));
+  check('team: 90% で促す', at.includes('週次枠: 90%'), at);
 }
 {
   const home = sandbox('week-max', 'max');
@@ -148,6 +153,15 @@ console.log('\nアカウント別の既定閾値(週次枠)');
   const home = sandbox('week-proto', 'constructor');
   writeState(home, 'constructor', { seven: 90 });
   check('プロトタイプのキー名でも team の閾値に倒れる', message(run(home, { sid: 'a' })).includes('週次枠: 90%'));
+}
+{
+  // subscriptionType の大小は保証されていない。環境変数のサフィックスは toUpperCase() で
+  // 作るため大小の揺れを吸収するので、既定値の側だけ完全一致だと「上書きは効くのに
+  // 既定値は team に落ちる」というちぐはぐな状態になる。91% は team なら促す値。
+  const home = sandbox('week-case', 'Max');
+  writeState(home, 'Max', { seven: 91 });
+  const m = message(run(home, { sid: 'a' }));
+  check('大文字混じりのアカウント名でも max の閾値が効く', m === '', m);
 }
 
 console.log('\n既定閾値(5時間枠)');
