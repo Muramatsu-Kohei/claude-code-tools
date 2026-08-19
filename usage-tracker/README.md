@@ -186,7 +186,7 @@ node transcript/sessions.js
 node transcript/turncost.js
 node transcript/breakdown.js
 node test/run.js               # test/*.test.js を一括実行(偽 HOME を使うので実データは読まない)
-node test/run.js transcript    # 名前の一部で絞って実行
+node test/run.js guard         # 名前の一部で絞って実行
 node test/transcript.test.js   # 1 ファイルだけ実行したいとき
 ```
 

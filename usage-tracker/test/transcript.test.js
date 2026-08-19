@@ -11,8 +11,8 @@ const { execFileSync } = require('child_process');
 const lib = require('../transcript/lib');
 
 // .tmp 直下ではなく自分専用のサブディレクトリを使う(account-guard / claude-worklog と同じ規約)。
-// テストファイルが1本しかない間は実害が出ないが、2本目が増えた瞬間に他スイートのサンドボックスを
-// 実行中に消す事故が再現する(account-guard/test/account-guard.test.js:15-18 参照)。
+// guard.test.js が同じ .tmp を使うので、直下を消すと他スイートのサンドボックスを実行中に
+// 巻き添えで消す(account-guard/test/account-guard.test.js:15-18 が記録した事故と同型)。
 const BASE = path.join(__dirname, '.tmp', 'transcript');
 const TRANSCRIPT = path.join(__dirname, '..', 'transcript');
 fs.rmSync(BASE, { recursive: true, force: true });
