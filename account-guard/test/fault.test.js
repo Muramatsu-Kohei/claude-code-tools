@@ -265,9 +265,25 @@ console.log(`  (${CASES} ケース, ${((Date.now() - startedAt) / 1000).toFixed(
     //              ないので、操作列の warmup は必ず --yes 付きで走り、この経路自体を通らない
     //              (通らない呼び出しに故障を注入しても、現実には起きない状態を作るだけ)。
     ['swap.js', new Set(['writeSync', 'readSync'])],
-    // status の表示にだけ使うフォールバック。内部で例外を握りつぶす API なので、throw を
-    // 注入しても現実には起きない状態を作ることになる。
-    ['account-guard.js', new Set(['existsSync'])],
+    // existsSync    … status の表示にだけ使うフォールバック。内部で例外を握りつぶす API なので、
+    //                  throw を注入しても現実には起きない状態を作ることになる。
+    // appendFileSync … 解除の履歴(unlock.log)への追記にだけ使う。呼び出し側が try/catch で
+    //                  握り潰す設計で、書けなくても解除の成否は変わらない(履歴を書けないことを
+    //                  理由に解除を失敗させると、本筋と無関係な行き止まりを作る)。加えてこの
+    //                  property test が回す操作列は swap.js のサブコマンドで、解除の経路自体を
+    //                  通らない。解除そのものの状態を書く writeFileSync / renameSync は
+    //                  WRAPPED_CALLS 側にあるので、書き込みの故障が検査から漏れるわけではない。
+    // openSync / statSync / closeSync / writeSync … 解除の状態ファイルを読み書きするあいだの
+    //                  ロック(withUnlockLock)にだけ使う。appendFileSync と同じくこの property
+    //                  test の操作列(swap.js のサブコマンド)は通らない経路であることに加え、
+    //                  ここが失敗しても状態ファイルは書き換わらない ―― ロックを取れなければ中の
+    //                  読み書きを呼ばずに失敗するので、壊れ方は「解除できない」だけで、
+    //                  保護が緩む向きには倒れない。writeSync はロックに自分の印を書くためだけに
+    //                  使い、書けなければ解放のときに「自分のロックではない」と判断されるだけ
+    //                  (自分のロックを消し残す = LOCK_STALE_MS 後に奪われる、で止まる)。
+    //                  印を読み直す側の readFileSync は WRAPPED_CALLS にあるので、読めない
+    //                  ときに他人のロックを消さないことは注入で確かめられる。
+    ['account-guard.js', new Set(['existsSync', 'appendFileSync', 'openSync', 'statSync', 'closeSync', 'writeSync'])],
     // credentials.js は existsSync を呼んでいない。probeFile の説明コメントが「fs.existsSync を
     // 使わない」理由を書いており、その文字列を下の正規表現が拾うだけ。コメントを削ってから
     // 拾う手もあるが、削りすぎれば本物の呼び出しを見逃す(危険側に倒れる)ので、拾いすぎた
