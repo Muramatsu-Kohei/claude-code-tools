@@ -519,14 +519,31 @@ function cwdCandidates(texts, cwd) {
 // ように選択肢を 32 個並べる、`{a,{b,{c,{d,{e,<ツリー名>}}}}}` のように 5 段重ねる、の
 // どちらでも素通りした)。上限を上げても同じ手が使えるので、打ち切りは「判定できなかった」
 // として扱い、拒否側に倒すしかない(targetStrings の undecidable)。
-// シェルが実際に展開するのは引用符の外のブレースだけ。引用符を外した文字列で数えると、
-// JS / JSON のオブジェクトリテラル・jq のフィルタ・PowerShell のスクリプトブロックまで
-// ブレースとして数えられ、5 個並んだだけで「判定できない」に倒れていた(そのどれもシェルは
-// 展開しない)。閉じない引用符はそこから先を丸ごと囲みと見なす ―― 展開されないという結論は
-// 同じなので、数え方としてはこれで足りる。
-const stripQuotedSpans = (text) => text.replace(/"[^"]*"?|'[^']*'?|`[^`]*`?/g, ' ');
+// 数える対象は「シェルが展開するブレース」に絞る。JS / JSON のオブジェクトリテラルや
+// jq のフィルタ・PowerShell のスクリプトブロックも `{...}` にカンマを含むが、シェルはこれを
+// 展開しない ―― 一緒に数えると数個並んだだけで上限に達し、保護ツリーに一切触れない
+// コマンドが「判定できない」で拒否される。
+//
+// 引用符の外だけを数えていた頃は、この選別を「引用符に囲まれているか」で代用していた。
+// ところが引用符の中もラッパー越しに展開される ―― `bash -c "… {a,b} …"` の中身は内側の
+// シェルが展開するのに、数える側からは丸ごと消えていた。展開する側(texts)は引用符を
+// 外してから展開するので、上限を超えた展開が黙って捨てられ、「ツリー名をブレースで割る」
+// 手(上のコメント)が引用符の中に対してだけ生き残っていた。
+//
+// 代わりに中身の形で選別する。シェルのブレース展開に書く選択肢はそのままパスの一部になるので、
+// 空白も引用符も含まないのがふつう。逆に JSON / jq はどの選択肢にも引用符か空白が入る。
+// 「すべての選択肢が該当する」ことを条件にするのは、1 つでも素の選択肢があれば展開の側
+// (= 数える側 = 拒否側)に倒すため。`{org-tre,"x"}` のような混ぜ方では逃げられない。
+const DATA_ALTERNATIVE = /["\s]/;
+const BRACE_ALTERNATION = /\{([^{}]*,[^{}]*)\}/g;
 
-const BRACE_ALTERNATION = /\{([^{}]*,[^{}]*)\}/;
+// 左から順に見て、シェルが展開するブレースの最初の 1 つを返す。無ければ null。
+function firstShellBrace(text) {
+  for (const m of text.matchAll(BRACE_ALTERNATION)) {
+    if (!m[1].split(',').every((alt) => DATA_ALTERNATIVE.test(alt))) return m;
+  }
+  return null;
+}
 // 上限は「打ち切りが即拒否になる」ことを踏まえて決める。本数は各段の累積で数えるので、2 択の
 // グループ n 個で 2+4+…+2^n になり、32 では 4 グループで頭打ちだった ―― `mkdir -p a/{x,y}
 // b/{x,y} c/{x,y} d/{x,y} e/{x,y}` のように保護ツリーに一切触れないふつうの Bash が拒否される。
@@ -541,7 +558,7 @@ function braceVariants(text) {
   for (let depth = 0; depth < BRACE_MAX_DEPTH; depth++) {
     const next = [];
     for (const t of frontier) {
-      const m = BRACE_ALTERNATION.exec(t);
+      const m = firstShellBrace(t);
       if (!m) continue;
       for (const alt of m[1].split(',')) {
         next.push(t.slice(0, m.index) + alt + t.slice(m.index + m[0].length));
@@ -556,7 +573,7 @@ function braceVariants(text) {
   }
   // 本数の上限に当たらずに抜けても、深さの上限で展開しきれていないことがある。展開の
   // 打ち切りはこの 2 経路しかないので、どちらも同じ印にまとめる。
-  return { variants: out, truncated: frontier.some((t) => BRACE_ALTERNATION.test(t)) };
+  return { variants: out, truncated: frontier.some((t) => firstShellBrace(t) !== null) };
 }
 
 // markUndecidable は「対象を判定できなかった」印(下の braceTruncated)を混ぜてよいかどうか。
@@ -613,20 +630,22 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
   // 判定材料に増やしてしまう。PowerShell は実際にはブレース展開しないが、展開版を足すだけなら
   // 判定材料が増えるだけなので Bash と分けない(展開しきれなかったときの印は別。即拒否に
   // つながるので Bash に限る ―― 下の braceTruncated 参照)。
-  if (isShell) {
-    for (const t of [...texts]) texts.push(...braceVariants(t).variants);
-  }
-  // 打ち切りの有無は引用符の外にあるブレースだけで数える(stripQuotedSpans のコメント)。
-  // 展開そのものは引用符を外した文字列に対して行ってよい ―― 判定材料が増える向きの誤りなので
-  // 保護が緩むことはない。数え方だけを実際に展開される範囲に合わせる。
   //
-  // 数えるのは Bash だけにする。ブレース展開をするシェルは Bash であって PowerShell ではなく、
-  // PowerShell の `@{x=1;y=2}` や `| % { $_.Name, $_.Id }` は引用符に囲まれていないので
-  // stripQuotedSpans では落ちない。展開版を足すだけなら材料が増えるだけで済んでいたが、
-  // markUndecidable が入って以降は打ち切りが即拒否になるため、保護ツリーに一切触れない
-  // ふつうの PowerShell が 5 個並べただけで拒否されていた(拒否側なら安全、が成り立たない)。
-  const braceTruncated = toolName === 'Bash'
-    && rawTexts.some((t) => braceVariants(stripQuotedSpans(t)).truncated);
+  // 打ち切りは展開そのものから受け取る。別の文字列で数え直すと、展開した側と数えた側が
+  // 食い違い、その差がそのまま抜け道になる(firstShellBrace のコメント)。
+  //
+  // 数えるのは Bash だけにする。ブレース展開をするシェルは Bash であって PowerShell ではない。
+  // 展開版を足すだけなら判定材料が増えるだけで済んでいたが、markUndecidable が入って以降は
+  // 打ち切りが即拒否になるため、保護ツリーに一切触れないふつうの PowerShell が並べただけで
+  // 拒否されていた(拒否側なら安全、が成り立たない)。
+  let braceTruncated = false;
+  if (isShell) {
+    for (const t of [...texts]) {
+      const expanded = braceVariants(t);
+      texts.push(...expanded.variants);
+      if (toolName === 'Bash' && expanded.truncated) braceTruncated = true;
+    }
+  }
 
   // 相対パスの基準は cwd だけとは限らない(cwdCandidates のコメント)。
   const bases = cwdCandidates(texts, cwd);
@@ -795,24 +814,36 @@ function isUnlockStateWrite(input) {
   if (homeUnresolved) return false;
   const tool = input.tool_name;
   if (READ_ONLY_TOOLS.has(tool)) return false;
-  // trees に UNLOCKS を渡すと、シェルのコマンド文字列中の裸のファイル名(`unlocks.json`)も
+  // trees に状態ファイルを渡すと、シェルのコマンド文字列中の裸のファイル名(`unlocks.json`)も
   // cwd 基準で解決される。別の場所の同名ファイルは違うパスに解決されるので巻き込まない。
   // 裸の名前を拾うのはシェルだけ(targetStrings のコメント)だが、それ以外のツールは操作対象が
   // パスのフィールドに入っており、そこに書かれた `unlocks.json` は同じく cwd 基準で解決される
   // ので取りこぼしはない。
   // kind が 'text'(シェルのコマンド文字列そのもの)は見ない。文字列全体が状態ファイルの
   // パスと完全一致することはないうえ、ここで部分一致を採ると単に言及しただけで拒否される。
-  const target = normalize(UNLOCKS);
+  //
+  // 履歴(unlock.log)も同じ扱いにする。誰がいつ何のために解除したかを後から確かめるための
+  // 記録で、この設計は「ユーザーが `!` で打った」ことに全体重を預けている ―― 記録を書き換え
+  // られると、その確かめようがなくなる。読み取りは READ_ONLY_TOOLS 側で通したままにする。
+  const targets = [normalize(UNLOCKS), normalize(UNLOCK_LOG)];
   const guardDir = normalize(GUARD_DIR);
-  return targetStrings(tool, input.tool_input ?? {}, input.cwd, [UNLOCKS]).some((t) => {
+  return targetStrings(tool, input.tool_input ?? {}, input.cwd, [UNLOCKS, UNLOCK_LOG]).some((t) => {
     if (t.kind !== 'path') return false;
     const value = normalize(t.value);
+    // ガード自身のディレクトリを指しているものは、それだけで書き込み扱いにする。ファイル名まで
+    // 一致することを求めていた頃は、ディレクトリ宛ての書き込みが丸ごと素通りしていた ――
+    // `cp <偽の unlocks.json> ~/.claude/account-guard/` は cp がファイル名を補うので、
+    // 状態ファイルを名指ししないまま置き換えられた(同じ操作を `cd` してファイル名で書けば
+    // 拒否されるので、書き方だけで結論が変わっていた)。
+    if (value === guardDir) return true;
     // 切り詰められたトークン(SAFE_TOKEN_END のコメント)は実際に書かれるパスの先頭部分でしか
     // ないので、完全一致では捉えられない。`unlocks{.json,}` や `unlocks[.]json` のように末尾を
     // 展開で作る形が、それだけで素通りしていた。前方一致に緩めるのはガード自身のディレクトリを
     // 指しているときに限る ―― 無条件に緩めると `ls C:/{a,b}` のような `C:/` で切り詰められた
     // トークンまで状態ファイルへの書き込み扱いになる。
-    return t.truncated ? value.startsWith(guardDir) && target.startsWith(value) : value === target;
+    return t.truncated
+      ? value.startsWith(guardDir) && targets.some((target) => target.startsWith(value))
+      : targets.includes(value);
   });
 }
 
@@ -896,6 +927,12 @@ function violation(input, account, config, unlocked = [], notes = []) {
   const runtimeNote = runtimeCd ? '(cd の移動先が実行時に決まるため、一時解除を適用できません)' : '';
 
   const targets = targetStrings(input.tool_name, input.tool_input, cwd, config.rules.map((r) => r.tree), true);
+  // どのフィールドが操作対象か分からないツール(MCP のファイルシステム系など)は、入力を
+  // JSON にしてから拾う。トークンは必ず JSON の `"` で終わるので SAFE_TOKEN_END から見れば
+  // 常に切り詰め扱いになり、解除の範囲判定を通らない ―― これは意図した設計(hasRuntimeCd の
+  // コメント)だが、拒否の文面まで「指定がそこで終わっている」と説明すると、書き換えれば
+  // 通るように読める。実際には書き換えようがないので、理由の側を分ける。
+  const opaqueTool = !PATH_FIELDS[input.tool_name] && !COMMAND_FIELDS[input.tool_name];
 
   // 案内する swap は Bash 経由なので、cwd が拒否対象ツリーの内側だとその呼び出し自体が
   // 同じ判定に当たって拒否される。当たったルールが cwd を含むとは限らない(別の保護ツリーに
@@ -940,14 +977,18 @@ function violation(input, account, config, unlocked = [], notes = []) {
         const braceHit = hits.some((t) => t.undecidable === 'brace');
         const truncatedHit = hits.some((t) => hasTruncatedRef(t, rule.tree));
         const undecidable = braceHit || truncatedHit;
+        let reason = `操作の対象が ${rule.tree} 配下です${runtimeNote}`;
+        if (braceHit) {
+          reason = `ブレース展開を展開しきれないため、対象が ${rule.tree} 配下かどうか判定できません`;
+        } else if (truncatedHit) {
+          reason = opaqueTool
+            ? `このツールは入力の形が決まっておらず、対象の指定がどこで終わるかを特定できないため、${rule.tree} 配下かどうか判定できません`
+            : `対象の指定がそこで終わっておらず、実際に触る場所を特定できないため、${rule.tree} 配下かどうか判定できません`;
+        }
         return {
           tree: rule.tree,
           undecidable,
-          reason: braceHit
-            ? `ブレース展開を展開しきれないため、対象が ${rule.tree} 配下かどうか判定できません`
-            : truncatedHit
-              ? `対象の指定がそこで終わっておらず、実際に触る場所を特定できないため、${rule.tree} 配下かどうか判定できません`
-              : `操作の対象が ${rule.tree} 配下です${runtimeNote}`,
+          reason,
           allow: rule.allow,
           // cwd はこのツリーの内側ではないが、別の保護ツリーの内側かもしれない。
           cwdTree,

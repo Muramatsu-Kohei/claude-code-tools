@@ -1505,6 +1505,34 @@ const TOOL_B = 'C:/org-tree/tool-b';
   res = call('MultiEdit', { file_path: file, edits: [] });
   check('MultiEdit からの状態ファイル書き込みも拒否する', decision(res) === 'deny', JSON.stringify(res));
 
+  // 宛先がディレクトリの書き込みは、コマンド文字列にファイル名が現れない。完全一致だけを
+  // 見ていた頃は `cp <偽の unlocks.json> ~/.claude/account-guard/` がそのまま通り、状態ファイルを
+  // 名指ししないまま置き換えられた(同じ操作を cd してファイル名で書けば拒否されていたので、
+  // 書き方だけで結論が変わっていた)。
+  res = call('Bash', { command: 'cp /tmp/x ~/.claude/account-guard/' });
+  check('ディレクトリ宛ての書き込みも拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = call('Bash', { command: 'mv /tmp/x ~/.claude/account-guard' });
+  check('末尾に区切りが無いディレクトリ宛ても拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // 過剰検出は承知のうえ。書き込みかどうかはコマンドを解釈しないと分からず、解釈を増やすほど
+  // 「その解釈から漏れた書き方」が穴になる。言及しただけのコマンドが止まる実害は、そのコマンドを
+  // 打てないことだけで、読むだけなら Read / Glob / Grep が通る。
+  res = call('Bash', { command: 'ls ~/.claude/account-guard/' });
+  check('ディレクトリを言及しただけでも止める(過剰検出は許容)', decision(res) === 'deny', JSON.stringify(res));
+
+  // 履歴は「誰がいつ何のために解除したか」を後から確かめる唯一の手掛かりで、この設計は
+  // 「ユーザーが `!` で打った」ことに全体重を預けている。書き換えられるとその確かめようがない。
+  const logFile = path.join(path.dirname(file), 'unlock.log');
+  res = call('Write', { file_path: logFile, content: '' });
+  check('解除の履歴への書き込みも拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = call('Bash', { command: 'echo x >> ~/.claude/account-guard/unlock.log' });
+  check('履歴への追記も拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = call('Read', { file_path: logFile });
+  check('履歴の読み取りは止めない', decision(res) === null, JSON.stringify(res));
+
   // 同名でも別の場所のファイルは巻き込まない。
   res = call('Write', { file_path: 'C:/claude/ClaudeCode/unlocks.json', content: '{}' });
   check('別の場所にある同名ファイルは巻き込まない', decision(res) === null, JSON.stringify(res));
@@ -1704,6 +1732,18 @@ const TOOL_B = 'C:/org-tree/tool-b';
   check('切り詰めの拒否は見出しも判定不能にする',
     /判定できないため拒否/.test(truncatedReason), truncatedReason);
 
+  // どのフィールドが操作対象か分からないツールは入力を JSON にしてから拾うので、トークンは
+  // 必ず JSON の `"` で終わり、常に切り詰め扱いになる ―― 解除が効かないのは意図した設計だが、
+  // 理由まで「指定がそこで終わっている」と説明すると、書き方を直せば通るように読める。
+  // 直しようがないので、この場合だけ別の文面にする。拒否そのものは変わらない。
+  const opaque = runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/claude/ClaudeCode',
+    tool_name: 'mcp__fs__read_file', tool_input: { path: `${TOOL_A}/x.py` },
+  });
+  check('知らないツールは解除の範囲内でも拒否する', decision(opaque) === 'deny', JSON.stringify(opaque));
+  check('知らないツールの理由は書き換えを促さない',
+    /入力の形が決まっておらず/.test(reasonOf(opaque)), reasonOf(opaque));
+
   res = shell(`cat ${TOOL_A},bc/secret`);
   check('カンマで名前が続く形は拒否する', decision(res) === 'deny', JSON.stringify(res));
 
@@ -1873,8 +1913,9 @@ const TOOL_B = 'C:/org-tree/tool-b';
   check('保護ツリーに触れない 5 グループのブレースは通す', decision(res) === null, JSON.stringify(res));
 
   // ブレース展開をするのは Bash であって PowerShell ではない。PowerShell のハッシュテーブルや
-  // パイプのスクリプトブロックは引用符に囲まれていないので stripQuotedSpans では落ちず、
-  // 打ち切りとして数えると、保護ツリーと無関係なふつうのコマンドが判定不能で拒否される。
+  // パイプのスクリプトブロックは中身の形が展開されるブレースと見分けられない(どの選択肢にも
+  // 引用符も空白も無い)ので、シェルの種類で落とさないと、保護ツリーと無関係なふつうの
+  // コマンドが判定不能で拒否される。
   const ps = (command) => runInSession(home, {
     hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/claude/ClaudeCode',
     tool_name: 'PowerShell', tool_input: { command },
@@ -1884,10 +1925,32 @@ const TOOL_B = 'C:/org-tree/tool-b';
   res = ps('Get-Process | ? { $_.Id -gt 1, 2 } | % { $_.Name, $_.Id } | % { $_, 1 } | % { $_, 2 } | % { $_, 3 }');
   check('PowerShell のスクリプトブロックは打ち切りに数えない', decision(res) === null, JSON.stringify(res));
 
-  // 引用符の中のブレースはシェルが展開しない。数に入れると、JS のオブジェクトリテラルや
-  // jq のフィルタ・PowerShell のスクリプトブロックを含むコマンドが判定不能扱いになる。
+  // 引用符の中にもブレースを書くコマンドはふつうにある。数える対象から落とすのではなく、
+  // 上限の内側で展開しきれる限りは通す(落とすと下のラッパーの穴が開く)。
   res = shell('node -e "const a={x:1,y:2}; const b={p:3,q:4}; const c={r:5,s:6}; const d={t:7,u:8}; const e={v:9,w:0};"');
-  check('引用符の中のブレースは打ち切りに数えない', decision(res) === null, JSON.stringify(res));
+  check('引用符の中のブレースも上限の内側なら通す', decision(res) === null, JSON.stringify(res));
+
+  // 引用符の中でも、ラッパーに渡した文字列は内側のシェルが展開する。数える側から引用符の中を
+  // 丸ごと落としていた頃は、展開する側(引用符を外してから展開する)との差がそのまま抜け道に
+  // なっていた ―― `bash -c` の中で選択肢を並べて上限を超えさせると、打ち切りが無印のまま
+  // 捨てられ、ツリー名を割ったまま拒否をすり抜けられた。引用符の外に同じものを書けば拒否
+  // されるので、これも書き方だけで結論が変わる形だった。
+  res = shell('bash -c "echo x{1,2}{1,2}{1,2}{1,2}{1,2}{1,2}{1,2}{1,2}{1,2} ; cat C:/{org-tre,other}e/secret"');
+  // 拒否だけでは足りない。数え方を旧実装(引用符の外だけ)に戻しても、展開しきれた別の変種が
+  // ツリーに当たって拒否されることがあり、それだと穴が開いたまま緑になる。「判定できなかった
+  // から拒否した」という理由まで見て、打ち切りが印として残ったことを確かめる。
+  check('ラッパーに渡した引用符の中の打ち切りも判定不能にする',
+    decision(res) === 'deny' && /判定できないため拒否/.test(reasonOf(res)), JSON.stringify(res));
+
+  // 引用符の中を数えるようにした代わりに、シェルが展開しない形を中身で見分ける
+  // (DATA_ALTERNATIVE)。どちらのケースも上限を実際に超える深さで書く ―― 見分けを外すと
+  // 打ち切りに達して拒否されることを確認済みで、上限の内側に収まる浅さだと、見分けが
+  // 壊れても緑のままになる。
+  res = shell(`curl -d '{"a": {"b": {"c": {"d": {"e": {"f": {"g": {"h": 1,"i": 2},"j": 3},"k": 4},"l": 5},"m": 6},"n": 7},"o": 8},"p": 9}' http://x`);
+  check('引用符の中の JSON は打ち切りに数えない', decision(res) === null, JSON.stringify(res));
+
+  res = shell(`jq '{z: {a: {b: {c: {d: {e: {f: {g: {h: .x, i: .y}, j: 1}, k: 2}, l: 3}, m: 4}, n: 5}, o: 6}, p: 7}' x.json`);
+  check('引用符の中の jq フィルタは打ち切りに数えない', decision(res) === null, JSON.stringify(res));
 }
 
 // --- 裸のツリー名は区切りを伴わない形だけを拾う ---
