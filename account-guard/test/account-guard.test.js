@@ -1533,6 +1533,18 @@ const TOOL_B = 'C:/org-tree/tool-b';
   res = call('Read', { file_path: logFile });
   check('履歴の読み取りは止めない', decision(res) === null, JSON.stringify(res));
 
+  // Win32 が「同じファイル」として扱う書き方。NTFS の代替データストリーム表記は本体そのものを
+  // 指し(`x::$DATA` への書き込みが実際に x を上書きすることを確認済み)、末尾のドットと空白は
+  // Win32 が黙って落とす。完全一致で突き合わせていた頃はいずれも別のパスとして素通りしていた。
+  for (const [label, suffix] of [
+    ['代替データストリーム', '::$DATA'],
+    ['末尾のドット', '.'],
+    ['末尾の空白', ' '],
+  ]) {
+    res = call('Write', { file_path: `${file}${suffix}`, content: '{}' });
+    check(`${label}を付けた書き込みも拒否する`, decision(res) === 'deny', JSON.stringify(res));
+  }
+
   // 同名でも別の場所のファイルは巻き込まない。
   res = call('Write', { file_path: 'C:/claude/ClaudeCode/unlocks.json', content: '{}' });
   check('別の場所にある同名ファイルは巻き込まない', decision(res) === null, JSON.stringify(res));
@@ -1817,6 +1829,23 @@ const TOOL_B = 'C:/org-tree/tool-b';
   // 候補が増えるほど拒否側に倒れる設計どおりで、この修正の前後で変わらない。
   res = inTree('cd x && cd y && cat ../../sub/x.py');
   check('連鎖した cd では範囲内を指していても拒否側に倒れる', decision(res) === 'deny', JSON.stringify(res));
+
+  // Glob の pattern と Grep の glob は、cwd ではなく同じ入力の path フィールドからの相対で
+  // 効く。すべて cwd 基準で解決していた頃は、逃げる側の pattern が cwd 基準ではツリーの外に
+  // 落ちて対象にならず、残る対象が解除済みの path だけになって素通りしていた。
+  for (const [tool, field] of [['Glob', 'pattern'], ['Grep', 'glob']]) {
+    res = runInSession(home, {
+      hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/work',
+      tool_name: tool, tool_input: { path: TOOL_A, [field]: '../tool-b/**' },
+    });
+    check(`${tool} の ${field} は path 基準で解決する`, decision(res) === 'deny', JSON.stringify(res));
+
+    res = runInSession(home, {
+      hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/work',
+      tool_name: tool, tool_input: { path: TOOL_A, [field]: '**/*.py' },
+    });
+    check(`${tool} の ${field} が範囲内なら通す`, decision(res) === null, JSON.stringify(res));
+  }
 }
 
 // --- 実行時にしか決まらない要素を含むコマンドでは解除を適用しない ---
@@ -1939,6 +1968,16 @@ const TOOL_B = 'C:/org-tree/tool-b';
   // 2 択のグループ 4 個で頭打ちだった頃は、保護ツリーに一切触れないこの形が拒否されていた。
   res = shell('mkdir -p a/{x,y} b/{x,y} c/{x,y} d/{x,y} e/{x,y}');
   check('保護ツリーに触れない 5 グループのブレースは通す', decision(res) === null, JSON.stringify(res));
+
+  // 上限が測っているのは「捨てた variant があるか」で、本数そのものではない。段の累積で数えて
+  // 即座に打ち切っていた頃は、展開しきっていて捨てたものが無いのに拒否されていた ―― 3 択 5
+  // グループ(累積 363)と 2 択 8 グループ(累積 510)がどちらも「判定できません」になり、
+  // 2 択 7 グループ(累積 254)だけが通るという、上限をまたぐかどうかだけの差になっていた。
+  res = shell('mkdir -p a/{x,y,z} b/{x,y,z} c/{x,y,z} d/{x,y,z} e/{x,y,z}');
+  check('展開しきれる 3 択 5 グループは通す', decision(res) === null, JSON.stringify(res));
+
+  res = shell('mkdir -p a/{x,y} b/{x,y} c/{x,y} d/{x,y} e/{x,y} f/{x,y} g/{x,y} h/{x,y}');
+  check('展開しきれる 2 択 8 グループは通す', decision(res) === null, JSON.stringify(res));
 
   // ブレース展開をするのは Bash であって PowerShell ではない。PowerShell のハッシュテーブルや
   // パイプのスクリプトブロックは中身の形が展開されるブレースと見分けられない(どの選択肢にも

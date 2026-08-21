@@ -171,9 +171,21 @@ function normalize(p) {
 // ツリー名の直後がパス区切りか非識別子文字であることまで見る。
 // 逆にツリー名だけ(`org-tree`)での一致は採らない。ドキュメントや会話でツリー名に
 // 言及しただけで拒否され、誤検知のほうが実害になるため。
+// 正規表現はツリーごとに使い回す。対象 × ルールの回数だけ呼ばれるので、毎回組み立てると
+// 対象が増えたときに効いてくる(ブレースの展開版 × cd の候補 × トークンで数百件になる)。
+const treeRegexCache = new Map();
+function treeRegex(tree) {
+  let re = treeRegexCache.get(tree);
+  if (!re) {
+    const t = normalize(tree).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    re = new RegExp(t + '(?![a-z0-9_.-])');
+    treeRegexCache.set(tree, re);
+  }
+  return re;
+}
+
 function mentionsTree(haystack, tree) {
-  const t = normalize(tree).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(t + '(?![a-z0-9_.-])').test(normalize(haystack));
+  return treeRegex(tree).test(normalize(haystack));
 }
 
 // パス風のトークンをどこで切るか。シェルのメタ文字はパスの一部になりえないので、必ず
@@ -346,6 +358,16 @@ const PATH_FIELDS = {
   Grep: ['path', 'glob'],
 };
 
+// 相対パスの基準が cwd ではないフィールド。`Glob.pattern` と `Grep.glob` は、同じ入力の
+// `path` フィールド(あれば)からの相対で効く。すべて cwd 基準で解決していた頃は、
+// `Glob{path:"<解除した場所>", pattern:"../tool-b/**"}` が素通りしていた ―― 逃げる側の
+// pattern は cwd 基準だとツリーの外に落ちて対象にならず、残る対象は解除済みの path だけに
+// なるため。cwd 基準の解決も併せて積む(候補が増えるほど拒否側に倒れる)。
+const PATH_FIELD_BASE = {
+  Glob: { pattern: 'path' },
+  Grep: { glob: 'path' },
+};
+
 // シェルと委譲は文字列全体を見る。パスがどの位置に現れるか決まっていないうえ、
 // 「保護ツリーを読め」という指示そのものを止めたいため。
 const COMMAND_FIELDS = {
@@ -401,9 +423,30 @@ function fromMsys(token) {
 const RELATIVE_PATH_TOKEN = new RegExp(`(?<![a-z0-9_.:\\-\\\\/])[a-z0-9_.\\-]*(?:[\\\\/]${NOT_STOP}*)+`, 'gi');
 
 // 相対パスを cwd 基準の絶対パスへ直す。解決できない値(null 文字を含む等)は捨てる。
+// Win32 が「同じファイル」として扱う書き方を畳む。NTFS の代替データストリーム
+// (`unlocks.json::$DATA`)は本体そのものを指し、末尾のドットと空白は Win32 が黙って落とす
+// ので、いずれも別のパスとして扱ってはいけない ―― 完全一致で突き合わせていた頃は
+// `Write{file_path:"…/unlocks.json::$DATA"}` が素通りし、本体を上書きできた(実際に
+// 上書きされることを確かめてある)。path.resolve はこれらを畳まないので、解決の前に落とす。
+//
+// ドライブのコロン(`C:`)だけは残す。区切りで切ってから成分ごとに見るのは、成分の途中に
+// 現れるコロンだけを落とすため ―― 文字列全体に対して雑に落とすとドライブ文字が消える。
+function stripWin32Aliases(value) {
+  return String(value)
+    .split(/([\\/])/)
+    .map((part) => {
+      if (/^[\\/]$/.test(part) || /^[a-z]:$/i.test(part)) return part;
+      const cleaned = part.replace(/:.*$/, '');
+      // `.` と `..` はドットだけでできた正規の成分なので落とさない。ここを区別せずに末尾の
+      // ドットを削ると、上に登る指定が丸ごと消えて相対パスの解決が別の場所を指す。
+      return /^\.+$/.test(cleaned) ? cleaned : cleaned.replace(/[. ]+$/, '');
+    })
+    .join('');
+}
+
 function resolveFrom(cwd, value) {
   try {
-    return path.resolve(cwd || process.cwd(), expandHomeIn(value));
+    return path.resolve(cwd || process.cwd(), stripWin32Aliases(expandHomeIn(value)));
   } catch {
     return null;
   }
@@ -570,19 +613,26 @@ function braceVariants(text) {
   let frontier = [text];
   for (let depth = 0; depth < BRACE_MAX_DEPTH; depth++) {
     const next = [];
+    let overflow = false;
     for (const t of frontier) {
       const m = firstShellBrace(t);
       if (!m) continue;
       for (const alt of m[1].split(',')) {
         next.push(t.slice(0, m.index) + alt + t.slice(m.index + m[0].length));
       }
+      // 1 段の中でも際限なく増えうる(選択肢を何百個も並べる形)。段の終わりまで待たずに
+      // 打ち切る。
+      if (next.length > BRACE_MAX_VARIANTS) { overflow = true; break; }
     }
     if (!next.length) break;
     out.push(...next);
-    if (out.length >= BRACE_MAX_VARIANTS) {
-      return { variants: out.slice(0, BRACE_MAX_VARIANTS), truncated: true };
-    }
+    if (overflow) return { variants: out.slice(0, BRACE_MAX_VARIANTS), truncated: true };
     frontier = next;
+    // 上限は「捨てた variant があるか」を測るためのもので、本数そのものを嫌っているわけでは
+    // ない。この段で展開しきったなら捨てたものは無いので、本数が上限に達していても打ち切りでは
+    // ない ―― 累積で数えて即座に打ち切っていた頃は、保護ツリーに一切触れず展開もしきれている
+    // `mkdir -p a/{x,y,z} … e/{x,y,z}` が「判定できません」で拒否されていた。
+    if (!frontier.some((t) => firstShellBrace(t) !== null)) break;
   }
   // 本数の上限に当たらずに抜けても、深さの上限で展開しきれていないことがある。展開の
   // 打ち切りはこの 2 経路しかないので、どちらも同じ印にまとめる。
@@ -602,10 +652,16 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
   // フィールドの値そのものが操作対象のパス。書かれたままと解決後の両方を見る。
   if (pathFields) {
     const out = [];
+    const baseFields = PATH_FIELD_BASE[toolName] ?? {};
     for (const f of pathFields) {
       const v = ti[f];
       if (typeof v !== 'string' || !v) continue;
       out.push(v, resolveFrom(cwd, v));
+      // そのフィールドの基準が別のフィールドなら、そちらからも解決して積む。
+      const sibling = ti[baseFields[f]];
+      if (typeof sibling === 'string' && sibling) {
+        out.push(resolveFrom(resolveFrom(cwd, sibling), v));
+      }
     }
     // asPath を直接渡さない。map は第 2 引数に添字を渡すので、それが truncated に入ってしまう。
     return out.filter(Boolean).map((v) => asPath(v));
@@ -670,6 +726,17 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
   const bases = cwdCandidates(texts, cwd);
 
   const out = [];
+  // 同じ (基準, トークン) は 1 回だけ解決する。ここは「ブレースの展開版 × cd の候補 ×
+  // 切り出したトークン」の総当たりで、展開版の多くは同じトークンを含むため、素直に回すと
+  // 同じ解決を何万回も繰り返す(重ねた形のコマンドで実測 8.9 秒かかっていた)。落とすのは
+  // 解決の前 ―― 結果を作ってから重複を捨てても、作る手間は払ったままになる。
+  const resolved = new Set();
+  const pushResolved = (base, token, truncated) => {
+    const key = `${base}\u0000${token}\u0000${truncated ? 1 : 0}`;
+    if (resolved.has(key)) return;
+    resolved.add(key);
+    out.push(asPath(resolveFrom(base, token), truncated));
+  };
   for (const text of texts) {
     const absolute = tokensIn(text, ABSOLUTE_PATH_TOKEN);
     const relative = tokensIn(text, RELATIVE_PATH_TOKEN);
@@ -683,9 +750,9 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
     // `C:/x/../<tree>/secret` や `/c/./<tree>` のような形が素通りしていた
     // (mentionsTree は文字列を突き合わせるだけで、パスとしての正規化はしない)。
     // 絶対パスは基準に依存しないので cwd だけで解決する。
-    for (const m of absolute) out.push(asPath(resolveFrom(cwd, m.token), m.truncated));
+    for (const m of absolute) pushResolved(cwd, m.token, m.truncated);
     for (const m of relative) {
-      for (const base of bases) out.push(asPath(resolveFrom(base, m.token), m.truncated));
+      for (const base of bases) pushResolved(base, m.token, m.truncated);
     }
     for (const m of msys) {
       const win = fromMsys(m.token);
@@ -729,7 +796,19 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
   if (markUndecidable && braceTruncated) {
     for (const tree of trees) out.push({ ...asPath(normalize(tree), true), undecidable: 'brace' });
   }
-  return out.filter((t) => t.value);
+  // 重複を落としてから返す。ここは「ブレースの展開版 × cd の候補 × 切り出したトークン」の
+  // 総当たりで、同じ場所を指す対象が何十件も並ぶ。呼び出し側はこの一覧をルートごとに舐めるので、
+  // 落とさないと同じ判定を繰り返すことになる(重ねた形のコマンドで実測 8.9 秒かかっていた)。
+  // 印(truncated / undecidable)が違うものは別の対象として残す ―― 同じ値でも解除の範囲判定に
+  // 通してよいかが変わる。
+  const seen = new Set();
+  return out.filter((t) => {
+    if (!t.value) return false;
+    const key = `${t.kind} ${t.truncated ? 1 : 0} ${t.undecidable ?? ''} ${t.value}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 // 設定を読む。`broken` は「保護すべきなのに読めない」状態を表す。
