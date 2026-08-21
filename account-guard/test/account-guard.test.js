@@ -2241,6 +2241,19 @@ const TOOL_B = 'C:/org-tree/tool-b';
   // 実測 0.9 秒。フックの timeout 自体が 5 秒なので、そこを閾値にする(5 倍の余裕がある)。
   check(`基準が指数的に増える形でも 5 秒以内に判定する(実測 ${ms}ms)`, ms < 5000, `${ms}ms`);
 
+  // 上限は 1 つの因子(基準の数・展開版の本数)しか抑えないので、掛け合わせは上限の中でも
+  // 伸びる。トークンを 20 個しか並べない上の形では気づけず、実測で「cd 31 段 + ブレース 8 組
+  // + トークン 200 個」が 5.9 秒かかって timeout で kill されていた ―― 拒否が届かないので
+  // 保護が外れるのと同じ。展開版をまたいでトークンを一意にしてから基準を掛ける形に直すと
+  // 0.5 秒になる。掛け算のまま上限だけ足す直し方に戻すと、ここで落ちる。
+  const manyCds = Array.from({ length: 31 }, (_, i) => `cd d${i}`).join(' && ');
+  const manyBraces = Array.from({ length: 8 }, (_, i) => `g${i}/{aa,bb}`).join(' ');
+  const manyTokens = Array.from({ length: 200 }, (_, i) => `s${i}/f${i}.js`).join(' ');
+  const t1 = Date.now();
+  shell(`${manyCds} && ls ${manyBraces} ${manyTokens}`);
+  const ms1 = Date.now() - t1;
+  check(`基準・展開版・トークンが同時に多くても 5 秒以内に判定する(実測 ${ms1}ms)`, ms1 < 5000, `${ms1}ms`);
+
   // 打ち切ったときは「判定できなかった」として拒否する。ツリーに一度も触れないコマンドまで
   // 拒否側に落ちるのは承知のうえ ―― 見ていない基準で解決すれば配下を指しうる。
   const res2 = shell(`${cds} && cat x`);

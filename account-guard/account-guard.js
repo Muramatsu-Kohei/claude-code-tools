@@ -934,6 +934,11 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
   //
   // 重複は最後の dedup が落とす。ここで先に弾かないのは、メタ文字を含むトークン自体が
   // 稀で、GLOB_META に当たらなければ globReach が即 return するため。
+  // 相対パスのトークンとグロブのパターンは、展開版をまたいで一意にしてから基準を掛ける
+  // (下の合流点のコメント)。キーに切り詰めの印を含めるのは、同じ字面でも印が違えば
+  // 解除の範囲判定に通してよいかが変わるため(最後の dedup と同じ理由)。
+  const relTokens = new Map();
+  const relPatterns = new Set();
   const reached = new Set();
   const markReach = (pattern, base) => {
     if (!markUndecidable || !GLOB_META.test(pattern)) return;
@@ -964,11 +969,11 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
       pushResolved(cwd, m.token, m.truncated);
       markReach(globPatternOf(text, m, m.token), cwd);
     }
+    // 相対パスだけは基準の数だけ解決するので、ここでは集めるにとどめる(下の合流点で回す)。
     for (const m of relative) {
-      for (const base of bases) {
-        pushResolved(base, m.token, m.truncated);
-        markReach(globPatternOf(text, m, m.token), base);
-      }
+      relTokens.set(`${m.truncated ? 1 : 0}|${m.token}`, m);
+      const pattern = globPatternOf(text, m, m.token);
+      if (GLOB_META.test(pattern)) relPatterns.add(pattern);
     }
     for (const m of msys) {
       const win = fromMsys(m.token);
@@ -976,6 +981,24 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
       out.push(asPath(win, m.truncated), asPath(resolveFrom(cwd, win), m.truncated));
       markReach(globPatternOf(text, m, win), cwd);
     }
+  }
+
+  // 相対パスを基準の数だけ解決する。展開版をまたいで一意にしてから掛けるのは、同じトークンが
+  // どの展開版にも現れるため ―― 素直に「展開版 × トークン × 基準」で回すと、重複を落とすのが
+  // 解決の後でも前でも、キーを作る手間だけは全部払うことになる。
+  //
+  // 上限(BRACE_MAX_VARIANTS・MAX_BASES)は 1 つの因子しか抑えないので、掛け合わせは上限の
+  // 中でも伸びる。実測で「cd 31 段 + ブレース 8 組 + パスのトークン 200 個」(2770 文字)が
+  // 5.9 秒かかり、フックの timeout(5 秒)で kill されていた ―― 拒否を返すはずだったのに
+  // それが届かないので、結果は保護が外れるのと同じ(MAX_BASES を足したときと同じ穴が、
+  // 因子を変えて残っていた)。一意にすると総当たりが「展開版 × トークン」と
+  // 「一意なトークン × 基準」の和になり、掛け算そのものが消える。
+  // 上限を足す形にしないのは、正当に大きいコマンドが拒否になるのを避けるため。
+  for (const m of relTokens.values()) {
+    for (const base of bases) pushResolved(base, m.token, m.truncated);
+  }
+  for (const pattern of relPatterns) {
+    for (const base of bases) markReach(pattern, base);
   }
 
   // 区切りを含まない裸のトークンは cwd 基準で解決しない(RELATIVE_PATH_TOKEN のコメント。
