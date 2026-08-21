@@ -2191,13 +2191,26 @@ const TOOL_B = 'C:/org-tree/tool-b';
   check('ロックが生きている間は解除を失敗させる',
     failed !== null && /進行中/.test(failed.stderr), JSON.stringify(failed));
   check('失敗した解除は状態ファイルを作らない', !fs.existsSync(unlocksFile(home)), '');
+  // 取れなかったロックを消してはいけない。消すと 3 者目が自由に取れてしまい、排他そのものが
+  // 外れる ―― この仕組みが防ぎたかった「片方の解除が黙って消える」が起きる。
+  check('取得できなかったロックは消さない', fs.existsSync(lock), '');
 
   // 取り残されたロックは奪う。奪えないと、強制終了のたびに以後ずっと解除できなくなる。
   const old = new Date(Date.now() - 120000);
   fs.utimesSync(lock, old, old);
   const out = String(guardCli(home, ['unlock', '--path', TOOL_A, 'テスト用の解除'], SID) || '');
   check('古いロックは奪って解除できる', /解除しました/.test(out), out);
+  // 印を書いて読み直す形にしたので、ここは「自分のロックだと分かって消せる」ことも見ている。
+  // 印が書けない・読めない・比較が壊れると、自分のロックを消さなくなってここで落ちる。
   check('奪ったロックは処理の後に消える', !fs.existsSync(lock), '');
+
+  // 判定側(フック)はフック入力の ID を優先し、手打ちの status は環境変数からしか取れない。
+  // ずれると「解除中と出ているのに拒否される」になるので、照合に使った ID を出しておく。
+  const statusOut = String(guardCli(home, ['status'], SID) || '');
+  check('status は照合に使うセッション ID を出す',
+    statusOut.includes(SID) && /照合に使うセッション ID/.test(statusOut), statusOut);
+  check('status はずれたときの直し方も出す',
+    /判定側が別のセッション ID/.test(statusOut), statusOut);
 }
 
 // --- ロックを取得できないときの案内 ---

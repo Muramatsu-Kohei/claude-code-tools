@@ -1828,8 +1828,19 @@ const LOCK_STALE_MS = 30000;
 // 状態ファイルの修復・削除を勧めるが、ロックはまだ状態ファイルに触れる前の段階であり、
 // 削除を勧めると他セッションの解除まで巻き添えで消させることになる(readAllUnlocks の
 // コメントにある、この設計が避けたかった結末そのもの)。
+// 奪われたことに気づくための印。ロックを取ったら中身に書き、解放する前に読み直して、
+// 自分の印のままなら消す ―― 無条件に消していた頃は、自分が stale と判断されて奪われた後の
+// 解放で、奪った側のロックまで消していた。そこから 3 者目が自由にロックを取れるので、
+// 排他そのものが外れ、この仕組みが防ぎたかった「片方の解除が黙って消える」が起きる。
+// 印を書けなかったときは自分では消さない ―― LOCK_STALE_MS 後に奪われるだけで、
+// 行き止まりにはならない(消し損ねる側の誤りは、他人のロックを消す誤りより軽い)。
+function lockToken() {
+  return `${process.pid}-${process.hrtime.bigint()}`;
+}
+
 function withUnlockLock(fn) {
   let fd;
+  const token = lockToken();
   try {
     fs.mkdirSync(path.dirname(UNLOCK_LOCK), { recursive: true });
     fd = fs.openSync(UNLOCK_LOCK, 'wx');
@@ -1851,11 +1862,16 @@ function withUnlockLock(fn) {
       throw e2;
     }
   }
+  try { fs.writeSync(fd, token); } catch { /* 書けなければ下で「自分のではない」と判断される */ }
   try {
     return fn();
   } finally {
     try { fs.closeSync(fd); } catch { /* 閉じられなくても消す */ }
-    try { fs.unlinkSync(UNLOCK_LOCK); } catch { /* 消せなくても次回 stale として奪える */ }
+    // まだ自分のロックのときだけ消す(lockToken のコメント)。読めない・中身が違うのは
+    // 「奪われた後」なので、消すと相手のロックを消すことになる。
+    let mine = false;
+    try { mine = fs.readFileSync(UNLOCK_LOCK, 'utf8') === token; } catch { /* 消えている */ }
+    if (mine) { try { fs.unlinkSync(UNLOCK_LOCK); } catch { /* 消せなくても次回 stale として奪える */ } }
   }
 }
 
@@ -2127,13 +2143,20 @@ function printUnlockStatus() {
     console.log('解除: ホームディレクトリを特定できないため、状態を確認できません');
     return;
   }
-  if (!sessionCandidates({}).length) {
+  const ids = sessionCandidates({});
+  if (!ids.length) {
     console.log('解除: セッション ID を取得できないため確認できません(Claude Code の外から実行しています)');
     return;
   }
+  // 照合に使った ID を添える。手打ちのこの経路は環境変数からしか ID を取れないのに対し、
+  // 判定側(フック)はフックの入力に入っている ID を優先する。同じセッションで両者がずれると、
+  // ここが「解除中」と出ているのに操作は拒否される、という食い違いになる。原因が見えないと
+  // 解除し直す・ガードを切る方へ向かってしまうので、突き合わせられる材料を出しておく。
+  const idNote = `  照合に使うセッション ID: ${ids[0]}(環境変数 CLAUDE_CODE_SESSION_ID)`;
   const active = activeUnlocks({});
   if (!active.length) {
     console.log('解除: なし(このセッションで解除中の範囲はありません)');
+    console.log(idNote);
     return;
   }
   console.log('解除: このセッションでは次の範囲だけ保護を外しています');
@@ -2141,6 +2164,9 @@ function printUnlockStatus() {
     console.log(`  ${u.path}`);
     console.log(`    理由: ${u.reason || '(記録なし)'} / 解除時のアカウント: ${u.account || '不明'} / ${u.at || '日時不明'}`);
   }
+  console.log(idNote);
+  console.log('  ここに出ている範囲なのに拒否されるなら、判定側が別のセッション ID を見ています。');
+  console.log('  guard lock で消してから、解除し直してください。');
   console.log('  取り消すには guard lock(範囲を指定するなら guard lock --path <dir>)。');
 }
 
