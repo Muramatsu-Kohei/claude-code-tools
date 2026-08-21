@@ -448,56 +448,69 @@ const CD_HEAD = '(?:^|[;&|(\\n]|\\s)\\s*(?:cd|chdir|pushd|set-location|sl|push-l
 
 const CD_COMMAND = new RegExp(`${CD_HEAD}(?:-[a-z]+\\s+)*(${NOT_STOP}+)`, 'gi');
 
-// 解除の範囲判定に使えるのは「どこを触るかが字面から決まる」コマンドだけ。cd の移動先に
-// 実行時にしか決まらない要素($VAR / ${VAR} / %VAR% / $(...) / `...` / (Get-Item …))が
-// 入ると、相対パスの基準が定まらない。resolveFrom はそれを字面どおりのディレクトリ名として
-// 解決してしまうので、解除したディレクトリの「配下」に実在しない基準ができ、ツリー内のどこを
-// 指す相対パスも解除の範囲内に見えていた ―― `tool-a` だけを解除した状態で
-// `cd $PARENT && cat tool-b/secret` が通り、兄弟ディレクトリが読めていた。
+// 解除の範囲判定に使えるのは「どこを触るかが字面から決まる」コマンドだけ。実行時にしか
+// 決まらない要素($VAR / ${VAR} / %VAR% / $(...) / `...` / (Get-Item …))が入ると、
+// resolveFrom はそれを字面どおりのディレクトリ名として解決するので、解除したディレクトリの
+// 「配下」に実在しない場所ができ、実際には範囲外を指すコマンドが範囲内に見える。
 //
-// 移動先の切り出しは CD_COMMAND と分ける。CD_COMMAND のキャプチャは TOKEN_STOP で切れるので、
-// バッククォートや `$(` で始まる移動先はキャプチャに現れない(`` cd `dirname $PWD` `` では
-// CD_COMMAND 自体がマッチしない)。ここでは次のコマンド区切りまでを移動先の記述として丸ごと
-// 見る。引用符を外す前の値を見るのも同じ理由で、外した後では `` `pwd` `` が `pwd` という
-// ディレクトリ名に化け、実行時要素だったことが分からなくなる。
+// 見るのはコマンド文字列全体。当初は cd の移動先だけを見ていたが、同じ要素が操作対象の側に
+// あっても結果は同じで、そちらは素通りしていた ―― `tool-a` だけを解除した状態で
+// `cat $(dirname ..)/tool-b/secret` や `cat $X/y` が通っていた。とくに区切りを含まない
+// `cat $X` はパスのトークンとして切り出されないため対象が 1 つも作られず、実行時の値が
+// cwd 基準で解決される以上、届く先はツリーの中に限らない。
 //
-// `(` まで実行時要素に数えるのは PowerShell の `(Get-Item …).FullName` を取り逃さないため。
-// 引用符なしで括弧を含むディレクトリ名を書くことはまず無いが、誤って数えても拒否側に倒れる
-// (解除が効かなくなるだけで、保護が緩む向きには倒れない)。
-const CD_DEST_RAW = new RegExp(`${CD_HEAD}([^;&|\\n]*)`, 'gi');
+// 判定に使う文字は移動先を見ていた頃と同じものを流用する。コマンド全体用に別の(狭い)定義を
+// 置くと、箇所ごとに見方がずれて片方だけが知っている書き方が抜け道になる ―― このファイルが
+// TOKEN_STOP や切り詰めの印で繰り返し避けてきた形。`(` まで数えるのは PowerShell の
+// `(Get-Item …).FullName` を取り逃さないため。
+//
+// 引用符を外す前の値を見るのは、外した後では `` `pwd` `` が `pwd` というディレクトリ名に
+// 化け、実行時要素だったことが分からなくなるため。
+//
+// 過剰拒否は承知のうえ。`git log --format=%H` のように実行時要素でない `%` を含むコマンドも、
+// 解除中の保護ツリーの中では拒否される。解除が無いセッションでは判定が変わらない(ツリーの
+// 中は元から無条件に拒否)ので、影響は解除中に限られ、逃げ道はユーザーの `!` 実行で残る。
 const RUNTIME_DEST = /[$%`(]/;
 
-function hasRuntimeCd(toolName, toolInput) {
+function hasRuntimeElement(toolName, toolInput) {
   const ti = toolInput ?? {};
   // パスのフィールドが決まっているツールでは、そのフィールドが操作対象そのもので、相対パスの
-  // 基準は cwd しかない ―― cd は関係しない。ここで引数全体を見ると、`Write` の content に
-  // 書いた `cd $x` のような「文面」で解除が効かなくなる(targetStrings が PATH_FIELDS を
+  // 基準は cwd しかない ―― 実行時要素の入りようがない。ここで引数全体を見ると、`Write` の
+  // content に書いた `$x` のような「文面」で解除が効かなくなる(targetStrings が PATH_FIELDS を
   // 優先するのと同じ理由で、判断の根拠にしてよいのは操作対象のフィールドだけ)。
   if (PATH_FIELDS[toolName]) return false;
   const commandFields = COMMAND_FIELDS[toolName];
   // 知らないツールは targetStrings と同じく引数全体を見る。どの引数がコマンドかは判断
-  // できないので、cd の記述がどこに入っていても拾える形に倒す。
-  //
-  // ただし `{"command":"cd $X && …"}` のように引用符が cd の直前に来る形は、移動先の切り出しに
-  // 当たらない(CD_HEAD が行頭・区切り・空白のいずれかを要求するので、`"` の直後は当たらない)。いまはそれでも穴にならない ―― 知らないツールから
-  // 取り出した参照は JSON の `"` で必ず切り詰め扱いになり(SAFE_TOKEN_END)、解除の範囲判定を
-  // 通らないので、解除の有無に関係なく拒否される。逆に言えば、JSON の `"` を切り詰めの対象外に
-  // する(= 知らないツールでも解除を効かせる)なら、この検出も同時に JSON 対応させなければ
-  // そこが穴になる。
+  // できないので、実行時要素がどこに入っていても拾える形に倒す(知らないツールから取り出した
+  // 参照は JSON の `"` で必ず切り詰め扱いになり、そもそも解除の範囲判定を通らないが、
+  // 判定の根拠を 1 つに揃えておく)。
   const texts = commandFields
     ? commandFields.map((f) => ti[f]).filter((v) => typeof v === 'string')
     : [JSON.stringify(ti)];
-  return texts.some((t) => [...t.matchAll(CD_DEST_RAW)].some((m) => RUNTIME_DEST.test(m[1])));
+  return texts.some((t) => RUNTIME_DEST.test(t));
 }
 
 // 相対パスの解決に使う基準ディレクトリ一覧。先頭は必ずフック入力の cwd。
+//
+// 連鎖する cd は積み上げる。cd ごとに cwd から解決し直していた頃は、`cd x && cd y` の実際の
+// 基準 `x/y` がどの候補にもならず(候補は cwd・cwd/x・cwd/y の 3 つ)、そこからの相対パスが
+// 別の場所に解決されて、解除の範囲内に見えていた ―― `tool-a` だけを解除した状態で
+// `cd x && cd y && cat ../../../tool-b/secret` が通り、1 段の `cat ../tool-b/secret` なら
+// 拒否されるのに 2 段にすると読める、という書き方だけで結論が変わる形だった。
+// 各 cd を cwd 基準でも積むのは従来どおり。実際には通らない cd が混ざっていても、基準が
+// 増える向きの誤りにしかならない(範囲判定は候補が増えるほど拒否側に倒れる)。
 function cwdCandidates(texts, cwd) {
   const out = [cwd];
+  const add = (p) => { if (p && !out.includes(p)) out.push(p); };
   for (const text of texts) {
+    // コマンド文字列ごとに積み直す。別の文字列の cd は同じシェルの続きとは限らない。
+    let chained = cwd;
     for (const m of text.matchAll(CD_COMMAND)) {
       // MSYS 形式のまま path.resolve に渡すと `C:\c\...` に化けるので、先に直す(fromMsys)。
-      const dest = resolveFrom(cwd, fromMsys(m[1]) || m[1]);
-      if (dest && !out.includes(dest)) out.push(dest);
+      const dest = fromMsys(m[1]) || m[1];
+      add(resolveFrom(cwd, dest));
+      chained = resolveFrom(chained, dest) || chained;
+      add(chained);
     }
   }
   return out;
@@ -638,11 +651,17 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
   // 展開版を足すだけなら判定材料が増えるだけで済んでいたが、markUndecidable が入って以降は
   // 打ち切りが即拒否になるため、保護ツリーに一切触れないふつうの PowerShell が並べただけで
   // 拒否されていた(拒否側なら安全、が成り立たない)。
+  //
+  // 展開は引用符を外す前の文字列に対して行う。外した後では、シェルが展開しないものを中身の形で
+  // 見分ける条件(DATA_ALTERNATIVE)のうち引用符が消えてしまい、空白しか効かなくなる ――
+  // 空白を詰めた JSON `{"a":1,"b":2}` がブレース展開として数えられ、入れ子が深いだけで
+  // 保護ツリーに一切触れない `curl -d` が判定不能で拒否されていた(同じ JSON に空白を入れると
+  // 通るので、書き方だけで結論が変わる)。展開した variant は使う前に引用符を外して揃える。
   let braceTruncated = false;
   if (isShell) {
-    for (const t of [...texts]) {
-      const expanded = braceVariants(t);
-      texts.push(...expanded.variants);
+    for (const raw of rawTexts) {
+      const expanded = braceVariants(raw);
+      texts.push(...expanded.variants.map((v) => expandHomeIn(v.replace(/["'`]/g, ''))));
       if (toolName === 'Bash' && expanded.truncated) braceTruncated = true;
     }
   }
@@ -917,19 +936,22 @@ function violation(input, account, config, unlocked = [], notes = []) {
     };
   }
 
-  // 解除は「触る場所が字面から決まる」ことを前提にする(hasRuntimeCd のコメント)。決まらない
-  // コマンドでは解除を適用せず、解除を入れる前と同じ「保護ツリーの中は無条件に拒否」へ戻す。
-  // 解除が無いときは判定が変わらないので、余計な拒否は生まない。
-  const runtimeCd = unlocked.length > 0 && hasRuntimeCd(input.tool_name, input.tool_input);
-  const scoped = runtimeCd ? [] : unlocked;
+  // 解除は「触る場所が字面から決まる」ことを前提にする(hasRuntimeElement のコメント)。
+  // 決まらないコマンドでは解除を適用せず、解除を入れる前と同じ「保護ツリーの中は無条件に拒否」
+  // へ戻す。解除が無いときは判定が変わらないので、余計な拒否は生まない。
+  const runtime = unlocked.length > 0 && hasRuntimeElement(input.tool_name, input.tool_input);
+  const scoped = runtime ? [] : unlocked;
   // 解除中に拒否されると、理由が書かれていない限り「解除が壊れている」ように見え、解除の
   // やり直しやガード外しに向かってしまう。適用しなかったことまで文面に出す。
-  const runtimeNote = runtimeCd ? '(cd の移動先が実行時に決まるため、一時解除を適用できません)' : '';
+  const runtimeNote = runtime
+    ? '(コマンドに実行時にしか決まらない要素($VAR・$(...)・`...`・%VAR%・(...))が含まれ、'
+      + '触る場所が字面から決まらないため、一時解除を適用できません。パスを字面で書き直すと通ります)'
+    : '';
 
   const targets = targetStrings(input.tool_name, input.tool_input, cwd, config.rules.map((r) => r.tree), true);
   // どのフィールドが操作対象か分からないツール(MCP のファイルシステム系など)は、入力を
   // JSON にしてから拾う。トークンは必ず JSON の `"` で終わるので SAFE_TOKEN_END から見れば
-  // 常に切り詰め扱いになり、解除の範囲判定を通らない ―― これは意図した設計(hasRuntimeCd の
+  // 常に切り詰め扱いになり、解除の範囲判定を通らない ―― これは意図した設計(hasRuntimeElement の
   // コメント)だが、拒否の文面まで「指定がそこで終わっている」と説明すると、書き換えれば
   // 通るように読める。実際には書き換えようがないので、理由の側を分ける。
   const opaqueTool = !PATH_FIELDS[input.tool_name] && !COMMAND_FIELDS[input.tool_name];
@@ -1572,10 +1594,17 @@ function cmdUnlock(argv, config, account) {
   // 既定の cwd は process.cwd() なので必ずこの形になる。
   const raw = sawPath ? target : process.cwd();
   if (!hasDriveLetter(raw)) {
-    return failUnlock([
-      `[account-guard] --path はドライブ文字から始まる絶対パスで指定してください(受け取った値: ${raw})。`,
-      '相対パスやドライブ文字を省いた形は、意図より広い範囲に効くことがあるため受け付けません。',
-    ]);
+    // 文面は --path を渡したかどうかで分ける。UNC 共有(`\\server\share`)で作業していると
+    // --path を省いても cwd がこの形にならず、使っていないオプションの直し方を案内される。
+    return failUnlock(sawPath
+      ? [
+        `[account-guard] --path はドライブ文字から始まる絶対パスで指定してください(受け取った値: ${raw})。`,
+        '相対パスやドライブ文字を省いた形は、意図より広い範囲に効くことがあるため受け付けません。',
+      ]
+      : [
+        `[account-guard] 作業ディレクトリがドライブ文字から始まらないため、範囲を決められません(${raw})。`,
+        '--path でドライブ文字から始まる絶対パスを指定してください。',
+      ]);
   }
   const abs = path.resolve(raw);
 

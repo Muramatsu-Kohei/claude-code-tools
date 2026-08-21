@@ -1805,14 +1805,31 @@ const TOOL_B = 'C:/org-tree/tool-b';
   check('解除した場所からラッパー越しに登る形も拒否する', decision(res) === 'deny', JSON.stringify(res));
   res = inTree('cat sub/x.py');
   check('解除の範囲内なら cwd 基準の相対パスは通す', decision(res) === null, JSON.stringify(res));
+
+  // 連鎖する cd。cd ごとに cwd から解決し直していた頃は候補が cwd・cwd/x・cwd/y の 3 つで、
+  // 実際の基準 x/y がどこにも無かった。そこから登る相対パスは別の場所に解決され、解除の
+  // 範囲内に見えて通っていた ―― 1 段の `cat ../tool-b/secret` なら拒否されるので、段数を
+  // 増やすだけで結論が変わる形だった。
+  res = inTree('cd x && cd y && cat ../../../tool-b/secret');
+  check('連鎖した cd の基準からツリー外へ登る形も拒否する', decision(res) === 'deny', JSON.stringify(res));
+  // 積み上げた基準は cwd 基準の候補に足す形なので、実際には通らない基準も残る。連鎖した cd
+  // から見て範囲内を指す相対パスでも、別の候補から解決すると範囲外になり拒否される ――
+  // 候補が増えるほど拒否側に倒れる設計どおりで、この修正の前後で変わらない。
+  res = inTree('cd x && cd y && cat ../../sub/x.py');
+  check('連鎖した cd では範囲内を指していても拒否側に倒れる', decision(res) === 'deny', JSON.stringify(res));
 }
 
-// --- 移動先が実行時に決まる cd では解除を適用しない ---
+// --- 実行時にしか決まらない要素を含むコマンドでは解除を適用しない ---
 //
 // resolveFrom は `$PARENT` を字面どおりのディレクトリ名として解決するので、解除したディレクトリ
-// の「配下」に実在しない基準ができ、ツリー内のどこを指す相対パスも解除の範囲内に見えていた
-// (`tool-a` だけを解除した状態で兄弟の `tool-b` が読めた)。基準が定まらないコマンドでは解除を
-// 無かったものとして扱い、解除を入れる前と同じ「保護ツリーの中は無条件に拒否」へ戻す。
+// の「配下」に実在しない場所ができ、実際には範囲外を指すコマンドが範囲内に見えていた
+// (`tool-a` だけを解除した状態で兄弟の `tool-b` が読めた)。触る場所が字面から決まらない
+// コマンドでは解除を無かったものとして扱い、解除を入れる前と同じ「保護ツリーの中は無条件に
+// 拒否」へ戻す。
+//
+// 当初は cd の移動先だけを見ていたが、同じ要素が操作対象の側にあっても結果は同じで、そちらは
+// 素通りしていた。とくに区切りを含まない `cat $X` はパスのトークンとして切り出されないため
+// 対象が 1 つも作られず、実行時の値は cwd 基準で解決される以上、届く先はツリーの中に限らない。
 {
   const SID = 'session-runtime-cd';
   const home = unlockedSandbox('unlock-runtime-cd', TOOL_A, SID);
@@ -1837,27 +1854,38 @@ const TOOL_B = 'C:/org-tree/tool-b';
     check(`移動先が ${label} の cd では解除を適用しない`, decision(res) === 'deny', JSON.stringify(res));
   }
 
+  // 操作対象の側に入った実行時要素。cd の移動先だけを見ていた頃はここが素通りだった。
+  for (const [label, command] of [
+    ['$VAR/…', 'cat $SOMEDIR/secret'],
+    ['$(...)/…', 'cat $(dirname ..)/tool-b/secret'],
+    // バッククォートは判定より前に外れるので、外した残り(`pwd/secret`)が解除の範囲内に
+    // 収まる形にする。`` `dirname ..`/tool-b/secret `` だと外した残りの `../tool-b/secret` が
+    // それだけで範囲外になり、実行時要素を見ていなくても拒否される(感度の無いテストになる)。
+    ['バッククォート', 'cat `pwd`/secret'],
+    ['区切りを含まない $VAR', 'cat $X'],
+    ['PowerShell の部分式', 'cat (Get-Item ..).FullName/secret'],
+  ]) {
+    res = shell(command);
+    check(`操作対象が ${label} のコマンドでは解除を適用しない`, decision(res) === 'deny', JSON.stringify(res));
+  }
+
   // 解除が効く形まで巻き込んでいないことを確かめる。実行時要素を拒否側に倒す判定は、
-  // 「cd を含むコマンドは全部拒否」に膨らませると解除そのものが使えなくなる。
+  // 「何でも拒否」に膨らませると解除そのものが使えなくなる。
   res = shell('cat x.py');
-  check('cd を含まないコマンドは解除範囲のまま通す', decision(res) === null, JSON.stringify(res));
+  check('実行時要素を含まないコマンドは解除範囲のまま通す', decision(res) === null, JSON.stringify(res));
 
   res = shell('cd sub && cat x.py');
   check('移動先が静的な cd は解除範囲のまま通す', decision(res) === null, JSON.stringify(res));
 
-  // パスのフィールドが決まっているツールでは cd は関係しない(相対パスの基準は cwd だけ)。
-  // 引数全体を見ると、書き込む「文面」に cd の例が入っているだけで解除が効かなくなり、
-  // 解除した範囲のドキュメントにコマンド例を書けなくなる。
-  //
-  // 文面は区切り記号を挟んだ形にする。移動先の切り出しは cd の直前に行頭か区切りを要求する
-  // ので、`{"content":"cd …` のように引用符が直前に来る形では検出されない ―― 素の
-  // `cd $PARENT` で書くと、判定に関わらず必ず通る(=感度の無い)テストになる。
+  // パスのフィールドが決まっているツールでは、そのフィールドが操作対象そのもので、実行時要素の
+  // 入りようがない(相対パスの基準は cwd だけ)。引数全体を見ると、書き込む「文面」に $VAR が
+  // 入っているだけで解除が効かなくなり、解除した範囲のドキュメントにコマンド例を書けなくなる。
   res = runInSession(home, {
     hook_event_name: 'PreToolUse', session_id: SID, cwd: TOOL_A,
     tool_name: 'Write',
     tool_input: { file_path: `${TOOL_A}/note.md`, content: 'echo hi; cd $PARENT && ls' },
   });
-  check('パスのフィールドを持つツールは文面の cd で解除を失わない', decision(res) === null, JSON.stringify(res));
+  check('パスのフィールドを持つツールは文面の実行時要素で解除を失わない', decision(res) === null, JSON.stringify(res));
 }
 
 // --- 展開を打ち切ったブレースは判定不能として拒否する ---
@@ -1951,6 +1979,12 @@ const TOOL_B = 'C:/org-tree/tool-b';
 
   res = shell(`jq '{z: {a: {b: {c: {d: {e: {f: {g: {h: .x, i: .y}, j: 1}, k: 2}, l: 3}, m: 4}, n: 5}, o: 6}, p: 7}' x.json`);
   check('引用符の中の jq フィルタは打ち切りに数えない', decision(res) === null, JSON.stringify(res));
+
+  // 空白を詰めた JSON。見分けの条件は引用符と空白の 2 つだが、展開を引用符除去のあとに
+  // 行っていた頃は引用符が先に消えており、空白しか効いていなかった ―― 上の JSON から
+  // 空白を抜いただけで判定不能の拒否に変わり、書き方だけで結論が変わっていた。
+  res = shell(`curl -d '{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":1,"i":2},"j":3},"k":4},"l":5},"m":6},"n":7},"o":8},"p":9}' http://x`);
+  check('空白を詰めた JSON も打ち切りに数えない', decision(res) === null, JSON.stringify(res));
 }
 
 // --- 裸のツリー名は区切りを伴わない形だけを拾う ---
