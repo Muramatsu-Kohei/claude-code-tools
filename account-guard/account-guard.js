@@ -368,6 +368,59 @@ const PATH_FIELD_BASE = {
   Grep: { glob: 'path' },
 };
 
+// グロブとして解釈されるフィールド。ここに書かれた `{a,b}` や `*` は、ツール自身が展開して
+// から探すので、字面のパスとして突き合わせるだけでは足りない ―― `Glob{pattern:"C:/{org-tree,
+// other}/**"}` と `Glob{pattern:"C:/org*/**"}` はどちらも保護ツリーを列挙でき、`Grep` なら
+// 中身まで読めるのに、素通りしていた(同じ場所を `Glob{pattern:"C:/org-tree/**"}` と書けば
+// 拒否されるので、書き方だけで結論が変わっていた)。
+//
+// `file_path` 系はここに入れない。Read / Edit / Write はその名前のファイルを直接開くだけで
+// 展開しないため、`C:/{org-tree,other}/secret` は実在しない名前として失敗するだけ。
+// 展開しないフィールドまで同じ扱いにすると、届きようのない書き方を拒否することになる。
+const GLOB_FIELDS = {
+  Glob: ['pattern'],
+  Grep: ['glob'],
+};
+
+// グロブのメタ文字。これ以降がどこへ届くかは字面では決まらない。
+const GLOB_META = /[*?[\]]/;
+
+// パターンのうち「実際に探し始めるディレクトリ」を返す。最初のメタ文字より前の、最後の区切り
+// まで。成分の途中で切ると `C:/org*` から `C:` が残り、ドライブ相対(`C:` は「そのドライブの
+// カレント」)として解決されて別の場所を指すので、区切りまで戻す。
+function globPrefix(pattern) {
+  const at = pattern.search(GLOB_META);
+  if (at < 0) return null;
+  const head = pattern.slice(0, at);
+  const cut = Math.max(head.lastIndexOf('/'), head.lastIndexOf('\\'));
+  return cut < 0 ? '' : head.slice(0, cut + 1);
+}
+
+// メタ文字を含むパターンが保護ツリーへ届きうるなら、そのツリーのルートを「判定できなかった
+// 対象」として積む。届く先そのものは展開しないと分からないので、範囲判定(解除)も通さない。
+//
+// 配下を指す形は上の通常の解決がすでに当てているので、ここで見るのは「探し始める場所が
+// ツリーの祖先」―― メタ文字の展開でツリーへ降りられるケース。
+function globReach(pattern, base, trees) {
+  const prefix = globPrefix(pattern);
+  if (prefix === null) return [];
+  const out = [];
+  const mark = (tree) => out.push({ ...asPath(normalize(tree), true), undecidable: 'glob' });
+  // メタ文字と `..` の組み合わせは追えない。`*/../tool-b/**` はメタ文字を挟んで上へ出るので、
+  // 「メタ文字より前」だけを見ると解除した範囲の内側に見える(実際には兄弟へ届く)。
+  // path.resolve は `..` の直前の成分を畳むので、`*` ごと消えて残りが範囲内に解決される。
+  if (pattern.split(/[\\/]/).includes('..')) {
+    for (const tree of trees) mark(tree);
+    return out;
+  }
+  const start = resolveFrom(base, prefix);
+  if (!start) return out;
+  for (const tree of trees) {
+    if (isInsideTree(tree, start)) mark(tree);
+  }
+  return out;
+}
+
 // シェルと委譲は文字列全体を見る。パスがどの位置に現れるか決まっていないうえ、
 // 「保護ツリーを読め」という指示そのものを止めたいため。
 const COMMAND_FIELDS = {
@@ -542,6 +595,13 @@ function hasRuntimeElement(toolName, toolInput) {
   // content に書いた `$x` のような「文面」で解除が効かなくなる(targetStrings が PATH_FIELDS を
   // 優先するのと同じ理由で、判断の根拠にしてよいのは操作対象のフィールドだけ)。
   if (PATH_FIELDS[toolName]) return false;
+  // 数えるのはシェルのコマンド文字列だけ。Agent / Task の prompt は自然文で、そこに現れる
+  // `$` やバッククォートは実行される置換ではなく文章の一部 ―― マークダウンのコードスパンを
+  // 1 つ書いただけで解除が消えていた(裸の丸括弧を PowerShell 限定に狭めたのと同じ理屈で、
+  // 日本語の委譲プロンプトではどちらも普通に出る)。委譲先は別セッションなので解除を継承せず、
+  // そこで改めて保護が効くため、prose を実行時要素の判定から外しても抜け道にはならない。
+  // 知らないツールは引数全体を見る(どの引数がコマンドか判断できないので安全側に倒す)。
+  if (COMMAND_FIELDS[toolName] && toolName !== 'Bash' && toolName !== 'PowerShell') return false;
   const commandFields = COMMAND_FIELDS[toolName];
   // 知らないツールは targetStrings と同じく引数全体を見る。どの引数がコマンドかは判断
   // できないので、実行時要素がどこに入っていても拾える形に倒す(知らないツールから取り出した
@@ -574,8 +634,11 @@ function hasRuntimeElement(toolName, toolInput) {
 // はずだったのに、それが届く前にプロセスが死ぬので、結果は保護が外れるのと同じだった。
 // 「重ねるほど遅くなる」は、そのまま「重ねれば保護を外せる」を意味する。
 //
-// 64 は、ブレースを含む cd を 6 段重ねてなお収まる値(2^6 = 64)。実運用でこれを超える
-// コマンドは書かないし、超えたときは拒否側に落ちるだけで素通りにはならない。
+// 64 で許せる段数は実測で、単純な `cd` の連鎖なら 31 段まで(cd ごとに cwd 基準と連鎖基準の
+// 2 つを積むので 1 + 2n)、ブレースを含む `cd` なら 3 段まで。展開版ごとに移動先が別に積まれる
+// ので、後者は段数に対してずっと早く上限に達する ―― 実運用でどちらも書かないが、
+// 「2^n まで許す」という読み方はできない(そう書いていたのは誤り)。
+// 超えたときは拒否側に落ちるだけで素通りにはならない。
 const MAX_BASES = 64;
 
 // 重複判定に Set を使う。配列の includes で見ていた頃は基準の数に対して O(n²) で、
@@ -704,20 +767,43 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
 
   // フィールドの値そのものが操作対象のパス。書かれたままと解決後の両方を見る。
   if (pathFields) {
-    const out = [];
+    const plain = [];
+    const marked = [];
     const baseFields = PATH_FIELD_BASE[toolName] ?? {};
+    const globFields = GLOB_FIELDS[toolName] ?? [];
+    let braceTruncated = false;
     for (const f of pathFields) {
       const v = ti[f];
       if (typeof v !== 'string' || !v) continue;
-      out.push(v, resolveFrom(cwd, v));
-      // そのフィールドの基準が別のフィールドなら、そちらからも解決して積む。
+      // そのフィールドの基準が別のフィールドなら、そちらも基準にする。
       const sibling = ti[baseFields[f]];
-      if (typeof sibling === 'string' && sibling) {
-        out.push(resolveFrom(resolveFrom(cwd, sibling), v));
+      const base = (typeof sibling === 'string' && sibling) ? resolveFrom(cwd, sibling) : null;
+      // グロブのフィールドはブレースを展開してから見る(GLOB_FIELDS のコメント)。展開するのは
+      // ツール自身なので、字面のままでは割られたツリー名にどのトークンも当たらない。
+      // 展開しないフィールドはこれまでどおり 1 本の値として扱う。
+      const isGlob = globFields.includes(f);
+      const expanded = isGlob ? braceVariants(v) : { variants: [], truncated: false };
+      if (expanded.truncated) braceTruncated = true;
+      // 書かれた値そのものを必ず先頭に置く。braceVariants はブレースを含まない入力に対して
+      // 空を返す(コマンド文字列の側は展開前の texts を別に持っているので気づけない仕様)。
+      // 展開版だけを回していた実装では、`Glob{pattern:"C:/<tree>/**"}` のようにブレースを
+      // 含まないリテラルのパターンが対象を 1 つも作らず、拒否が丸ごと外れていた。
+      for (const variant of [v, ...expanded.variants]) {
+        plain.push(variant, resolveFrom(cwd, variant));
+        if (base) plain.push(resolveFrom(base, variant));
+        // メタ文字より先はどこへ届くか字面で決まらない。届きうるツリーを判定不能として積む。
+        // markUndecidable で絞るのは、判定不能の印が状態ファイルの判定へ流れると誤拒否に
+        // なるため(コミット d483f57 と同じ理由。ブレースの打ち切りも同じく絞ってある)。
+        if (isGlob && markUndecidable) marked.push(...globReach(variant, base || cwd, trees));
       }
     }
+    // 展開を打ち切ったときの扱いは、コマンド文字列の側(下の braceTruncated)と同じ ――
+    // 見ていない variant にツリー名が割れて入っている可能性を排除できない。
+    if (markUndecidable && braceTruncated) {
+      for (const tree of trees) marked.push({ ...asPath(normalize(tree), true), undecidable: 'brace' });
+    }
     // asPath を直接渡さない。map は第 2 引数に添字を渡すので、それが truncated に入ってしまう。
-    return out.filter(Boolean).map((v) => asPath(v));
+    return [...plain.filter(Boolean).map((v) => asPath(v)), ...marked];
   }
 
   // ここから先はパスがどの位置に現れるか決まっていない文字列。
@@ -1188,13 +1274,16 @@ function violation(input, account, config, unlocked = [], notes = []) {
           && !unlockCoversTargets(rule.tree, [t], scoped));
         const braceHit = !certainHit && hits.some((t) => t.undecidable === 'brace');
         const basesHit = !certainHit && hits.some((t) => t.undecidable === 'bases');
+        const globHit = !certainHit && hits.some((t) => t.undecidable === 'glob');
         const truncatedHit = !certainHit && hits.some((t) => hasTruncatedRef(t, rule.tree));
-        const undecidable = braceHit || basesHit || truncatedHit;
+        const undecidable = braceHit || basesHit || globHit || truncatedHit;
         let reason = `操作の対象が ${rule.tree} 配下です${runtimeNote}`;
         if (braceHit) {
           reason = `ブレース展開を展開しきれないため、対象が ${rule.tree} 配下かどうか判定できません`;
         } else if (basesHit) {
           reason = `ディレクトリ移動が多すぎて相対パスの基準を数え切れないため、対象が ${rule.tree} 配下かどうか判定できません`;
+        } else if (globHit) {
+          reason = `パターンの展開先が ${rule.tree} 配下に届きうるため、対象が配下かどうか判定できません`;
         } else if (truncatedHit) {
           reason = opaqueTool
             ? `このツールは入力の形が決まっておらず、対象の指定がどこで終わるかを特定できないため、${rule.tree} 配下かどうか判定できません`

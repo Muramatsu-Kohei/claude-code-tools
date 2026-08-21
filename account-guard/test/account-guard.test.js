@@ -2343,4 +2343,89 @@ const TOOL_B = 'C:/org-tree/tool-b';
     /`!` を付けて自分で実行/.test(reasonOf(varRes)), reasonOf(varRes));
 }
 
+// --- Glob / Grep のパターン ---
+// パターンはツール自身が展開してから探すので、字面のパスとして突き合わせるだけでは足りない。
+// 展開を見ていなかった頃は、ツリー名をブレースで割る形とワイルドカードで伏せる形が素通りし、
+// 保護ツリーの列挙(Glob)と中身の読み出し(Grep)ができていた ―― 同じ場所をリテラルで
+// 書けば拒否されるので、書き方だけで結論が変わっていた。
+{
+  const home = sandbox('glob-pattern', { subscriptionType: 'pro', rules: ORG });
+  const call = (tool, toolInput) => run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/work/proj', tool_name: tool, tool_input: toolInput,
+  });
+
+  check('Glob のパターンでツリー名を割った形を拒否する',
+    decision(call('Glob', { pattern: 'C:/{org-tree,other}/**' })) === 'deny', 'glob brace');
+  check('Grep のパターンでツリー名を割った形を拒否する',
+    decision(call('Grep', { glob: 'C:/{org-tree,other}/**' })) === 'deny', 'grep brace');
+  check('ワイルドカードでツリー名を伏せた形を拒否する',
+    decision(call('Glob', { pattern: 'C:/org*/**' })) === 'deny', 'glob star');
+  check('1 文字ワイルドカードでも拒否する',
+    decision(call('Glob', { pattern: 'C:/org-tre?/**' })) === 'deny', 'glob question');
+  // メタ文字を含むパターンだけを見る実装にすると、ブレースもワイルドカードも無いリテラルの
+  // パターンが対象を 1 つも作らずに素通りする(実装中に一度これを踏んだ)。
+  check('リテラルのパターンは従来どおり拒否する',
+    decision(call('Glob', { pattern: 'C:/org-tree/**' })) === 'deny', 'glob literal');
+  // 届きようのないパターンまで拒否すると日常の邪魔になる。
+  check('保護ツリーに届かないパターンは通す',
+    call('Glob', { pattern: 'C:/claude/**' }) === null, 'glob unrelated');
+  check('保護ツリーに届かない再帰パターンも通す',
+    call('Glob', { pattern: '**/*.js' }) === null, 'glob recursive');
+
+  // file_path 系は展開しない(その名前のファイルを直接開く)。届きようのない書き方なので、
+  // ここまで拒否側に倒すと誤拒否が増えるだけ。
+  check('展開しないフィールドのブレースは対象にしない',
+    call('Read', { file_path: 'C:/{org-tree,other}/secret' }) === null, 'read brace');
+}
+
+// --- 解除中の Glob / Grep ---
+{
+  const SID = 'session-glob-escape';
+  const home = unlockedSandbox('unlock-glob-escape', TOOL_A, SID);
+  const call = (tool, toolInput) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: TOOL_A,
+    tool_name: tool, tool_input: toolInput,
+  });
+
+  check('解除範囲の外を直接指すパターンは拒否する',
+    decision(call('Glob', { path: TOOL_A, pattern: '../tool-b/**' })) === 'deny', 'direct');
+  check('ブレースで割って解除範囲の外へ出る形を拒否する',
+    decision(call('Glob', { path: TOOL_A, pattern: '{../tool-b,x}/**' })) === 'deny', 'brace escape');
+  check('Grep でも同じ形を拒否する',
+    decision(call('Grep', { path: TOOL_A, glob: '{../tool-b,x}/*' })) === 'deny', 'grep escape');
+  // path.resolve は `..` の直前の成分を畳むので、`*` ごと消えて残りが範囲内に解決される。
+  // メタ文字と `..` の組み合わせは追えないものとして拒否する。
+  check('メタ文字を挟んで登る形を拒否する',
+    decision(call('Glob', { path: TOOL_A, pattern: '*/../tool-b/**' })) === 'deny', 'star parent');
+
+  // 解除の正常系を巻き込んでいないこと。ここが拒否になると解除中に Glob が一切使えない。
+  check('解除範囲内の再帰パターンは通す',
+    decision(call('Glob', { path: TOOL_A, pattern: '**/*.py' })) === null, 'recursive inside');
+  check('解除範囲内のリテラルパターンは通す',
+    decision(call('Glob', { path: TOOL_A, pattern: 'src/*.py' })) === null, 'literal inside');
+}
+
+// --- 委譲の指示文と実行時要素 ---
+// 自然文に現れる `$` やバッククォートは実行される置換ではない。全ツールで数えていた頃は、
+// マークダウンのコードスパンを 1 つ書いただけで解除が消えていた。委譲先は別セッションなので
+// 解除を継承せず、そこで改めて保護が効く。
+{
+  const SID = 'session-prose-runtime';
+  const home = unlockedSandbox('unlock-prose-runtime', TOOL_A, SID);
+  const call = (tool, toolInput) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: TOOL_A,
+    tool_name: tool, tool_input: toolInput,
+  });
+
+  check('委譲の指示文のコードスパンは実行時要素として数えない',
+    decision(call('Task', { prompt: `${TOOL_A} の \`foo\` を直して`, description: '修正' })) === null,
+    'task backtick');
+  check('委譲の指示文の $ も数えない',
+    decision(call('Agent', { prompt: '$HOME の話は関係ない。ここの x.py を直して', description: '修正' })) === null,
+    'agent dollar');
+  // シェルのコマンド文字列では従来どおり数える(ここを緩めると解除の範囲が実行時の値で決まる)。
+  check('シェルでは従来どおり数える',
+    decision(call('Bash', { command: 'cat `pwd`/secret' })) === 'deny', 'bash backtick');
+}
+
 report();
