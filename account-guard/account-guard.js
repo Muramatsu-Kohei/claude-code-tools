@@ -220,10 +220,12 @@ function isTruncated(text, index, length) {
 
 // 正規表現で切り出したトークンを、切り詰めの印付きで返す。切り出しを行う箇所すべてが
 // これを通ることで、印の付け方が 1 箇所に集まる。
+// 位置も返すのは「どの文字で切れたか」を呼び出し側が見るため ―― 切り詰めの理由がグロブの
+// 展開(`[` `{`)なら、切れた先はツリーへ届きうる(globPatternOf)。
 function tokensIn(text, re) {
   const out = [];
   for (const m of text.matchAll(re)) {
-    out.push({ token: m[0], truncated: isTruncated(text, m.index, m[0].length) });
+    out.push({ token: m[0], truncated: isTruncated(text, m.index, m[0].length), index: m.index });
   }
   return out;
 }
@@ -385,6 +387,21 @@ const GLOB_FIELDS = {
 // グロブのメタ文字。これ以降がどこへ届くかは字面では決まらない。
 const GLOB_META = /[*?[\]]/;
 
+// 切り出したトークンを終わらせた文字のうち、「その先が展開される」もの。
+// TOKEN_STOP に `[` `{` が入っているので、コマンド文字列から切り出したトークンは
+// `C:/org[-]tree/s` なら `C:/org` で切れ、メタ文字がトークンの中に残らない。切れた文字を
+// 戻してから届き先を見ないと、ブラケットで伏せた形だけが判定をすり抜ける。
+// `*` と `?` は TOKEN_STOP ではないのでトークンの中に残り、この補正は要らない。
+const GLOB_OPENER = /[[{]/;
+
+// 切り出したトークンを、グロブとして見るときのパターンに直す。切り詰めた理由が展開なら
+// その文字を戻す。token を別に受け取るのは、MSYS 形式を Windows 形式へ直した後の値を
+// 渡すため(`/c/org*/s` のまま resolveFrom に渡すと `C:\c\...` に化ける)。
+function globPatternOf(text, m, token) {
+  const cut = text[m.index + m.token.length];
+  return (cut !== undefined && GLOB_OPENER.test(cut)) ? token + cut : token;
+}
+
 // パターンのうち「実際に探し始めるディレクトリ」を返す。最初のメタ文字より前の、最後の区切り
 // まで。成分の途中で切ると `C:/org*` から `C:` が残り、ドライブ相対(`C:` は「そのドライブの
 // カレント」)として解決されて別の場所を指すので、区切りまで戻す。
@@ -409,14 +426,38 @@ function globReach(pattern, base, trees) {
   // メタ文字と `..` の組み合わせは追えない。`*/../tool-b/**` はメタ文字を挟んで上へ出るので、
   // 「メタ文字より前」だけを見ると解除した範囲の内側に見える(実際には兄弟へ届く)。
   // path.resolve は `..` の直前の成分を畳むので、`*` ごと消えて残りが範囲内に解決される。
-  if (pattern.split(/[\\/]/).includes('..')) {
+  //
+  // 見るのはメタ文字より後ろ(rest)だけ。prefix 側の `..` は resolveFrom が正しく畳むので
+  // 追えないのはメタ文字を挟んだ側に限る ―― 全体で見ていると、`cat ../src/*.js` のような
+  // ごく普通の相対指定が「全ツリーへ届きうる」と扱われて軒並み拒否される。
+  const rest = pattern.slice(prefix.length);
+  if (rest.split(/[\\/]/).includes('..')) {
     for (const tree of trees) mark(tree);
     return out;
   }
   const start = resolveFrom(base, prefix);
   if (!start) return out;
+  // 探し始める場所からツリーへ降りるには、メタ文字を含む成分がツリー名に一致するしかない。
+  // グロブの成分は「最初のメタ文字より前」がそのまま一致対象の先頭になるので、それがツリー側の
+  // 成分の先頭になっていなければ、その書き方では絶対に届かない。
+  //
+  // 起点がツリーの祖先というだけで積むと、ドライブ直下に置いたツリーの祖先は `C:/` なので、
+  // `C:/claude*/` のような無関係なワイルドカードが軒並み拒否される ―― コマンド文字列にも同じ
+  // 判定を広げた以上、この絞り込みが無いと日常の Bash が通らなくなる。
+  // 先頭の一致しか見ないのはグロブの意味を真似ないため(展開を真似るほど実装のずれが抜け道に
+  // なる、という expandBraces と同じ判断)。除くのは「届きようがない」と言い切れる形だけで、
+  // 判断がつかないものはこれまでどおり積む。
+  const first = rest.split(/[\\/]/)[0];
+  const at = first.search(GLOB_META);
+  const literal = (at < 0 ? first : first.slice(0, at)).toLowerCase();
+  const from = normalize(start);
   for (const tree of trees) {
-    if (isInsideTree(tree, start)) mark(tree);
+    if (!isInsideTree(tree, start)) continue;
+    const t = normalize(tree);
+    // 起点がツリーそのものなら、比べる成分が無い(すでに中を探している)。
+    if (t === from) { mark(tree); continue; }
+    if (literal && !t.slice(from.length + 1).split('/')[0].startsWith(literal)) continue;
+    mark(tree);
   }
   return out;
 }
@@ -473,7 +514,13 @@ function fromMsys(token) {
 // 散文中でツリー名に言及しただけで拒否される誤検知(PATH_FIELDS のコメント)が復活するため。
 // 直前が識別子の文字・コロン・区切りなら拾わない。これがないと `D:/<tree>` や
 // `https://host/<tree>` の途中を切り出し、別ドライブや URL を cwd 配下へ解決してしまう。
-const RELATIVE_PATH_TOKEN = new RegExp(`(?<![a-z0-9_.:\\-\\\\/])[a-z0-9_.\\-]*(?:[\\\\/]${NOT_STOP}*)+`, 'gi');
+//
+// 最初の区切りより前にもグロブのメタ文字(`*` `?`)を許す。含めていなかった頃は、`ls org*/` の
+// ように 1 つ目の成分を伏せた相対形がトークンとして切り出されず(`org` の直後が区切りでないので
+// 一致が始まらない)、cwd がツリーの親のとき、そのままツリーを列挙できた ―― 同じ場所を
+// `ls C:/org*/` と絶対形で書けば拒否されるので、書き方だけで結論が変わっていた。
+// 区切りを 1 つ以上要求する条件は変えないので、`*.js` のような裸の語は今までどおり拾わない。
+const RELATIVE_PATH_TOKEN = new RegExp(`(?<![a-z0-9_.:\\-\\\\/])[a-z0-9_.\\-*?]*(?:[\\\\/]${NOT_STOP}*)+`, 'gi');
 
 // 相対パスを cwd 基準の絶対パスへ直す。解決できない値(null 文字を含む等)は捨てる。
 // Win32 が「同じファイル」として扱う書き方を畳む。NTFS の代替データストリーム
@@ -876,6 +923,25 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
     resolved.add(key);
     out.push(asPath(resolveFrom(base, token), truncated));
   };
+  // メタ文字を含むトークンが保護ツリーへ届きうるなら、そのツリーを「判定できなかった対象」
+  // として積む。PATH_FIELDS の枝が globReach でやっているのと同じことを、コマンド文字列と
+  // 知らないツールの側でもやる ―― 塞ぐ側を経路で絞ると、そこだけが抜け道になる。
+  //
+  // これが無かった頃、`Bash{ls C:/org*/}`・`PowerShell{Get-ChildItem C:/org*/}`・
+  // `mcp__fs__list{path:"C:/org*/"}` は展開後にツリーを列挙できるのに、字面のどのトークンも
+  // ツリー名に当たらず素通りしていた。同じ形を `Glob{pattern:"C:/org*/**"}` に書けば拒否される
+  // ので、経路と書き方だけで結論が変わっていた(commit 4e1c882 で塞いだのと同じ穴の残り)。
+  //
+  // 重複は最後の dedup が落とす。ここで先に弾かないのは、メタ文字を含むトークン自体が
+  // 稀で、GLOB_META に当たらなければ globReach が即 return するため。
+  const reached = new Set();
+  const markReach = (pattern, base) => {
+    if (!markUndecidable || !GLOB_META.test(pattern)) return;
+    const key = `${base}|${pattern}`;
+    if (reached.has(key)) return;
+    reached.add(key);
+    out.push(...globReach(pattern, base, trees));
+  };
   for (const text of texts) {
     const absolute = tokensIn(text, ABSOLUTE_PATH_TOKEN);
     const relative = tokensIn(text, RELATIVE_PATH_TOKEN);
@@ -894,13 +960,21 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
     // `C:/x/../<tree>/secret` や `/c/./<tree>` のような形が素通りしていた
     // (mentionsTree は文字列を突き合わせるだけで、パスとしての正規化はしない)。
     // 絶対パスは基準に依存しないので cwd だけで解決する。
-    for (const m of absolute) pushResolved(cwd, m.token, m.truncated);
+    for (const m of absolute) {
+      pushResolved(cwd, m.token, m.truncated);
+      markReach(globPatternOf(text, m, m.token), cwd);
+    }
     for (const m of relative) {
-      for (const base of bases) pushResolved(base, m.token, m.truncated);
+      for (const base of bases) {
+        pushResolved(base, m.token, m.truncated);
+        markReach(globPatternOf(text, m, m.token), base);
+      }
     }
     for (const m of msys) {
       const win = fromMsys(m.token);
-      if (win) out.push(asPath(win, m.truncated), asPath(resolveFrom(cwd, win), m.truncated));
+      if (!win) continue;
+      out.push(asPath(win, m.truncated), asPath(resolveFrom(cwd, win), m.truncated));
+      markReach(globPatternOf(text, m, win), cwd);
     }
   }
 
@@ -1283,7 +1357,7 @@ function violation(input, account, config, unlocked = [], notes = []) {
         } else if (basesHit) {
           reason = `ディレクトリ移動が多すぎて相対パスの基準を数え切れないため、対象が ${rule.tree} 配下かどうか判定できません`;
         } else if (globHit) {
-          reason = `パターンの展開先が ${rule.tree} 配下に届きうるため、対象が配下かどうか判定できません`;
+          reason = `ワイルドカードの展開先が ${rule.tree} 配下に届きうるため、対象が配下かどうか判定できません`;
         } else if (truncatedHit) {
           reason = opaqueTool
             ? `このツールは入力の形が決まっておらず、対象の指定がどこで終わるかを特定できないため、${rule.tree} 配下かどうか判定できません`

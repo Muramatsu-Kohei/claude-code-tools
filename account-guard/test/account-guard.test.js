@@ -2378,6 +2378,63 @@ const TOOL_B = 'C:/org-tree/tool-b';
     call('Read', { file_path: 'C:/{org-tree,other}/secret' }) === null, 'read brace');
 }
 
+// --- コマンド文字列のグロブ ---
+// 上の到達判定を Glob / Grep のフィールドにしか持っていなかった頃、同じ形をコマンド文字列に
+// 書くと素通りしていた ―― `Glob{pattern:"C:/org*/**"}` は拒否されるのに `Bash{ls C:/org*/}` は
+// 通る、という経路だけで結論が変わる状態で、シェルは展開後に列挙も読み出しもできた。
+// 塞ぐ側を経路(PATH_FIELDS の枝)で絞る形は、このファイルが繰り返し避けてきた失敗。
+{
+  const home = sandbox('command-glob', { subscriptionType: 'pro', rules: ORG });
+  const call = (tool, toolInput, cwd = 'C:/work/proj') => run(home, {
+    hook_event_name: 'PreToolUse', cwd, tool_name: tool, tool_input: toolInput,
+  });
+
+  check('Bash のワイルドカードでツリーを列挙する形を拒否する',
+    decision(call('Bash', { command: 'ls C:/org*/' })) === 'deny', 'bash star');
+  check('Bash のワイルドカードで中身を読む形を拒否する',
+    decision(call('Bash', { command: 'cat C:/org*/secret.txt' })) === 'deny', 'bash star read');
+  check('Bash の ? で伏せる形を拒否する',
+    decision(call('Bash', { command: 'cat C:/org-tre?/secret.txt' })) === 'deny', 'bash question');
+  // `[` はトークンの終わりなので、切り出した時点ではメタ文字がトークンに残らない。
+  // 切れた文字を戻してから届き先を見ないと、ブラケットで伏せた形だけがすり抜ける。
+  check('Bash のブラケットで伏せる形を拒否する',
+    decision(call('Bash', { command: 'cat C:/org[-]tree/secret.txt' })) === 'deny', 'bash bracket');
+  check('Git Bash 形式のワイルドカードも拒否する',
+    decision(call('Bash', { command: 'cat /c/org*/secret.txt' })) === 'deny', 'msys star');
+  check('PowerShell のワイルドカードを拒否する',
+    decision(call('PowerShell', { command: 'Get-ChildItem C:/org*/' })) === 'deny', 'pwsh star');
+  check('知らないツールのワイルドカードを拒否する',
+    decision(call('mcp__fs__list', { path: 'C:/org*/' })) === 'deny', 'mcp star');
+  check('委譲の指示文のワイルドカードを拒否する',
+    decision(call('Agent', { prompt: 'C:/org*/ の中身を要約して', description: 'x' })) === 'deny', 'agent star');
+
+  // 起点がツリーの祖先というだけで積むと、ドライブ直下のツリーの祖先は `C:/` なので、
+  // 無関係なワイルドカードが軒並み拒否される。メタ文字より前の字面がツリー名の先頭に
+  // なっていない形は「届きようがない」と言い切れるので通す。
+  check('先頭が一致しないワイルドカードは通す',
+    call('Bash', { command: 'ls C:/claude*/' }) === null, 'unrelated star');
+  check('cwd 配下のワイルドカードは通す',
+    call('Bash', { command: 'ls src/*.js' }) === null, 'relative star');
+  check('区切りを含まないワイルドカードは通す',
+    call('Bash', { command: 'grep -rn foo *.js' }) === null, 'bare star');
+  // 同じ絞り込みが Glob 側にも効く(判定は 1 か所なので、片方だけ緩むことがない)。
+  check('Glob でも先頭が一致しないワイルドカードは通す',
+    call('Glob', { pattern: 'C:/claude*/**' }) === null, 'glob unrelated star');
+  // cwd がツリーの親なら、1 つ目の成分を伏せた相対形でもツリーに届く。絶対形で書けば
+  // 拒否されるので、ここを拾えないと書き方だけで結論が変わる。
+  check('cwd がツリーの親なら相対のワイルドカードを拒否する',
+    decision(call('Bash', { command: 'ls org*/' }, 'C:/')) === 'deny', 'parent cwd star');
+  check('先頭が一致しない相対のワイルドカードは通す',
+    call('Bash', { command: 'ls other*/' }, 'C:/') === null, 'parent cwd unrelated star');
+
+  // `..` を追えないのはメタ文字を挟んだ側だけ。メタ文字より前の `..` は解決で畳めるので、
+  // ここまで拒否側に倒すと、ごく普通の相対指定が軒並み通らなくなる。
+  check('メタ文字を挟んで登る形は拒否する',
+    decision(call('Bash', { command: 'cat */../org-tree/s' })) === 'deny', 'star parent shell');
+  check('メタ文字より前の .. は通す',
+    call('Bash', { command: 'cat ../src/*.js' }) === null, 'parent then star');
+}
+
 // --- 解除中の Glob / Grep ---
 {
   const SID = 'session-glob-escape';
