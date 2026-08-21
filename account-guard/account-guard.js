@@ -444,12 +444,25 @@ function stripWin32Aliases(value) {
     .join('');
 }
 
+// 解決とブレース展開はどちらも入力だけで決まるので、結果を覚えておく。判定は 1 回の呼び出しで
+// 2 度走る ―― 解除の状態ファイルへの書き込みかを見る側と、保護ツリーに触れるかを見る側が、
+// 同じ入力に対して同じ展開と解決を繰り返す(渡すツリーだけが違う)。フックはツール呼び出しの
+// たびに動くので、この重複はそのまま待ち時間になる。プロセスは 1 回の判定で終わるため、
+// 覚えたものを捨てる仕組みは要らない。
+const resolveCache = new Map();
+const braceCache = new Map();
+
 function resolveFrom(cwd, value) {
+  const key = `${cwd}|${value}`;
+  if (resolveCache.has(key)) return resolveCache.get(key);
+  let out;
   try {
-    return path.resolve(cwd || process.cwd(), stripWin32Aliases(expandHomeIn(value)));
+    out = path.resolve(cwd || process.cwd(), stripWin32Aliases(expandHomeIn(value)));
   } catch {
-    return null;
+    out = null;
   }
+  resolveCache.set(key, out);
+  return out;
 }
 
 // 判定対象にする文字列を取り出す。
@@ -609,6 +622,14 @@ const BRACE_MAX_DEPTH = 8;
 const BRACE_MAX_VARIANTS = 256;
 
 function braceVariants(text) {
+  const cached = braceCache.get(text);
+  if (cached) return cached;
+  const result = expandBraces(text);
+  braceCache.set(text, result);
+  return result;
+}
+
+function expandBraces(text) {
   const out = [];
   let frontier = [text];
   for (let depth = 0; depth < BRACE_MAX_DEPTH; depth++) {
@@ -692,34 +713,32 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
   const rawTexts = commandFields
     ? commandFields.map((f) => ti[f]).filter((v) => typeof v === 'string')
     : [JSON.stringify(ti)];
-  const texts = rawTexts.map((t) => expandHomeIn(isShell ? t.replace(/["'`]/g, '') : t));
+  const stripQuotes = (t) => (isShell ? t.replace(/["'`]/g, '') : t);
+  const texts = rawTexts.map((t) => expandHomeIn(stripQuotes(t)));
 
-  // ブレースの展開もシェルのコマンド文字列に限る(引用符除去と同じ理由)。知らないツールで
-  // 見る JSON にはオブジェクトの `{...}` がそのまま含まれ、展開すると実在しない文字列を
-  // 判定材料に増やしてしまう。PowerShell は実際にはブレース展開しないが、展開版を足すだけなら
-  // 判定材料が増えるだけなので Bash と分けない(展開しきれなかったときの印は別。即拒否に
-  // つながるので Bash に限る ―― 下の braceTruncated 参照)。
+  // ブレースは、この枝に来るツールすべてで展開し、展開しきれなかったことも記録する。
+  //
+  // 以前はどちらもツール名で絞っていた(展開は Bash / PowerShell だけ、打ち切りの記録は Bash
+  // だけ)。どちらも「そのツールはブレース展開しない」という前提だったが、コマンド文字列の
+  // 中身を実行するのは別のシェルでありうる ―― PowerShell から `bash -c` を呼ぶ形も、
+  // `mcp__shell__exec` のような知らないツールも同じで、実際にツリー名を割った参照が
+  // 素通りしていた(Bash に同じものを渡せば拒否される)。塞ぐ側をツール名で列挙する形は、
+  // このファイルが READ_ONLY_TOOLS などで繰り返し避けてきた失敗。
   //
   // 打ち切りは展開そのものから受け取る。別の文字列で数え直すと、展開した側と数えた側が
   // 食い違い、その差がそのまま抜け道になる(firstShellBrace のコメント)。
-  //
-  // 数えるのは Bash だけにする。ブレース展開をするシェルは Bash であって PowerShell ではない。
-  // 展開版を足すだけなら判定材料が増えるだけで済んでいたが、markUndecidable が入って以降は
-  // 打ち切りが即拒否になるため、保護ツリーに一切触れないふつうの PowerShell が並べただけで
-  // 拒否されていた(拒否側なら安全、が成り立たない)。
   //
   // 展開は引用符を外す前の文字列に対して行う。外した後では、シェルが展開しないものを中身の形で
   // 見分ける条件(DATA_ALTERNATIVE)のうち引用符が消えてしまい、空白しか効かなくなる ――
   // 空白を詰めた JSON `{"a":1,"b":2}` がブレース展開として数えられ、入れ子が深いだけで
   // 保護ツリーに一切触れない `curl -d` が判定不能で拒否されていた(同じ JSON に空白を入れると
-  // 通るので、書き方だけで結論が変わる)。展開した variant は使う前に引用符を外して揃える。
+  // 通るので、書き方だけで結論が変わる)。この見分けがあるおかげで、知らないツールの入力を
+  // JSON にした文字列を展開にかけても、オブジェクトの `{...}` は数にも展開にも入らない。
   let braceTruncated = false;
-  if (isShell) {
-    for (const raw of rawTexts) {
-      const expanded = braceVariants(raw);
-      texts.push(...expanded.variants.map((v) => expandHomeIn(v.replace(/["'`]/g, ''))));
-      if (toolName === 'Bash' && expanded.truncated) braceTruncated = true;
-    }
+  for (const raw of rawTexts) {
+    const expanded = braceVariants(raw);
+    texts.push(...expanded.variants.map((v) => expandHomeIn(stripQuotes(v))));
+    if (expanded.truncated) braceTruncated = true;
   }
 
   // 相対パスの基準は cwd だけとは限らない(cwdCandidates のコメント)。
@@ -732,7 +751,8 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
   // 解決の前 ―― 結果を作ってから重複を捨てても、作る手間は払ったままになる。
   const resolved = new Set();
   const pushResolved = (base, token, truncated) => {
-    const key = `${base}\u0000${token}\u0000${truncated ? 1 : 0}`;
+    // 区切りは | 。Windows のパスに現れない文字なので、成分の境界が紛れない。
+    const key = [base, token, truncated ? 1 : 0].join('|');
     if (resolved.has(key)) return;
     resolved.add(key);
     out.push(asPath(resolveFrom(base, token), truncated));
@@ -742,9 +762,14 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
     const relative = tokensIn(text, RELATIVE_PATH_TOKEN);
     const msys = tokensIn(text, MSYS_PATH_TOKEN);
 
-    // シェルや委譲は「保護ツリーを読め」という指示そのものを止めたいので文字列全体も見る。
-    if (commandFields) out.push({ value: text, kind: 'text', truncated: false });
-    else out.push(...[...absolute, ...msys].map((m) => asPath(m.token, m.truncated)));
+    // 文字列全体も対象にする。シェルや委譲は「保護ツリーを読め」という指示そのものを止めたい
+    // ため、知らないツールは切り出しだけでは足りないため ―― トークンは TOKEN_STOP で切れるので、
+    // ツリーのパスにシェルのメタ文字(`;` `&` `[` など)が含まれていると、切り出した時点で
+    // ツリー名に届かず、保護が無言で効かなくなっていた(同じツリーを Read や Bash から触れば
+    // 拒否されるのに、知らないツールからだけ通る状態だった)。
+    // 突き合わせるのはツリーの絶対パスなので、名前だけを含む散文には当たらない。
+    out.push({ value: text, kind: 'text', truncated: false });
+    if (!commandFields) out.push(...[...absolute, ...msys].map((m) => asPath(m.token, m.truncated)));
 
     // 埋もれたパスは切り出して個別に解決する。文字列全体のままでは `.` / `..` を畳めず、
     // `C:/x/../<tree>/secret` や `/c/./<tree>` のような形が素通りしていた
@@ -804,7 +829,7 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
   const seen = new Set();
   return out.filter((t) => {
     if (!t.value) return false;
-    const key = `${t.kind} ${t.truncated ? 1 : 0} ${t.undecidable ?? ''} ${t.value}`;
+    const key = `${t.kind}|${t.truncated ? 1 : 0}|${t.undecidable ?? ''}|${t.value}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
@@ -1075,8 +1100,15 @@ function violation(input, account, config, unlocked = [], notes = []) {
         // そこで終わっておらず(glob・カンマ・括弧が続く)切り出した文字列が先頭部分でしか
         // ない場合。後者を見ていなかったため、切り詰めで拒否したときだけ見出しが断定形に
         // 戻り、書き方を直せば通ると気づけなかった。
-        const braceHit = hits.some((t) => t.undecidable === 'brace');
-        const truncatedHit = hits.some((t) => hasTruncatedRef(t, rule.tree));
+        //
+        // ただし「配下だと確定した対象」が 1 つでもあるなら、判定不能とは言わない。判定不能の
+        // 見出しは「書き方を直せば結論が変わりうる」と伝えるためのものなので、直しても拒否が
+        // 動かない場合に出すと、通らない書き直しへ誘導してしまう ―― `cp <tree>/a.txt{,.bak}`
+        // は展開後の両方が明確に配下なのに、展開前のトークンが `{` で切り詰められている
+        // というだけで「判定できません」になっていた。
+        const certainHit = hits.some((t) => !t.undecidable && !hasTruncatedRef(t, rule.tree));
+        const braceHit = !certainHit && hits.some((t) => t.undecidable === 'brace');
+        const truncatedHit = !certainHit && hits.some((t) => hasTruncatedRef(t, rule.tree));
         const undecidable = braceHit || truncatedHit;
         let reason = `操作の対象が ${rule.tree} 配下です${runtimeNote}`;
         if (braceHit) {
@@ -1608,7 +1640,11 @@ function parseUnlockArgs(argv) {
     const a = argv[i];
     if (a === '--path') { sawPath = true; target = argv[++i]; continue; }
     if (a.startsWith('--path=')) { sawPath = true; target = a.slice('--path='.length); continue; }
-    if (!unknownOption && /^--?\S/.test(a)) { unknownOption = a; continue; }
+    // オプションらしさは「空白を含まない 1 語」であることまで求める。要素全体を見ていた頃は、
+    // 引用符で正しく囲んだ理由がハイフンで始まるだけで(`"-- limit hit"`、`"-1 日だけ"`)
+    // 知らないオプション扱いになり、「理由は引用符で囲んで渡してください」と、すでに従って
+    // いる指示を返していた。打ち間違い(`--paht`)は 1 語なので、これでも捕まえられる。
+    if (!unknownOption && /^--?\S+$/.test(a)) { unknownOption = a; continue; }
     rest.push(a);
   }
   return { sawPath, target, reason: rest.join(' ').trim(), unknownOption };

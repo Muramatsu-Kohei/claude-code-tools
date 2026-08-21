@@ -431,6 +431,20 @@ console.log('account-guard');
   });
   check('未知ツールでも散文中のツリー名では拒否しない', res === null, JSON.stringify(res));
 }
+{
+  // ツリーのパスにシェルのメタ文字が入ると、切り出したトークンが TOKEN_STOP でそこで切れ、
+  // ツリー名に届かない。未知ツールは切り出したものしか対象にしていなかったため、Read や Bash
+  // からは拒否される同じツリーが、未知ツールからだけ無言で素通りしていた。
+  for (const tree of ['C:/a;b/org', 'C:/a&b/org', 'C:/a[1]/org']) {
+    const home = sandbox(`deny-mcp-metachar-${tree.replace(/[^a-z0-9]/gi, '')}`,
+      { subscriptionType: 'pro', rules: [{ tree, allow: ['team'] }] });
+    const res = run(home, {
+      hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode',
+      tool_name: 'mcp__filesystem__read_file', tool_input: { path: `${tree}/secret.py` },
+    });
+    check(`メタ文字を含むツリー ${tree} も未知ツールから守る`, decision(res) === 'deny', JSON.stringify(res));
+  }
+}
 
 // --- 相対パスは cwd 基準で解決してから判定する ---
 // 絶対パスしか見ていなかった頃は、保護ツリー外の cwd から `../../` で上に登る指定が
@@ -1571,6 +1585,17 @@ const TOOL_B = 'C:/org-tree/tool-b';
   check('打ち間違えたオプションをそのまま示す', /--paht/.test(f?.stderr || ''), f?.stderr);
   check('打ち間違えた解除は状態ファイルを作らない', !fs.existsSync(file), file);
 
+  // 引用符で正しく囲んだ理由がハイフンで始まるだけで、知らないオプション扱いにしない。
+  // 要素全体を見ていた頃は「理由は引用符で囲んで渡してください」と、すでに従っている指示を
+  // 返していた。オプションらしさに「空白を含まない 1 語」まで求めれば、打ち間違い(--paht)は
+  // そのまま捕まえられる。
+  // 成功する解除を作るので、この一巡の状態ファイル検査に影響しないよう別のサンドボックスで行う。
+  for (const [i, why] of ['-- limit hit', '-1 日だけ'].entries()) {
+    const h = sandbox(`unlock-dash-reason-${i}`, { subscriptionType: 'pro', rules: ORG });
+    const failed = guardCliFail(h, ['unlock', '--path', TOOL_B, why], SID);
+    check(`ハイフンで始まる理由 "${why}" を受け付ける`, failed === null, JSON.stringify(failed));
+  }
+
   f = guardCliFail(home, ['unlock', '--path', 'C:/elsewhere', '理由'], SID);
   check('保護ツリーの外は解除できない', f !== null && f.status === 1, JSON.stringify(f));
 
@@ -1941,12 +1966,40 @@ const TOOL_B = 'C:/org-tree/tool-b';
   res = shell('cat C:/{a,{b,{c,{d,{e,{f,{g,{h,{i,org-tree}}}}}}}}}/secret');
   check('深さの上限を超えるブレースは拒否する', decision(res) === 'deny', JSON.stringify(res));
 
+  // 打ち切りの印をツール名で絞ると、そこから漏れたツールがそのまま抜け道になる。コマンド
+  // 文字列の中身を実行するのは別のシェルでありうる ―― PowerShell から bash を呼ぶ形も、
+  // 知らないツール(MCP のシェル実行系)も同じで、Bash に同じものを渡せば拒否される内容が
+  // 素通りしていた。
+  const NESTED = 'cat C:/{a,{b,{c,{d,{e,{f,{g,{h,{i,org-tree}}}}}}}}}/secret';
+  const asTool = (tool_name, tool_input) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: 'C:/claude/ClaudeCode',
+    tool_name, tool_input,
+  });
+  res = asTool('PowerShell', { command: `bash -c "${NESTED}"` });
+  check('PowerShell 越しの入れ子ブレースも拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  res = asTool('PowerShell', { command: `cat C:/{${many},org-tree}/secret` });
+  check('PowerShell の本数超過も拒否する', decision(res) === 'deny', JSON.stringify(res));
+
+  // 知らないツールは展開そのものをしていなかったので、2 択で割るだけで足りていた。
+  res = asTool('mcp__shell__exec', { cmd: 'cat C:/{a,org-tree}/secret' });
+  check('知らないツールのブレースも展開して拒否する', decision(res) === 'deny', JSON.stringify(res));
+
   // 判定できなかったときは、見出しも「判定できなかった」と言う。断定形のままだと、対象が
   // 本当にツリー配下にあると読めてしまい、書き方を変えれば通ることに気づけない。
   const undecidableReason = res?.hookSpecificOutput?.permissionDecisionReason ?? '';
   check('判定不能の拒否は見出しでも断定しない',
     /判定できないため拒否/.test(undecidableReason) && !/^\[account-guard\] C:\/org-tree は別アカウント専用/.test(undecidableReason),
     undecidableReason);
+
+  // 逆に、配下だと確定した対象が 1 つでもあるなら判定不能とは言わない。判定不能の見出しは
+  // 「書き方を直せば結論が変わりうる」と伝えるためのもので、直しても拒否が動かない場合に
+  // 出すと通らない書き直しへ誘導する。`cp <tree>/a.txt{,.bak}` は展開後の両方が明確に配下
+  // なのに、展開前のトークンが `{` で切り詰められているというだけで判定不能になっていた。
+  res = shell('cp C:/org-tree/a.txt{,.bak}');
+  const certainReason = res?.hookSpecificOutput?.permissionDecisionReason ?? '';
+  check('配下と確定した対象があるなら判定不能とは言わない',
+    decision(res) === 'deny' && !/判定できない/.test(certainReason), certainReason);
 
   // 上限の内側は従来どおり展開して判定する。打ち切りを拒否に倒したことで、ブレースを含む
   // 無関係なコマンドまで一律に拒否していないことを確かめる。
