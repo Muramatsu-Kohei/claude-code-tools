@@ -1479,8 +1479,10 @@ const TOOL_B = 'C:/org-tree/tool-b';
 
   let res = call('Write', { file_path: file, content: '{"unlocks":[]}' });
   check('unlocks.json への Write は拒否する', decision(res) === 'deny', JSON.stringify(res));
+  // 何のファイルなのかを文面で説明する。守る範囲がディレクトリ単位になってからは、
+  // config.json(保護ルール)まで含むので、そこまで書き分けられていることを見る。
   check('拒否の文面が状態ファイルであることを説明する',
-    /解除の状態ファイル/.test(reasonOf(res)), reasonOf(res));
+    /状態ファイル/.test(reasonOf(res)) && /config\.json は保護ルール/.test(reasonOf(res)), reasonOf(res));
 
   res = call('Edit', { file_path: file });
   check('unlocks.json への Edit は拒否する', decision(res) === 'deny', JSON.stringify(res));
@@ -1917,11 +1919,21 @@ const TOOL_B = 'C:/org-tree/tool-b';
     // それだけで範囲外になり、実行時要素を見ていなくても拒否される(感度の無いテストになる)。
     ['バッククォート', 'cat `pwd`/secret'],
     ['区切りを含まない $VAR', 'cat $X'],
-    ['PowerShell の部分式', 'cat (Get-Item ..).FullName/secret'],
   ]) {
     res = shell(command);
     check(`操作対象が ${label} のコマンドでは解除を適用しない`, decision(res) === 'deny', JSON.stringify(res));
   }
+
+  // 部分式は PowerShell の経路で見る。裸の丸括弧を数えるのは PowerShell だけで、Bash や
+  // 委譲の指示文まで数えると `python -c "print(1)"` のような無関係なコマンドで解除が
+  // 失われる(Bash では `(` はサブシェルの構文で、そこからパスが生まれるわけではない。
+  // 実際に置換するのは `$(...)` で、そちらは上のループが押さえている)。
+  res = runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: TOOL_A,
+    tool_name: 'PowerShell', tool_input: { command: 'cat (Get-Item ..).FullName/secret' },
+  });
+  check('操作対象が PowerShell の部分式のコマンドでは解除を適用しない',
+    decision(res) === 'deny', JSON.stringify(res));
 
   // 解除が効く形まで巻き込んでいないことを確かめる。実行時要素を拒否側に倒す判定は、
   // 「何でも拒否」に膨らませると解除そのものが使えなくなる。
@@ -2207,6 +2219,128 @@ const TOOL_B = 'C:/org-tree/tool-b';
     failed !== null && /ロックを取得できません/.test(failed.stderr), JSON.stringify(failed));
   check('ロックの失敗で状態ファイルの修復や削除を勧めない',
     failed !== null && !/直すか削除/.test(failed.stderr), JSON.stringify(failed));
+}
+
+// --- 基準の打ち切り(MAX_BASES)---
+// 判定が遅くなりすぎると、フックの timeout(hooks-snippet.json は 5 秒)でプロセスが kill され、
+// 返すはずだった deny が届かない。「重ねるほど遅くなる」はそのまま「重ねれば保護を外せる」を
+// 意味する。上限を外すと実測 20 秒に戻り、ここで落ちる。
+{
+  const home = sandbox('bases-limit', { subscriptionType: 'pro', rules: ORG });
+  const cds = Array.from({ length: 8 }, (_, i) => `cd d${i}/{a,b}`).join(' && ');
+  const tail = Array.from({ length: 20 }, (_, i) => `f${i}/g${i}/h${i}`).join(' ');
+  const shell = (command) => run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command },
+  });
+
+  const t0 = Date.now();
+  const res = shell(`${cds} && cat ${TOOL_B}/secret ${tail}`);
+  const ms = Date.now() - t0;
+  check('基準が指数的に増える形でも拒否する', decision(res) === 'deny', JSON.stringify(res));
+  // 実測 0.9 秒。フックの timeout 自体が 5 秒なので、そこを閾値にする(5 倍の余裕がある)。
+  check(`基準が指数的に増える形でも 5 秒以内に判定する(実測 ${ms}ms)`, ms < 5000, `${ms}ms`);
+
+  // 打ち切ったときは「判定できなかった」として拒否する。ツリーに一度も触れないコマンドまで
+  // 拒否側に落ちるのは承知のうえ ―― 見ていない基準で解決すれば配下を指しうる。
+  const res2 = shell(`${cds} && cat x`);
+  check('基準を打ち切ったら判定不能として拒否する', decision(res2) === 'deny', JSON.stringify(res2));
+  // ブレースを含まない形で打ち切ったときに「ブレース展開が…」と出すと、直す先を探して
+  // 見つからない。打ち切りの種別ごとに文面を分けてあることを固定する。
+  check('打ち切りの理由をブレース展開と混同しない',
+    /基準を数え切れない/.test(reasonOf(res2)) && !/ブレース/.test(reasonOf(res2)), reasonOf(res2));
+}
+
+// --- ガードディレクトリ配下への書き込み ---
+// 守る対象をファイル名で列挙していた頃は、列挙に無いファイルがそのまま穴だった。とくに
+// config.json は保護ルールそのもので、消せば解除するまでもなく保護が丸ごと消える。
+{
+  const home = sandbox('guard-dir-write', { subscriptionType: 'pro', rules: ORG });
+  const guardFile = (f) => path.join(home, '.claude', 'account-guard', f);
+  const write = (file) => run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Write',
+    tool_input: { file_path: file, content: 'x' },
+  });
+
+  for (const f of ['config.json', 'unlocks.json', 'unlock.log', 'unlocks.lock', 'unlocks.json.tmp']) {
+    check(`ガードディレクトリ配下の ${f} への書き込みを拒否する`,
+      decision(write(guardFile(f))) === 'deny', f);
+  }
+  check('保護ルールを書き換えようとしたと分かる文面を出す',
+    /config\.json は保護ルール/.test(reasonOf(write(guardFile('config.json')))),
+    reasonOf(write(guardFile('config.json'))));
+
+  // 前方一致だけで見ると、名前が接頭辞になっている別ディレクトリまで巻き込む。
+  const sibling = write(path.join(home, '.claude', 'account-guard-old', 'x.json'));
+  check('名前が前方一致する別ディレクトリは巻き込まない', sibling === null, JSON.stringify(sibling));
+
+  // 中身を確かめる道は残す(読み取り専用と分かっているツールは素通し)。
+  const read = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Read',
+    tool_input: { file_path: guardFile('config.json') },
+  });
+  check('ガードディレクトリ配下の読み取りは通す', read === null, JSON.stringify(read));
+}
+
+// --- 保護ルールが無いインストール ---
+// README は「設定していない状態では何も拒否しない」と約束している。解除に関わる操作の遮断を
+// 無条件にしていた頃は、ルール未設定の環境でもこのリポジトリ自身への操作が拒否されていた。
+{
+  const home = sandbox('no-rules-unlock-block', { subscriptionType: 'pro', rawRules: '{ "rules": [] }' });
+  const res = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Bash',
+    tool_input: { command: 'git commit -m "fix: guard unlock の判定"' },
+  });
+  check('保護ルールが無ければ解除コマンドに見える文字列も拒否しない', res === null, JSON.stringify(res));
+
+  const write = run(home, {
+    hook_event_name: 'PreToolUse', cwd: 'C:/claude/ClaudeCode', tool_name: 'Write',
+    tool_input: { file_path: path.join(home, '.claude', 'account-guard', 'config.json'), content: '{}' },
+  });
+  check('保護ルールが無ければガードディレクトリへの書き込みも拒否しない', write === null, JSON.stringify(write));
+}
+
+// --- 解除中に拒否するときの見出し ---
+// 範囲内しか触らないのに切り詰めで拒否するとき、断定形の見出しを出すと「書き方を直せば通る」に
+// 気づけない(`mkdir -p a/x a/y` と書けば通る)。
+{
+  const SID = 'session-certain-hit';
+  const home = unlockedSandbox('unlock-certain-hit', TOOL_A, SID);
+  const res = runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: TOOL_A,
+    tool_name: 'Bash', tool_input: { command: 'mkdir -p a/{x,y}' },
+  });
+  check('解除範囲内しか触らないなら判定不能として拒否する',
+    decision(res) === 'deny' && /判定できません/.test(reasonOf(res)), reasonOf(res));
+  check('解除でカバー済みの対象を配下だと断定しない', !/配下です/.test(reasonOf(res)), reasonOf(res));
+}
+
+// --- 実行時要素の数え方 ---
+// 裸の丸括弧を数えるのは PowerShell だけ。全ツールで数えていた頃は、解除中に
+// `python -c "print(1)"` や丸括弧を含む委譲の指示文まで拒否され、一時解除の用途そのものが
+// 成立しなかった。
+{
+  const SID = 'session-runtime-paren';
+  const home = unlockedSandbox('unlock-runtime-paren', TOOL_A, SID);
+  const call = (tool, toolInput) => runInSession(home, {
+    hook_event_name: 'PreToolUse', session_id: SID, cwd: TOOL_A,
+    tool_name: tool, tool_input: toolInput,
+  });
+
+  // 解除が効いた回は additionalContext が返るので、レスポンス自体は null にならない。
+  // 見るのは permissionDecision。
+  const paren = call('Bash', { command: 'python -c "print(1)"' });
+  check('Bash の丸括弧は実行時要素として数えない', decision(paren) === null, JSON.stringify(paren));
+  const taskParen = call('Task', { prompt: 'このディレクトリの内容をまとめて(簡潔に)', description: 'まとめ' });
+  check('委譲の指示文の丸括弧も数えない', decision(taskParen) === null, JSON.stringify(taskParen));
+  check('PowerShell の丸括弧は実行時要素として数える',
+    decision(call('PowerShell', { command: 'Get-Content (Get-Item .).FullName' })) === 'deny', 'pwsh paren');
+
+  const varRes = call('Bash', { command: 'echo $PATH' });
+  check('変数参照は実行時要素として数える', decision(varRes) === 'deny', reasonOf(varRes));
+  // 「パスを字面で書き直すと通ります」だけでは、書き直す対象が無いコマンドで行き止まりになる。
+  check('パスを含まないコマンドには ! で打つ道を案内する',
+    /`!` を付けて自分で実行/.test(reasonOf(varRes)), reasonOf(varRes));
 }
 
 report();

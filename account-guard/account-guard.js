@@ -526,7 +526,14 @@ const CD_COMMAND = new RegExp(`${CD_HEAD}(?:-[a-z]+\\s+)*(${NOT_STOP}+)`, 'gi');
 // 過剰拒否は承知のうえ。`git log --format=%H` のように実行時要素でない `%` を含むコマンドも、
 // 解除中の保護ツリーの中では拒否される。解除が無いセッションでは判定が変わらない(ツリーの
 // 中は元から無条件に拒否)ので、影響は解除中に限られ、逃げ道はユーザーの `!` 実行で残る。
-const RUNTIME_DEST = /[$%`(]/;
+const RUNTIME_DEST = /[$%`]/;
+
+// PowerShell だけは括弧も実行時要素として数える。`(Get-Item …).FullName` のように、置換や
+// 変数を使わず括弧だけでパスを組み立てられるため。逆に Bash や自然文で括弧を数えるのは
+// 過剰で、`python -c "print(1)"` や委譲の指示文の丸括弧まで解除が効かなくなり、一時解除の
+// 用途(リミットの回復を待ちながら作業を続ける)そのものが成立しなくなっていた。
+// 変数・コマンド置換($VAR・$(...)・`...`・%VAR%)は上の RUNTIME_DEST が両方で拾う。
+const RUNTIME_DEST_POWERSHELL = /[$%`(]/;
 
 function hasRuntimeElement(toolName, toolInput) {
   const ti = toolInput ?? {};
@@ -543,7 +550,8 @@ function hasRuntimeElement(toolName, toolInput) {
   const texts = commandFields
     ? commandFields.map((f) => ti[f]).filter((v) => typeof v === 'string')
     : [JSON.stringify(ti)];
-  return texts.some((t) => RUNTIME_DEST.test(t));
+  const runtime = toolName === 'PowerShell' ? RUNTIME_DEST_POWERSHELL : RUNTIME_DEST;
+  return texts.some((t) => runtime.test(t));
 }
 
 // 相対パスの解決に使う基準ディレクトリ一覧。先頭は必ずフック入力の cwd。
@@ -555,9 +563,33 @@ function hasRuntimeElement(toolName, toolInput) {
 // 拒否されるのに 2 段にすると読める、という書き方だけで結論が変わる形だった。
 // 各 cd を cwd 基準でも積むのは従来どおり。実際には通らない cd が混ざっていても、基準が
 // 増える向きの誤りにしかならない(範囲判定は候補が増えるほど拒否側に倒れる)。
+// 基準の上限。超えたら積むのをやめ、「判定できなかった」として拒否側に倒す(呼び出し側で
+// ブレース展開の打ち切りと同じ合流点に載る)。
+//
+// 上限が要るのは、この関数が受け取る texts がブレース展開後の全 variant であり、cd 自身が
+// ブレースを含むと variant ごとに別の移動先が積まれるため ―― 基準の数は cd の段数に対して
+// 指数的に増える。対象は「基準 × 切り出したトークン」の総当たりなので、そのまま判定に流すと
+// 時間だけが伸びる。実測で `cd d0/{a,b}` を 8 段重ねたコマンド(359 文字)が 20.6 秒かかり、
+// フックの timeout(hooks-snippet.json は 5 秒)で kill されていた ―― 判定は deny を返す
+// はずだったのに、それが届く前にプロセスが死ぬので、結果は保護が外れるのと同じだった。
+// 「重ねるほど遅くなる」は、そのまま「重ねれば保護を外せる」を意味する。
+//
+// 64 は、ブレースを含む cd を 6 段重ねてなお収まる値(2^6 = 64)。実運用でこれを超える
+// コマンドは書かないし、超えたときは拒否側に落ちるだけで素通りにはならない。
+const MAX_BASES = 64;
+
+// 重複判定に Set を使う。配列の includes で見ていた頃は基準の数に対して O(n²) で、
+// 上限が無かった当時は基準が 2000 件まで伸びてここも実測に乗っていた。
 function cwdCandidates(texts, cwd) {
   const out = [cwd];
-  const add = (p) => { if (p && !out.includes(p)) out.push(p); };
+  const seen = new Set([cwd]);
+  let truncated = false;
+  const add = (p) => {
+    if (!p || seen.has(p)) return;
+    if (out.length >= MAX_BASES) { truncated = true; return; }
+    seen.add(p);
+    out.push(p);
+  };
   for (const text of texts) {
     // コマンド文字列ごとに積み直す。別の文字列の cd は同じシェルの続きとは限らない。
     let chained = cwd;
@@ -569,7 +601,7 @@ function cwdCandidates(texts, cwd) {
       add(chained);
     }
   }
-  return out;
+  return { bases: out, truncated };
 }
 
 // ブレース展開は 1 本の記述を複数のパスに分けて実行する。切り出しはブレースをトークンの
@@ -742,7 +774,8 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
   }
 
   // 相対パスの基準は cwd だけとは限らない(cwdCandidates のコメント)。
-  const bases = cwdCandidates(texts, cwd);
+  const baseList = cwdCandidates(texts, cwd);
+  const bases = baseList.bases;
 
   const out = [];
   // 同じ (基準, トークン) は 1 回だけ解決する。ここは「ブレースの展開版 × cd の候補 ×
@@ -820,6 +853,13 @@ function targetStrings(toolName, toolInput, cwd, trees = [], markUndecidable = f
   // 通さないため ―― 展開してみるまで何を触るか分からないので、範囲内である根拠が無い。
   if (markUndecidable && braceTruncated) {
     for (const tree of trees) out.push({ ...asPath(normalize(tree), true), undecidable: 'brace' });
+  }
+  // 基準を積むのを打ち切ったときも同じ扱いにする(MAX_BASES のコメント)。見ていない基準で
+  // 解決すればツリー配下を指しうるので、範囲内である根拠も、触らないという根拠も無い。
+  // 種別を 'brace' と分けるのは拒否の文面のため ―― ブレースを 1 つも書いていないのに
+  // 「ブレース展開を展開しきれない」と出ると、直す先を探して見つからない。
+  if (markUndecidable && baseList.truncated) {
+    for (const tree of trees) out.push({ ...asPath(normalize(tree), true), undecidable: 'bases' });
   }
   // 重複を落としてから返す。ここは「ブレースの展開版 × cd の候補 × 切り出したトークン」の
   // 総当たりで、同じ場所を指す対象が何十件も並ぶ。呼び出し側はこの一覧をルートごとに舐めるので、
@@ -948,9 +988,16 @@ function isUnlockStateWrite(input) {
   // 履歴(unlock.log)も同じ扱いにする。誰がいつ何のために解除したかを後から確かめるための
   // 記録で、この設計は「ユーザーが `!` で打った」ことに全体重を預けている ―― 記録を書き換え
   // られると、その確かめようがなくなる。読み取りは READ_ONLY_TOOLS 側で通したままにする。
-  const targets = [normalize(UNLOCKS), normalize(UNLOCK_LOG)];
   const guardDir = normalize(GUARD_DIR);
-  return targetStrings(tool, input.tool_input ?? {}, input.cwd, [UNLOCKS, UNLOCK_LOG]).some((t) => {
+  // targetStrings に渡すこの一覧は、判定に使う集合ではなく「区切りを含まない裸の名前を拾う
+  // ための手掛かり」。シェルのコマンド文字列に現れた裸の名前は、その名前が渡した対象の
+  // 基底名と一致したときだけ基準で解決される(targetStrings の裸トークン例外)。
+  // `cd ~/.claude/account-guard && echo {} > unlocks.json` のように、ディレクトリへ潜って
+  // ファイル名だけで書く形はこれが無いと 1 つも対象が作られず素通りする。
+  // 判定そのものは下の前方一致なので、ここに挙げ忘れた名前もパスの形で書かれれば拾える
+  // (裸の名前かつ cwd がガードディレクトリ、という組み合わせのときだけ列挙に依存する)。
+  const bareNameHints = [GUARD_DIR, CONFIG, UNLOCKS, UNLOCK_LOG, UNLOCK_LOCK];
+  return targetStrings(tool, input.tool_input ?? {}, input.cwd, bareNameHints).some((t) => {
     if (t.kind !== 'path') return false;
     const value = normalize(t.value);
     // ガード自身のディレクトリを指しているものは、それだけで書き込み扱いにする。ファイル名まで
@@ -959,14 +1006,18 @@ function isUnlockStateWrite(input) {
     // 状態ファイルを名指ししないまま置き換えられた(同じ操作を `cd` してファイル名で書けば
     // 拒否されるので、書き方だけで結論が変わっていた)。
     if (value === guardDir) return true;
-    // 切り詰められたトークン(SAFE_TOKEN_END のコメント)は実際に書かれるパスの先頭部分でしか
-    // ないので、完全一致では捉えられない。`unlocks{.json,}` や `unlocks[.]json` のように末尾を
-    // 展開で作る形が、それだけで素通りしていた。前方一致に緩めるのはガード自身のディレクトリを
-    // 指しているときに限る ―― 無条件に緩めると `ls C:/{a,b}` のような `C:/` で切り詰められた
-    // トークンまで状態ファイルへの書き込み扱いになる。
-    return t.truncated
-      ? value.startsWith(guardDir) && targets.some((target) => target.startsWith(value))
-      : targets.includes(value);
+    // 配下は「区切りまで含めた前方一致」で見る。守る対象をファイル名で列挙していた頃は、
+    // 列挙に無いファイルがそのまま穴だった ―― 実測で `config.json`・`unlocks.lock`・
+    // `unlocks.json.tmp` への Write がすべて素通りしていた。とくに config.json は
+    // 状態ファイルより強い(ルールを消せば解除どころか保護そのものが消える)ので、
+    // 弱い側だけを守っている状態だった。ディレクトリの単位で見れば、この先ここに何を
+    // 置いても守られる ―― 増えるたびに穴が開く向きの列挙をやめる、というこのファイルの
+    // 方針(READ_ONLY_TOOLS のコメント)と同じ形に揃える。
+    //
+    // 区切りを要求するのは `…/account-guard-old` のような別ディレクトリを巻き込まないため。
+    // 切り詰められたトークン(`…/account-guard/unlocks{.json,}` の `…/unlocks`)も、配下で
+    // あることは前方一致で分かるので、この 1 本で拾える。
+    return value.startsWith(guardDir + '/');
   });
 }
 
@@ -1023,8 +1074,20 @@ function violation(input, account, config, unlocked = [], notes = []) {
 
   // 解除に関わる操作は、設定の状態にも解除の有無にも関係なく真っ先に落とす。解除中のセッションで
   // あっても拒否する(isUnlockAttempt のコメント)ので、下の解除フィルタより前でなければならない。
-  if (isUnlockAttempt(input)) return { unlockAttempt: true };
-  if (isUnlockStateWrite(input)) return { unlockState: true };
+  // 守るツリーが 1 つも無いインストールでは、解除に関わる操作も拒否しない。ここを無条件に
+  // していた頃は、ルールを設定していない環境でも解除コマンドに見える文字列(このリポジトリ
+  // 自身への `git commit -m "…"` や grep)が拒否され、README が約束している「保護ルールを
+  // 設定していない状態では何も拒否しない」と食い違っていた。config が壊れているときは
+  // 「ルールが無い」のか「読めていない」のか区別できないので、そちらは拒否側に残す。
+  const guarding = config.broken || config.rules.length > 0;
+  if (guarding && isUnlockAttempt(input)) return { unlockAttempt: true };
+  // 状態ファイルへの書き込みは、壊れた設定を直す操作(と HOME 不明時のフック解除)だけ通す。
+  // isUnlockStateWrite がガードディレクトリ配下すべてを見るようになり、config.json もこの
+  // 判定に入った ―― 逃げ道を残さないと、壊れた設定を Claude Code の中から直せなくなる
+  // (isConfigRepair のコメントにある「全停止させたときに実際に困った」を再現してしまう)。
+  if (guarding && isUnlockStateWrite(input) && !(config.broken && isEscapeHatch(input, config))) {
+    return { unlockState: true };
+  }
 
   // 設定が壊れているときは、どのツリーを守るべきかが分からない。素通しにすると
   // 保護が丸ごと外れるので、修復操作を除いて拒否する。HOME 未解決もこの扱いに合流するが、
@@ -1047,9 +1110,15 @@ function violation(input, account, config, unlocked = [], notes = []) {
   const scoped = runtime ? [] : unlocked;
   // 解除中に拒否されると、理由が書かれていない限り「解除が壊れている」ように見え、解除の
   // やり直しやガード外しに向かってしまう。適用しなかったことまで文面に出す。
+  // 「パスを字面で書き直すと通ります」だけを案内していた頃は、書き直す対象が無いコマンド
+  // (`echo $PATH` のようにパスを 1 つも含まないもの)で行き止まりになっていた。手が無いのに
+  // 手があるように読める案内は、解除のやり直しやガード外しへ向かわせるので、パスを含まない
+  // 場合の道(`!` で自分で打つ)まで書く。
   const runtimeNote = runtime
-    ? '(コマンドに実行時にしか決まらない要素($VAR・$(...)・`...`・%VAR%・(...))が含まれ、'
-      + '触る場所が字面から決まらないため、一時解除を適用できません。パスを字面で書き直すと通ります)'
+    ? '(コマンドに実行時にしか決まらない要素($VAR・$(...)・`...`・%VAR%'
+      + (input.tool_name === 'PowerShell' ? '・(...)' : '')
+      + ')が含まれ、触る場所が字面から決まらないため、一時解除を適用できません。'
+      + 'パスを含むならリテラルで書き直すと通ります。含まないコマンドは `!` を付けて自分で実行してください)'
     : '';
 
   const targets = targetStrings(input.tool_name, input.tool_input, cwd, config.rules.map((r) => r.tree), true);
@@ -1106,13 +1175,26 @@ function violation(input, account, config, unlocked = [], notes = []) {
         // 動かない場合に出すと、通らない書き直しへ誘導してしまう ―― `cp <tree>/a.txt{,.bak}`
         // は展開後の両方が明確に配下なのに、展開前のトークンが `{` で切り詰められている
         // というだけで「判定できません」になっていた。
-        const certainHit = hits.some((t) => !t.undecidable && !hasTruncatedRef(t, rule.tree));
+        //
+        // 「配下だと確定した対象」からは、解除がすでに覆っているものを除く。除いていなかった
+        // 頃は、解除の範囲内しか触らないコマンドでも、切り詰められたトークンが 1 つあるだけで
+        // 見出しが断定形に戻っていた ―― `tool-a` を解除して `mkdir -p a/{x,y}` を打つと、
+        // 展開後の `a/x`・`a/y` はどちらも範囲内で、拒否の原因は `a/` が `{` で切り詰められて
+        // いることだけなのに、文面は「操作の対象が <ツリー> 配下です」と言い切っていた。
+        // 読んだ側は書き直せば通るとは思わないので、`mkdir -p a/x a/y` に辿り着けない。
+        // 判定は unlockCoversTargets に渡して合流させる(ここに解除判定を書き写すと、
+        // 片方だけ直って食い違う)。
+        const certainHit = hits.some((t) => !t.undecidable && !hasTruncatedRef(t, rule.tree)
+          && !unlockCoversTargets(rule.tree, [t], scoped));
         const braceHit = !certainHit && hits.some((t) => t.undecidable === 'brace');
+        const basesHit = !certainHit && hits.some((t) => t.undecidable === 'bases');
         const truncatedHit = !certainHit && hits.some((t) => hasTruncatedRef(t, rule.tree));
-        const undecidable = braceHit || truncatedHit;
+        const undecidable = braceHit || basesHit || truncatedHit;
         let reason = `操作の対象が ${rule.tree} 配下です${runtimeNote}`;
         if (braceHit) {
           reason = `ブレース展開を展開しきれないため、対象が ${rule.tree} 配下かどうか判定できません`;
+        } else if (basesHit) {
+          reason = `ディレクトリ移動が多すぎて相対パスの基準を数え切れないため、対象が ${rule.tree} 配下かどうか判定できません`;
         } else if (truncatedHit) {
           reason = opaqueTool
             ? `このツールは入力の形が決まっておらず、対象の指定がどこで終わるかを特定できないため、${rule.tree} 配下かどうか判定できません`
@@ -1453,8 +1535,9 @@ function unlockAttemptMessage() {
 // 書く経路を塞ぐための拒否なので、「別の書き方なら通る」と読めない文面にする。
 function unlockStateMessage() {
   return [
-    '[account-guard] 解除の状態ファイルへの書き込みは拒否しました。',
-    `${UNLOCKS} はガードの判定そのものを決めるファイルで、Claude からの書き換えを常に禁じています。`,
+    '[account-guard] ガードの状態ファイルへの書き込みは拒否しました。',
+    `${GUARD_DIR} 配下はガードの判定そのものを決める場所で、Claude からの書き換えを常に禁じています`,
+    '(config.json は保護ルール、unlocks.json は現に効いている解除、unlock.log はその履歴)。',
     '',
     '解除の追加・取り消しはコマンドで行ってください。',
     '  ! guard unlock "<理由>" … ユーザーが打つ(解除の追加)',
@@ -2041,9 +2124,18 @@ function reportCrash(e) {
   // 外側の catch は stderr に書くだけ ―― 拒否が出力されず呼び出しは通ってしまう。縮小判定の
   // 本体である cwd の拒否まで巻き添えにしないよう、個別に握りつぶして安全側の既定に倒す
   // (解除の遮断は失われるが、cwd がツリー内なら下の find が拒否する)。
+  // 適用条件も main(violation)と同じに揃える ―― 守るツリーが無いなら遮断しない、
+  // 壊れた設定の修復だけは通す。ここだけ無条件にしていると、ガードが壊れている間だけ
+  // 「ルール未設定でも解除コマンドが拒否される」「壊れた config を直せない」に戻る。
+  const repairable = isEscapeHatch(input, config);
+  const guarding = config.broken || config.rules.length > 0;
   let unlockBlocked = null;
   try {
-    unlockBlocked = isUnlockAttempt(input) ? 'attempt' : isUnlockStateWrite(input) ? 'state' : null;
+    if (guarding) {
+      unlockBlocked = isUnlockAttempt(input) ? 'attempt'
+        : (isUnlockStateWrite(input) && !(config.broken && repairable)) ? 'state'
+          : null;
+    }
   } catch {
     unlockBlocked = null;
   }
@@ -2057,7 +2149,6 @@ function reportCrash(e) {
   } catch {
     unlocked = [];
   }
-  const repairable = isEscapeHatch(input, config);
   const hit = unlockBlocked
     ? { unlockBlocked }
     : config.broken
