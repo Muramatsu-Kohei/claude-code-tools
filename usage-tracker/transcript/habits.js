@@ -5,7 +5,7 @@
 // usage.jsonl ではなく transcript を使うのは、usage.jsonl が statusline 更新時の記録で
 // サンプリングが粗く、無操作の切れ目を実際より長く見積もるため。
 //
-// 使い方: node habits.js [--days 14] [--json] [--since 2026-08-09]
+// 使い方: node habits.js [--days 14] [--gap 分] [--since YYYY-MM-DD] [--json]
 const fs = require('fs');
 const path = require('path');
 const { ROOT, cost, ctxLen, transcriptFiles, records, warnUnknownModels } = require('./lib');
