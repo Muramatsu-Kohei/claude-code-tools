@@ -181,11 +181,13 @@ $ node migrate-account.js --acct team             # 付与する(バックアッ
 - `transcript/sessions.js` — セッションごとのコスト・到達コンテキスト長・委譲回数(重いツール直接呼び出し vs サブエージェント委譲)を集計し、コスト上位セッションの表を出す。
 - `transcript/turncost.js` — Opus 系メインスレッドのみ抽出し、コンテキスト長バケット別の「1ターンあたり単価」と 30〜60K 帯を 1.0 とした倍率を出す。
 - `transcript/breakdown.js` — モデル×レイヤー(main/subagent)別のトークン内訳と、tool_result の総文字数をツール別に出す。「どのツールの出力が文脈を太らせているか」= 委譲候補を見つけるのが目的。
+- `transcript/habits.js` — 時間軸の使い方を出す。作業時間(操作の間隔を空白で区切って合算)・日別・時間帯・プロジェクト別と並行度・送信の癖・ツールの偏り・委譲が担った割合・セッションの到達コンテキスト。`--days N` / `--since YYYY-MM-DD` で期間、`--gap 分` で区切りの空白、`--json` で機械可読な出力。
 
 ```powershell
 node transcript/sessions.js
 node transcript/turncost.js
 node transcript/breakdown.js
+node transcript/habits.js --days 14
 node test/run.js               # test/*.test.js を一括実行(偽 HOME を使うので実データは読まない)
 node test/run.js guard         # 名前の一部で絞って実行
 node test/transcript.test.js   # 1 ファイルだけ実行したいとき
@@ -212,4 +214,7 @@ node test/transcript.test.js   # 1 ファイルだけ実行したいとき
 - `in_tok` / `out_tok` は**コンテキスト窓の累積でセッション単位**。プランの枠に計上される総消費量ではないので、「%あたり何トークン」の目安にはなるが絶対値としては使えない。
 - **Anthropic 側が枠の定義や重み付けを変えると過去データと比較できない**。時系列を残しているのはそのため(傾きが途中で変わったら定義変更を疑う)。
 - 5時間枠と週次枠が**同じ消費を同じ重みで数えている保証はない**。このツールが測るのはあくまで両者の観測上の比。
-- **`transcript/` 配下の分析はアカウントを区別できない**。`usage.jsonl` と違い、transcript は Claude Code が書くファイルで、レコードにアカウントを示す情報が無い(`userType` はアカウント同定に使えない)。複数アカウントを使い分けている場合、`sessions.js` / `turncost.js` / `breakdown.js` の集計は**両方を黙って合算する**。分けたいときは対象ディレクトリか期間で絞るしかない。なお `pricing.js` は API 定価での換算なのでプラン種別には依存しない——裏を返すと、この換算コストは**どちらのアカウントの枠を消費したかを一切表さない**。
+- **`transcript/` 配下の分析はアカウントを区別できない**。`usage.jsonl` と違い、transcript は Claude Code が書くファイルで、レコードにアカウントを示す情報が無い(`userType` はアカウント同定に使えない)。複数アカウントを使い分けている場合、`sessions.js` / `turncost.js` / `breakdown.js` / `habits.js` の集計は**両方を黙って合算する**。分けたいときは対象ディレクトリか期間で絞るしかない。なお `pricing.js` は API 定価での換算なのでプラン種別には依存しない——裏を返すと、この換算コストは**どちらのアカウントの枠を消費したかを一切表さない**。
+- **`usage.jsonl` の `cost` はセッションの累積値**。statusline が返す `total_cost_usd` をそのまま記録しているため、行ごとに足し上げると同じ額を何度も数えて桁が変わる。合計を出すならセッションごとの最大値を取るか、`transcript/` 側の換算を使う。
+- **`habits.js` の作業時間は推定であって打刻ではない**。操作の間隔を空白で区切って足しているだけなので、閾値の取り方で 1〜2 割動く(既定の 15 分に対し、5 分なら縮み 30 分なら伸びる)。長い実行を待っている時間と離席は区別できず、どちらも空白が閾値以内なら作業時間に入る。だから `--gap` を振って幅を確かめてから読むこと。
+- **サブエージェントの transcript は親セッションの下にある**(`projects/<プロジェクト>/<セッションID>/subagents/agent-*.jsonl`)。`isSidechain` フラグはこのファイル群には付かないので、それを頼りにメインと分けようとすると全部メイン扱いになる。`habits.js` はパスで判別している。

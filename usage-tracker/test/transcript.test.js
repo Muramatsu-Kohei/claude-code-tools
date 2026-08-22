@@ -38,14 +38,14 @@ function writeTranscript(home, project, id, recs) {
 }
 
 // 偽 HOME を向けてスクリプトを実行する。非 0 終了も検証対象なので投げずに返す
-function run(script, home) {
+function run(script, home, args = []) {
   const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
   // 孤児プロセスが残る事故(issue #8)の検出網として timeout を掛ける。stdin は既に
   // 'ignore' で閉じているのでこのスクリプト自体がハングする経路は無いはずだが、
   // 念のための保険。
   const timeout = 30000;
   try {
-    const out = execFileSync(process.execPath, [path.join(TRANSCRIPT, script)], {
+    const out = execFileSync(process.execPath, [path.join(TRANSCRIPT, script), ...args], {
       encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
       timeout, killSignal: 'SIGKILL',
     });
@@ -141,6 +141,60 @@ writeTranscript(homeB, 'proj', 'bbbbbbbb-0000-0000-0000-000000000001', [
 const ss = run('sessions.js', homeB);
 check('sessions.js が正常終了する', ss.code === 0, ss.err);
 check('対象ツールが 0 回でも委譲率が NaN にならない', /委譲率 -/.test(ss.out) && !/NaN/.test(ss.out), ss.out);
+
+// ---- サブエージェントの transcript を人間の操作と混ぜない ----
+// サブエージェントのログは projects/<プロジェクト>/<親セッションID>/subagents/agent-*.jsonl
+// に置かれる。ディレクトリ名をそのままプロジェクト名にすると "subagents" という架空の
+// プロジェクトが生まれ、さらにサブエージェントへの指示文が「自分の送信」として数えられて
+// 送信回数が実際より多く見える(実際に一度そう出した)。
+console.log('\nhabits.js');
+const homeH = sandbox('habits');
+const at = hhmm => `2026-01-01T${hhmm}:00.000Z`;
+const aTurn = (time, content) => ({
+  type: 'assistant', timestamp: at(time), isSidechain: false,
+  message: { model: 'claude-opus-5', usage: usage({ input_tokens: 10, output_tokens: 5 }), content },
+});
+const uTurn = (time, text) => ({ type: 'user', timestamp: at(time), message: { content: text } });
+const SID = 'cccccccc-0000-0000-0000-000000000001';
+
+// メイン: 送信 1 回・ツール 2 回。20 分間隔を空けて 0.2h の表示閾値を超えさせる
+writeTranscript(homeH, 'proj', SID, [
+  uTurn('00:00', '調べて直して'),
+  aTurn('00:10', [{ type: 'tool_use', id: 'm1', name: 'Agent', input: { subagent_type: 'sonnet-explorer' } }]),
+  aTurn('00:20', [{ type: 'tool_use', id: 'm2', name: 'Edit', input: {} }]),
+]);
+// サブ: 指示文(user)1 件とツール 2 回。指示文は人間の送信ではない。
+// 時刻を散らして 0.2h(プロジェクト一覧の表示閾値)を超えさせる — 短いと帰属を
+// 間違えても一覧から消えるだけになり、テストが素通りする。
+writeTranscript(homeH, path.join('proj', SID, 'subagents'), 'agent-abc123', [
+  uTurn('00:11', 'この関数の呼び出し元を全部挙げて'),
+  aTurn('00:25', [{ type: 'tool_use', id: 's1', name: 'Read', input: {} }]),
+  aTurn('00:40', [{ type: 'tool_use', id: 's2', name: 'Grep', input: {} }]),
+]);
+const hb = run('habits.js', homeH, ['--since', '2026-01-01']);
+check('habits.js が正常終了する', hb.code === 0, hb.err);
+check('サブエージェントへの指示を自分の送信として数えない', /送信 1 回/.test(hb.out), hb.out);
+check('"subagents" が架空のプロジェクトとして現れない', !/^subagents\s/m.test(hb.out), hb.out);
+// 親に合流していれば 00:00〜00:40 の 0.6h 台。合流に失敗すると proj は 0.3h に縮む
+check('サブの作業が親プロジェクトに帰属する', /^proj\s+0\.[67]h/m.test(hb.out), hb.out);
+check('委譲が担ったツール実行を数える(サブ 2 / 全 4 = 50%)',
+  /ツール 2 回/.test(hb.out) && /ツール実行の 50%/.test(hb.out), hb.out);
+check('委譲先の種別を集計する', /sonnet-explorer\s+1/.test(hb.out), hb.out);
+
+// 作業時間は無操作の空白で切る。既定 15 分に対し 2 時間空ければ別ブロックになる
+writeTranscript(homeH, 'proj2', 'cccccccc-0000-0000-0000-000000000002', [
+  uTurn('02:00', '別の作業'),
+  aTurn('02:01', [{ type: 'tool_use', id: 'x1', name: 'Bash', input: {} }]),
+]);
+const hb2 = run('habits.js', homeH, ['--since', '2026-01-01']);
+check('離れた時刻の操作を1つの区間に繋げない', /gap=15分\s+0\.\d+h\s+ブロック 2/.test(hb2.out), hb2.out);
+
+const hbj = run('habits.js', homeH, ['--since', '2026-01-01', '--json']);
+let parsed = null;
+try { parsed = JSON.parse(hbj.out); } catch (e) { parsed = null; }
+check('--json が機械可読な集計を返す',
+  parsed && parsed.input.userMsgs === 2 && parsed.delegation.subToolUses === 2,
+  parsed ? JSON.stringify(parsed.input) : hbj.out.slice(0, 200));
 
 // ---- transcript が無い環境 ----
 console.log('\ntranscript が無い場合');
