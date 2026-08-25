@@ -11,6 +11,14 @@
 | 作業ログのツリー隔離 | `claude-worklog/`（`restrictedTrees` 設定） |
 | 5 時間枠 ping のアカウント別状態 | `claude-window-keeper/` |
 
+> **ツリーを守る仕組みは 2 つあり、設定ファイルは別。** `account-guard` は
+> `~/.claude/account-guard/config.json` の `rules` でそのツリーへの**操作**を遮断し、
+> `claude-worklog` は `~/.claude/worklog/config.json` の `restrictedTrees` で
+> そのツリーの**作業ログの表示**を伏せる。守備範囲が違うので連動しない
+> （「操作は許すが作業ログは伏せる」も書ける）。**掛けるときも外すときも両方に書く。**
+> 片方だけになっている状態は `guard status` と worklog の注記が互いに報告する
+> （表示だけで、判定には影響しない）。
+
 ---
 
 ## 1. 前提となる事実

@@ -176,6 +176,156 @@ function blockedTrees(cfg, account) {
     .filter((r) => !(Array.isArray(r.allow) && r.allow.includes(account)));
 }
 
+// ---------------------------------------------------------------------------
+//  姉妹ツール account-guard との照合
+//
+//  同じツリーを、account-guard は「操作の遮断」で、worklog は「記録の読み出し制限」で
+//  守る。守備範囲が違うので設定は意図して別ファイルに分けてあるが、書く内容の形は同じ
+//  ({ tree, allow })なので、片方だけ書き換えて「解除したつもり」になる事故が起きる。
+//  実際に起きた: account-guard の rules を空にしたあとも worklog 側が残っていて、
+//  ツリー保護は外したはずなのに作業ログだけ伏せられ続け、原因を調べ直すことになった。
+//  そのとき手掛かりが無かったのは、伏せた理由が「別アカウント専用のツリーだから」としか
+//  出ず、どちらの設定が効いているのかが利用者から見えなかったため。
+//
+//  ここでするのは照合と報告だけで、判定には一切影響しない。相手の設定を判定に使うと、
+//  worklog 単体で使う構成が account-guard に依存し、「操作は許すが表示は伏せる」という
+//  正当な使い分けも書けなくなる。照合できないときは黙る(下の guardActiveRules 参照)。
+// ---------------------------------------------------------------------------
+
+const GUARD_CONFIG_PATH = path.join(CLAUDE_DIR, 'account-guard', 'config.json');
+
+// 両ツールで解釈が一致すると言い切れる tree の形。照合に使う tree は、自分の側も相手の側も
+// これを通ったものだけにする。
+//
+// account-guard の normalize は Git Bash 表記の `/c/org-tree` を `c:/org-tree` に寄せ、
+// ドライブ文字を落とした `/org-tree` は「どのドライブでも、パスの途中でも一致する広い
+// ルール」として扱う(向こうの README と issue #6)。一方こちらの normPath(path.resolve)は
+// どちらも実行時のドライブを基準にした別の場所へ解決する。この差を持ち込むと、実際には
+// 保護が効いているツリーに対して「保護されていない、外してよい」と案内してしまう —
+// プライバシー機能として最も避けたい向きの誤りなので、言い切れない形は照合ごと降りる。
+//
+// ドライブ文字を必須にしているので、この照合は Windows でしか働かない(POSIX では常に
+// 何も出ない)。両ツールとも Windows 前提なので割り切っている。README に明記した
+function comparableTree(t) {
+  return typeof t === 'string' && /^[a-zA-Z]:[\\/]/.test(t);
+}
+
+// account-guard 側で「現在のアカウントに対して今まさに効いている」保護ルールを返す。
+// 照合できないときは null を返し、呼び出し側は何も言わない:
+//  - 未作成(ENOENT): account-guard を入れていない構成。「向こうは保護していない」のは
+//    事実だが、使ってもいないツールの名前を出しても混乱を増やすだけ
+//  - 読めない/壊れている: account-guard は壊れた設定を全拒否として扱う(fail-closed)ので、
+//    実際には保護が最も強く効いている。「効いていない」と案内すると正反対になる
+// 一時解除(unlocks.json)は見ない。あれはセッション単位で消える一時的な状態で、
+// ここで知らせたいのは「設定を片方だけ書き換えたまま放置している」という恒久的な食い違い
+function guardActiveRules(account) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(GUARD_CONFIG_PATH, 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.rules)) return null;
+  // 書き損じ(tree が非文字列・空・相対パス)は 1 件でも当たれば全体をあきらめる。
+  // account-guard の loadConfig はこれを「設定全体が壊れている」とみなし、修復するまで
+  // 全操作を拒否する(= 保護が最も強く効いている)。壊れたルールだけ捨てて残りで判定
+  // すると、その最中に「効いていない」と正反対の案内を出す。allow に誰が入っていても
+  // 向こうの倒れ方は同じなので、この検査だけは絞る前に全ルールへ掛ける
+  if (!parsed.rules.every((r) => r && typeof r.tree === 'string' && r.tree
+    && path.isAbsolute(r.tree))) return null;
+  // 今のアカウントを拒否しているルールだけが「今まさに保護している」ルール。allow に
+  // 今のアカウントが入っているルールは何も遮っていないので、以降の判定には関わらない
+  const relevant = parsed.rules
+    .filter((r) => !(Array.isArray(r.allow) && r.allow.includes(account)));
+  // 両ツールで同じ場所を指すと言い切れない tree が保護側に 1 件でもあれば、そのルールが
+  // 対象ツリーを覆っているかを判定できない = 「効いていない」と言い切れないので降りる。
+  // 絞る範囲を account-guard の status 側と揃えてあるのは、両 README が「逆方向は同じ
+  // 食い違いを報告する」と約束しているため。片方だけ全ルールを検めると、同じ設定でも
+  // 報告する側としない側が生まれる
+  if (!relevant.every((r) => comparableTree(r.tree))) return null;
+  return relevant;
+}
+
+// worklog 側だけが伏せているツリー(= account-guard 側では今のアカウントで素通しになる
+// ツリー)を返す。account-guard の判定も前方一致なので、親ツリーが保護されていれば配下も
+// 保護される。cwdUnderTree で向き(worklog の tree が向こうの tree の内側)を固定するのは
+// そのため。逆向きまで一致にすると、向こうが子ディレクトリだけを守っている構成を
+// 「同じものを守っている」と誤って扱ってしまう
+function guardMismatchedTrees(blocked, account) {
+  // BLOCK_ALL(設定を読めず全伏せ)は特定のツリーの話ではないので照合の対象外。
+  // 自分の tree にも comparableTree を掛けるのは、突き合わせる 2 つのうち片方だけを
+  // 検めても解釈の差は消えないため。こちらの restrictedTrees は loadConfig の
+  // path.isAbsolute を通っているが、それはドライブ文字を落とした `/org-tree` を
+  // 通してしまう(issue #6 と同じ穴)
+  const trees = blocked.filter((r) => !r.all && comparableTree(r.tree)).map((r) => r.tree);
+  if (!trees.length) return [];
+  const guard = guardActiveRules(account);
+  if (!guard) return [];
+  return trees.filter((t) => !guard.some((g) => cwdUnderTree(t, g.tree)));
+}
+
+// 食い違いを利用者向けの一文にする。既存の注記の末尾へ連結して使う。
+// 平常時(両方に書いてある・account-guard 未導入・向こうが壊れている)は null を返すので、
+// 注記の文面は今までどおり一言一句変わらない。
+//
+// onlyTrees はこの注記が名指ししている対象に効いているルールの tree 一覧。--project や
+// cwd 基準の案内は特定のプロジェクトについて語っているので、そこに無関係なツリーの
+// 食い違いを混ぜると「この制限は」の指す先がずれ、実際には両方に書いてある制限を
+// 「worklog 側だけのもの」と誤って説明してしまう。件数ベースの注記(restrictionNote)は
+// 横断的な話なので null を渡して絞らない
+function guardMismatchNote(cfg, account, onlyTrees = null) {
+  // 設定を読めていないときの理由は「別アカウント専用のツリーだから」ではないので、
+  // ツリー単位の照合を持ち出しても噛み合わない(restrictionNote 側が本当の理由を出す)
+  if (cfg.configBroken) return null;
+  const blocked = onlyTrees
+    ? blockedTrees(cfg, account).filter((r) => onlyTrees.includes(r.tree))
+    : blockedTrees(cfg, account);
+  const mismatched = guardMismatchedTrees(blocked, account);
+  if (!mismatched.length) return null;
+  // 「保護されていない」ではなく「今のアカウントに効いていない」と言う。ここが拾う
+  // 食い違いには「向こうの allow に今のアカウントが入っている」場合も含まれ、そのとき
+  // 保護ルール自体は存在して他のアカウントには効いている。「保護されていない」と読んで
+  // 向こうのルールごと消すと、まだ生きている保護まで外れる(それが起きるのは
+  // account-guard 側 = 操作の遮断なので、worklog 側を外すより被害が大きい)
+  return `この制限は worklog 側の設定によるもの: ${CONFIG_PATH} の restrictedTrees`
+    + `\n(${mismatched.join(' / ')} は account-guard 側では今のアカウントに効いていない`
+    + ' — 解除するつもりなら両方の設定を見直す)';
+}
+
+// 注記に食い違いの説明を足す。改行で区切るだけで行頭は整えない — 呼び出し側の書式が
+// 2 通り(CLI の `! ` と export の Markdown 引用 `> `)あり、必要な継続行の飾りが違うため
+// (noteLines 参照)
+function withGuardMismatch(note, cfg, account, onlyTrees = null) {
+  if (!note) return note;
+  const extra = guardMismatchNote(cfg, account, onlyTrees);
+  return extra ? `${note}\n${extra}` : note;
+}
+
+// 複数行になりうる注記に行頭の飾りを付ける。1 行目と継続行で分けるのは、Markdown の
+// 引用が継続行にも `>` を要求するため。付けないと lazy continuation で前の行に繋がり、
+// 改行が消えて 1 行に潰れる(export の出力で実際に潰れた)
+function noteLines(note, first, cont) {
+  return String(note).split('\n').map((l, i) => `${i === 0 ? first : cont}${l}`).join('\n');
+}
+const cliNote = (note) => noteLines(note, '! ', '  ');
+const mdNote = (note) => noteLines(note, '> ', '> ');
+
+// 指定したキーのどれかに実際に効いている制限ルールの tree を返す。名指しの注記が
+// 「この制限は」と言うとき、その制限を作っているルールだけを説明の対象にするために使う
+function hitTrees(blocked, keys) {
+  return blocked.filter((r) => !r.all && keys.some((k) => keyUnderTree(k, r.tree))).map((r) => r.tree);
+}
+
+// hitTrees の cwd 版。move はセッション単位で「対象外」を決めるので、説明の材料も
+// その記録に実際に効いているルールに限る(hitTrees と同じ理由)。判定を書き下ろさず
+// isCwdBlocked にルールを 1 件ずつ渡すのは、cwd を持たないレコードのキー単位
+// フォールバックまで含めて「対象外」を決めた判定と、同じものを使うため
+function hitTreesByCwd(blocked, sessions, key) {
+  return blocked
+    .filter((r) => !r.all && sessions.some((s) => isCwdBlocked(s.cwd, [r], key)))
+    .map((r) => r.tree);
+}
+
 // key のログファイルに現れる cwd のうち、「本来その key の記録である」と確認できる
 // ものだけを集めてキャッシュする。isKeyBlocked は制限ルールごとに keyUnderTree を呼び、
 // filterVisibleKeys は全キーに対して走り、restrictionNote は同じコマンド内でさらに
@@ -307,7 +457,12 @@ function filterVisibleSessions(sessions, cfg, account, fallbackKey = null) {
 // 非制限キーの下にある孤児(move で移された記録など)が件数に現れず、まさにその網が
 // 拾う取りこぼしだけが無言で消える — この注記が防ごうとしている誤解そのものになる。
 // scopeKeys はそのコマンドが実際に問い合わせたキー(制限フィルタ前)。省略時は全キー横断。
-function restrictionNote(cfg, account, hiddenSessions = 0, scopeKeys = null) {
+//
+// withMismatch を false にすると、食い違いの説明(複数行になる)を付けない。既定を true に
+// してあるのは、付け忘れが「事故に気づけないまま」になる向きだから。false を渡してよいのは、
+// 注記を 1 行に収めなければ壊れる書式へ埋め込む呼び出し側が、食い違いの説明を別立てで
+// 自分で出す場合だけ(cmdHandoff の括弧書きがそれ)
+function restrictionNote(cfg, account, hiddenSessions = 0, scopeKeys = null, { withMismatch = true } = {}) {
   if (cfg.configBroken) {
     return `設定 ${CONFIG_PATH} を読めないため、安全側に倒して全ての記録を伏せています`;
   }
@@ -327,7 +482,9 @@ function restrictionNote(cfg, account, hiddenSessions = 0, scopeKeys = null) {
   if (hiddenSessions > 0) parts.push(`${hiddenSessions} 件のセッション`);
   // 「と 」の後ろのスペースは意図的。各パートが数字で始まるので、詰めると
   // 「プロジェクトと2 件」と不揃いになる
-  return parts.length ? `別アカウント専用のツリーのため ${parts.join('と ')}を表示していません` : null;
+  if (!parts.length) return null;
+  const note = `別アカウント専用のツリーのため ${parts.join('と ')}を表示していません`;
+  return withMismatch ? withGuardMismatch(note, cfg, account) : note;
 }
 
 // フック実行中の失敗は表に出せない(出すとセッションが汚れる)ので、ここだけに残す
@@ -1047,7 +1204,9 @@ function buildContext(key, cwd, currentSid, cfg) {
     cfg, currentAccount(), key,
   );
   const parts = [];
-  if (cfg.configBroken) parts.push(`> ${restrictionNote(cfg, currentAccount())}`);
+  // configBroken 限定なので今は必ず 1 行だが、生の補間だと将来ここが複数行になったとき
+  // 引用が崩れる(export で実際に起きた)。整形はどの経路も同じヘルパに通す
+  if (cfg.configBroken) parts.push(mdNote(restrictionNote(cfg, currentAccount())));
 
   // どのツールの続きを渡すか。全ツール分の引き継ぎを入れると、まさに避けたかった
   // 「無関係な引き継ぎ」が増えるだけなので、主スコープ 1 本だけを全文にする。
@@ -1566,7 +1725,12 @@ function explicitProjectRestrictionNote(flags, cfg, account) {
     const candidates = matchProjectKeys(raw, explicit).filter((k) => raw.includes(k));
     if (!candidates.length) return null;
     if (!candidates.every((k) => isKeyBlocked(k, blocked))) return null; // 一部でも見えるなら通常表示になる
-    return `「${explicit}」は別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。`;
+    // 食い違いの説明は、この注記が名指ししているプロジェクトに実際に効いているルールに限る。
+    // 全ルールを見ると、別のツリーの食い違いを「この制限は」の説明として出してしまう
+    return withGuardMismatch(
+      `「${explicit}」は別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。`,
+      cfg, account, hitTrees(blocked, candidates),
+    );
   }
   // --project 省略時(既定の cwd 解決)。--all は listProjectKeys() で既にキー単位
   // フィルタ済みで、件数ベースの restrictionNote が別途案内するのでここでは扱わない。
@@ -1574,7 +1738,10 @@ function explicitProjectRestrictionNote(flags, cfg, account) {
   if (flags.all) return null;
   const cwdKey = repoKey(one(flags, 'cwd', process.cwd()));
   if (!isKeyBlocked(cwdKey, blocked)) return null;
-  return '現在のディレクトリは別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。';
+  return withGuardMismatch(
+    '現在のディレクトリは別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。',
+    cfg, account, hitTrees(blocked, [cwdKey]),
+  );
 }
 
 function cmdList(flags) {
@@ -1613,20 +1780,20 @@ function cmdList(flags) {
     // 調べ回ることになるため、--project が保護ツリーに当たっている場合はそちらを優先する
     const restricted = explicitProjectRestrictionNote(flags, cfg, account);
     if (restricted) {
-      console.log(yellow(`! ${restricted}`));
+      console.log(yellow(cliNote(restricted)));
     } else {
       console.log(typeof scopeFilter === 'string'
         ? `スコープ「${scopeFilter}」に一致する記録がない。`
         : '記録がまだない。フックを設定したか、対象プロジェクトが合っているか確認する。');
     }
     // 個別の案内を出したときは件数の注記を重ねない(同じことを二度言うことになる)
-    if (note && !restricted) console.log(yellow(`! ${note}`));
+    if (note && !restricted) console.log(yellow(cliNote(note)));
     return;
   }
   const where = showProject ? '全プロジェクト' : keys.map((k) => repoLabel(k, all)).join(', ');
   console.log(bold(`直近の作業ログ (${where}${typeof scopeFilter === 'string' ? ` / scope ${scopeFilter}` : ''})`));
   for (const s of sessions) console.log(renderSession(s, { verbose, showProject, cfg }));
-  if (note) console.log(yellow(`! ${note}`));
+  if (note) console.log(yellow(cliNote(note)));
 }
 
 function cmdToday(flags) {
@@ -1664,12 +1831,12 @@ function cmdToday(flags) {
     // --project 省略時は cwd ではなく全プロジェクトが対象なので、cwd 基準の案内は使わない
     const restricted = flags.project ? explicitProjectRestrictionNote(flags, cfg, account) : null;
     if (restricted) {
-      console.log(yellow(`! ${restricted}`));
+      console.log(yellow(cliNote(restricted)));
     } else {
       console.log(days > 1 ? `直近 ${days} 日の記録はない。` : '今日の記録はまだない。');
     }
     // 個別の案内を出したときは件数の注記を重ねない
-    if (note && !restricted) console.log(yellow(`! ${note}`));
+    if (note && !restricted) console.log(yellow(cliNote(note)));
     return;
   }
   let currentDay = null;
@@ -1683,7 +1850,7 @@ function cmdToday(flags) {
   }
   const projects = uniq(sessions.map((s) => displayName(s, cfg)));
   console.log(`\n${dim(`${sessions.length} セッション / ${projects.length} プロジェクト: ${projects.join(', ')}`)}`);
-  if (note) console.log(yellow(`! ${note}`));
+  if (note) console.log(yellow(cliNote(note)));
 }
 
 function cmdLive() {
@@ -1770,7 +1937,7 @@ function cmdHandoff(flags, scopeArg) {
         ? restrictionNote(cfg, account, hiddenSessions, scopeKeys)
         : null);
     if (note) {
-      console.log(yellow(`! ${note}`));
+      console.log(yellow(cliNote(note)));
     } else {
       console.log('引き継ぎ文が記録されていない。セッション終了時に /finish を実行すると記録される。');
     }
@@ -1790,8 +1957,15 @@ function cmdHandoff(flags, scopeArg) {
   // 出せた引き継ぎより新しいものが制限で伏せられていることがある。何も言わずに古いほうを
   // 渡すと「これが最新」と受け取られるため、伏せた事実だけは添える(中身は出さない)
   if (hiddenKeys > 0 || hiddenSessions > 0) {
-    const note = restrictionNote(cfg, account, hiddenSessions, scopeKeys);
-    if (note) console.log(dim(`\n(${note}。より新しい引き継ぎがそちらにある可能性がある)`));
+    // 括弧の中に入れるので注記は 1 行でなければならない。食い違いの説明は複数行になり、
+    // 埋め込むと開き括弧と閉じ括弧・末尾の一文が別々の行に散って読めなくなるため、
+    // 括弧の外に別立てで出す(説明そのものは落とさない — この経路でしか伝わらない場合がある)
+    const note = restrictionNote(cfg, account, hiddenSessions, scopeKeys, { withMismatch: false });
+    if (note) {
+      console.log(dim(`\n(${note}。より新しい引き継ぎがそちらにある可能性がある)`));
+      const mismatch = guardMismatchNote(cfg, account);
+      if (mismatch) console.log(dim(noteLines(mismatch, '  ', '  ')));
+    }
   }
 }
 
@@ -1825,10 +1999,10 @@ function cmdExport(flags) {
   const hiddenKeys = scopeKeys.length - keys.length;
   const restricted = explicitProjectRestrictionNote(flags, cfg, account);
   if (restricted) {
-    out.push(`\n> ${restricted}`);
+    out.push(`\n${mdNote(restricted)}`);
   } else if (flags.all || cfg.configBroken || hiddenSessions > 0 || hiddenKeys > 0) {
     const note = restrictionNote(cfg, account, hiddenSessions, scopeKeys);
-    if (note) out.push(`\n> ${note}`);
+    if (note) out.push(`\n${mdNote(note)}`);
   }
   out.push('');
   let day = null;
@@ -1875,18 +2049,29 @@ function resolveMoveKey(spec, allowNew) {
   // (「ディスク上に無い」の警告は出るが move 自体は実行されてしまう)。
   // 制限が理由だと分かっている場合はキーを捏造せず、ここで move そのものを拒否する
   const cfg = loadConfig();
-  const blocked = blockedTrees(cfg, currentAccount());
+  const account = currentAccount();
+  const blocked = blockedTrees(cfg, account);
   // 設定を読めていないときは BLOCK_ALL で全部伏せているので、理由は「別アカウント専用の
   // ツリーだから」ではない。そのまま案内するとアカウント切り替えという効かない対処へ
   // 誘導してしまうため、restrictionNote / explicitProjectRestrictionNote と同じ区別をする
-  const denyReason = (what) => (cfg.configBroken
+  // 一覧側と同じ食い違いの説明を添える。ここは「なぜ動かせないのか」を調べる入り口の
+  // 一つで、設定を片方だけ外したまま来た利用者が最初にぶつかる場所でもある。
+  // keys は what が名指ししている対象のキー。explicitProjectRestrictionNote と同じく、
+  // その対象に実際に効いているルールだけを説明の材料にする — 全ルールを見ると、
+  // 両方に書いてあるツリーの move を断りながら「worklog 側だけ外せばよい」と誤誘導する。
+  // 継続行を字下げするのは、この文字列が Error の message になり
+  // `エラー: <1行目>` の形で出るため(2 行目以降が行頭に付くと読みにくい)
+  const denyReason = (what, keys = null) => (cfg.configBroken
     ? `設定 ${CONFIG_PATH} を読めないため、安全側に倒して全ての記録を伏せている。設定を直してからやり直す。`
-    : `${what}は別アカウント専用のツリーのため move できない。許可されたアカウントに切り替える。`);
+    : noteLines(withGuardMismatch(
+      `${what}は別アカウント専用のツリーのため move できない。許可されたアカウントに切り替える。`,
+      cfg, account, keys ? hitTrees(blocked, keys) : null,
+    ), '', '  '));
   if (blocked.length) {
     const raw = listProjectKeysRaw();
     const rawHit = raw.includes(spec) ? [spec] : raw.filter((k) => k.toLowerCase().includes(spec.toLowerCase()));
     if (rawHit.length && rawHit.every((k) => isKeyBlocked(k, blocked))) {
-      throw new Error(denyReason(`「${spec}」`));
+      throw new Error(denyReason(`「${spec}」`, rawHit));
     }
   }
 
@@ -1910,7 +2095,7 @@ function resolveMoveKey(spec, allowNew) {
   // ログを失ったのと同じになる。捏造するキーにもツリー判定を掛け、書けるが読めない
   // 置き場所を作らせない
   if (blocked.length && isKeyBlocked(key, blocked)) {
-    throw new Error(denyReason(`移動先「${spec}」`));
+    throw new Error(denyReason(`移動先「${spec}」`, [key]));
   }
   if (!existsSafe(normPath(spec))) console.log(yellow(`! 移動先 ${spec} はディスク上に無い。新しいキー ${key} を作る`));
   return key;
@@ -1989,7 +2174,9 @@ function cmdMove(flags) {
   // すり抜けてここまで来ることがある(過去の move で非制限キーへ移された孤児など)。
   // 下の一覧は summary をそのまま出すので、外さないと読み出し制限の抜け穴になる。
   // 見えていない記録を動かせるのも筋が通らないので、--force でも押し切らせない
-  const blocked = blockedTrees(loadConfig(), currentAccount());
+  const cfg = loadConfig();
+  const account = currentAccount();
+  const blocked = blockedTrees(cfg, account);
   // キー(from)も渡す。cwd を持たない孤児レコードまで一律に対象外にすると、保護ツリーと
   // 何の関係もない自分の記録が「別アカウント専用のツリーの記録」という誤った理由で
   // 動かせなくなる(from は resolveMoveKey を通っており可視なキーだけが来る)
@@ -2014,6 +2201,14 @@ function cmdMove(flags) {
   // 「消えた」と誤解して探し回らずに済むようにする
   for (const s of restricted) {
     console.log(yellow(`  対象外 ${fmtTime(s.startTs)} ${s.sid.slice(0, 8)} — 別アカウント専用のツリーの記録`));
+  }
+  // この一覧にもどちらの設定が効いているかを添える。move が丸ごと断られたときは
+  // resolveMoveKey の拒否理由が同じ説明を出すが、こちらは「一部のセッションだけ対象外」の
+  // 経路で、拒否理由は通らない。片方だけ外したまま来た利用者が「移せない記録がある」と
+  // 気づくのはここなので、説明が落ちると原因にたどり着けないまま終わる
+  if (restricted.length) {
+    const mismatch = guardMismatchNote(cfg, account, hitTreesByCwd(blocked, restricted, from));
+    if (mismatch) console.log(yellow(noteLines(mismatch, '  ', '  ')));
   }
   if (!moving.length) {
     console.error('移動できる記録がない。');

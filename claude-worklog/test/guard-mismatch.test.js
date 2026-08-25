@@ -1,0 +1,341 @@
+// 姉妹ツール account-guard との食い違い照合の回帰テスト。
+//
+// 同じツリーを account-guard は「操作の遮断」で、worklog は「記録の読み出し制限」で守る。
+// 設定は別ファイルなので、片方だけ書き換えて「解除したつもり」になる事故が起きる
+// (実際に起きた)。worklog が記録を伏せたとき、そのツリーが account-guard 側では
+// 素通しになっているなら、どちらの設定が効いているのかを注記で伝える。
+//
+// 大事なのは「判定は一切変えない」こと。照合できない・向こうでも守っている、のどちらでも
+// 注記は今までどおりの文面に戻り、伏せる/見せるの結果は動かない。
+const fs = require('fs');
+const path = require('path');
+const { execFileSync } = require('child_process');
+const {
+  tmpDir, projectKey, sandboxHome, checks, runner,
+} = require('./lib');
+
+const BASE = tmpDir('guard-mismatch');
+
+const TREE = path.join(BASE, 'org-tree');        // worklog が伏せるツリー
+const SUB = path.join(TREE, 'inner');            // その配下(前方一致の確認用)
+const TREE2 = path.join(BASE, 'second-tree');    // 2 本目。注記の対象を取り違えないことの確認用。
+// TREE と部分一致しない名前にするのは、--project や move の部分一致検索で巻き込まないため
+const OTHER = path.join(BASE, 'other-repo');     // 保護と無関係
+// 可視なキーの中に、cwd だけが保護ツリー配下のレコードが混ざった状態を作るためのリポジトリ。
+// move はキー単位の網(resolveMoveKey)を通ったあと、セッション単位でも cwd を見て外すので、
+// 「一部だけ対象外」という拒否理由とは別の経路がある
+const MIXED = path.join(BASE, 'mixed-repo');
+
+for (const r of [TREE, SUB, TREE2, OTHER, MIXED]) {
+  fs.mkdirSync(r, { recursive: true });
+  execFileSync('git', ['init', '-q'], { cwd: r, windowsHide: true, timeout: 30000, killSignal: 'SIGKILL' });
+}
+
+const { home, logDir } = sandboxHome(path.join(BASE, 'home'), { restrictedTrees: [{ tree: TREE, allow: ['team'] }] });
+const GUARD_DIR = path.join(home, '.claude', 'account-guard');
+fs.mkdirSync(GUARD_DIR, { recursive: true });
+const GUARD_CONFIG = path.join(GUARD_DIR, 'config.json');
+
+// 偽の .credentials.json でアカウントを差し替える(本物のトークンには触れない)
+function setAccount(subscriptionType) {
+  fs.writeFileSync(path.join(home, '.claude', '.credentials.json'), JSON.stringify({
+    claudeAiOauth: { subscriptionType, accessToken: 'dummy', refreshToken: 'dummy' },
+  }), 'utf8');
+}
+
+// account-guard の設定を差し替える。null を渡すと「未導入」(ファイルごと消す)
+function setGuard(config) {
+  if (config === null) {
+    fs.rmSync(GUARD_CONFIG, { force: true });
+    return;
+  }
+  fs.writeFileSync(GUARD_CONFIG, typeof config === 'string' ? config : JSON.stringify(config), 'utf8');
+}
+
+function setWorklog(config) {
+  fs.writeFileSync(path.join(logDir, 'config.json'), typeof config === 'string' ? config : JSON.stringify(config), 'utf8');
+}
+
+const RESTRICTED = { restrictedTrees: [{ tree: TREE, allow: ['team'] }] };
+
+function write(repo, sessions) {
+  const lines = [];
+  for (const s of sessions) {
+    lines.push(JSON.stringify({ k: 'start', sid: s.sid, ts: s.ts, cwd: s.cwd || repo, branch: 'main' }));
+    lines.push(JSON.stringify({
+      k: 'note', sid: s.sid, ts: s.ts, via: 'wrap', summary: s.summary, handoff: s.handoff || null,
+    }));
+    lines.push(JSON.stringify({ k: 'end', sid: s.sid, ts: s.ts + 1000, reason: 'clear', stats: {} }));
+  }
+  fs.writeFileSync(path.join(logDir, `${projectKey(repo)}.ndjson`), `${lines.join('\n')}\n`);
+}
+
+// ドライブ文字を落とした tree(`/org-tree`)が実際に伏せる先は、path.resolve の解決で
+// 「実行時ドライブのルート直下」になる。そこに記録があることにしないと制限が働かず、
+// 「照合しない」ことを確かめる検査が、注記自体が出ないせいで素通りしてしまう。
+// ディスク上には作らない — 制限の判定は記録に書かれた cwd で行われるので実体は要らない。
+// ドライブ文字をハードコードしないのは、リポジトリが別ドライブにある環境で壊れないため
+const DRIVE_ROOT = path.parse(BASE).root;
+const ROOT_TREE_REPO = path.join(DRIVE_ROOT, 'org-tree', 'repo');
+
+const T = Date.now() - 3600 * 1000;
+write(TREE, [{ sid: 'r1', ts: T, summary: '保護ツリーの作業' }]);
+write(ROOT_TREE_REPO, [{ sid: 'd1', ts: T, summary: 'ドライブ直下ツリーの作業' }]);
+write(TREE2, [{ sid: 'r2', ts: T, summary: '2本目のツリーの作業' }]);
+// OTHER には引き継ぎを持たせる。cmdHandoff の「括弧書きで伏せた件数を添える」経路は
+// 引き継ぎを出せたときにしか通らないため
+write(OTHER, [{ sid: 'o1', ts: T, summary: '無関係ツリーの作業', handoff: '次はここから' }]);
+
+const run = runner(home, OTHER);
+const { check, finish } = checks();
+
+// 食い違いの説明が出ているか。文面全体ではなく「どちらの設定が効いているか」を
+// 伝える核だけを見る(言い回しの調整でテストが落ちないように)
+const MISMATCH = /account-guard 側では今のアカウントに効いていない/;
+const WHICH_CONFIG = /この制限は worklog 側の設定によるもの/;
+
+setAccount('pro'); // allow=[team] に外れるので、以下すべて「伏せる」側
+
+console.log('\n食い違いがあるとき(片方だけ解除した状態)');
+
+setGuard({ rules: [] }); // まさに今回の事故: account-guard だけ空にした
+const cwdBlocked = run(['list', '--cwd', TREE]).out;
+check('cwd 基準の案内に、どちらの設定が効いているかが出る', WHICH_CONFIG.test(cwdBlocked), cwdBlocked);
+check('cwd 基準の案内に、account-guard 側との食い違いが出る', MISMATCH.test(cwdBlocked), cwdBlocked);
+check('元の文面(アカウント切り替えの案内)は残っている',
+  /別アカウント専用のツリーのため表示していない/.test(cwdBlocked), cwdBlocked);
+
+const projectBlocked = run(['list', '--project', projectKey(TREE)]).out;
+check('--project 指定の案内にも食い違いが出る', MISMATCH.test(projectBlocked), projectBlocked);
+
+const todayAll = run(['today', '--days', '3650']).out;
+check('件数ベースの注記(today)にも食い違いが出る', MISMATCH.test(todayAll), todayAll);
+
+const moveBlocked = run(['move', '--from', projectKey(TREE), '--to', projectKey(OTHER), '--all', '--dry-run']);
+check('move の拒否理由にも食い違いが出る', MISMATCH.test(moveBlocked.err), moveBlocked.err || moveBlocked.out);
+
+// 判定そのものは動かない。注記が増えても、伏せる対象は今までどおり
+check('食い違いがあっても保護ツリーの記録は伏せたまま',
+  !/保護ツリーの作業/.test(todayAll), todayAll);
+check('食い違いがあっても無関係ツリーの記録は見える',
+  /無関係ツリーの作業/.test(todayAll), todayAll);
+
+console.log('\n食い違いが無いとき(注記は今までどおりの文面に戻る)');
+
+setGuard({ rules: [{ tree: TREE, allow: ['team'] }] });
+const bothSet = run(['list', '--cwd', TREE]).out;
+check('両方に同じツリーが書いてあれば何も足さない', !MISMATCH.test(bothSet) && !WHICH_CONFIG.test(bothSet), bothSet);
+
+// account-guard の判定は前方一致なので、親を守っていれば配下も守られている。
+// ここを取り違えると、正しく設定してある構成に毎回「食い違っている」と出し続ける
+setGuard({ rules: [{ tree: BASE, allow: ['team'] }] });
+check('account-guard 側が親ツリーを守っていれば食い違いではない',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+// 逆向き(向こうが配下だけを守っている)は、worklog が伏せる範囲の方が広いので食い違い。
+// cwdUnderTree の向きを間違えるとここが落ちる
+setGuard({ rules: [{ tree: SUB, allow: ['team'] }] });
+check('account-guard 側が配下しか守っていなければ食い違いとして出す',
+  MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+setGuard(null);
+const noGuard = run(['list', '--cwd', TREE]).out;
+check('account-guard 未導入なら何も言わない(使っていないツールの名前を出さない)',
+  !MISMATCH.test(noGuard), noGuard);
+
+// 壊れた設定を account-guard は「全拒否」として扱う(fail-closed)。つまり保護は
+// 最も強く効いている状態なので、「効いていない」と案内すると正反対になる
+setGuard('{ "rules": [');
+check('account-guard の設定が壊れているときは何も言わない(向こうは全拒否なので逆の案内になる)',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+setGuard({ rules: 'まちがい' });
+check('account-guard の rules が配列でないときも何も言わない',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+console.log('\n照合の前提が崩れているとき');
+
+// worklog 側の設定が壊れていると全伏せになるが、理由は「別アカウント専用のツリー」では
+// ないので、ツリー単位の食い違いを持ち出しても噛み合わない
+setGuard({ rules: [] });
+setWorklog('{ "restrictedTrees": [');
+const brokenWorklog = run(['list', '--all']).out;
+check('worklog の設定が壊れているときは食い違いを言わない(理由が別)',
+  !MISMATCH.test(brokenWorklog), brokenWorklog);
+check('壊れているときの本来の理由は残っている',
+  /読めない/.test(brokenWorklog), brokenWorklog);
+
+setWorklog(RESTRICTED);
+
+// 許可されたアカウントなら、そもそも伏せないので注記自体が出ない
+setAccount('team');
+const allowed = run(['list', '--cwd', TREE]).out;
+check('許可されたアカウントでは記録が見える', /保護ツリーの作業/.test(allowed), allowed);
+check('許可されたアカウントでは食い違いも言わない', !MISMATCH.test(allowed), allowed);
+
+// account-guard 側が現在のアカウントを allow していても worklog 側が拒否していれば食い違い。
+// 「ルールが書いてあるか」ではなく「今のアカウントに効いているか」で見ていることの確認
+setAccount('pro');
+setGuard({ rules: [{ tree: TREE, allow: ['pro'] }] });
+const guardAllows = run(['list', '--cwd', TREE]).out;
+check('account-guard 側が今のアカウントを許可していれば食い違いとして出す',
+  MISMATCH.test(guardAllows), guardAllows);
+
+console.log('\naccount-guard 側が壊れている・解釈できない書き方をしているとき');
+
+// account-guard は「1 つでも書き損じたルールがあれば設定全体を壊れているとみなし、
+// すべての操作を拒否する」。こちらが壊れたルールだけ捨てて残りで判定すると、
+// 向こうが全拒否している最中に「効いていない」と正反対の案内を出す
+// 同居させる有効なルールは、TREE を覆わないもの(OTHER)にする。TREE を覆うルールを
+// 混ぜると、壊れたルールを無視しても「両方に書いてある」と判定されてしまい、
+// このチェックを外しても検査が通ってしまう(= 退行を検出できないテストになる)
+setGuard({ rules: [{ tree: OTHER, allow: ['team'] }, { tree: 'relative-path', allow: ['team'] }] });
+check('相対パスのルールが混じっていたら黙る(向こうは設定全体を壊れているとみなし全拒否)',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+setGuard({ rules: [{ tree: 42, allow: ['team'] }] });
+check('tree が文字列でないルールがあっても黙る',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+// ドライブ文字を落とした tree は向こうでは有効なルールとして働くが、こちらの normPath
+// (path.resolve)は実行時のドライブを基準に別の場所として解決する。解釈が食い違う以上、
+// 「効いていない」と言い切れない
+setGuard({ rules: [{ tree: '/org-tree', allow: ['team'] }] });
+check('ドライブ文字の無い tree があれば黙る(解釈が両者で食い違う)',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+// Git Bash 表記。向こうの normalize は `/c/org-tree` を `c:/org-tree` に寄せるが、
+// こちらの path.resolve は `<実行時のドライブ>:\c\org-tree` にしてしまう
+setGuard({ rules: [{ tree: '/c/org-tree', allow: ['team'] }] });
+check('Git Bash 表記の tree があれば黙る(保護が効いているのに外せと案内しない)',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+// 解釈できない tree でも、今のアカウントを allow しているルールは何も遮っていないので、
+// 覆っているかどうかを判定する必要がない = 照合を降りる理由にならない。
+// account-guard の status も「今拒否しているルール」だけを検めており(printWorklogRestrictions
+// の relevant)、両 README は「逆方向は同じ食い違いを報告する」と約束している。ここを
+// 全ルールに掛け直すと、同じ設定で報告する側としない側が生まれる
+setGuard({ rules: [{ tree: '/org-tree', allow: ['pro'] }] });
+const allowedOddTree = run(['list', '--cwd', TREE]).out;
+check('今のアカウントを許可しているだけのルールは、tree が解釈できなくても照合を止めない',
+  MISMATCH.test(allowedOddTree), allowedOddTree);
+
+// 一方、書き損じ(相対パス・非文字列・空)は allow に誰が入っていても降りる。
+// account-guard はルール 1 件の書き損じで設定全体を壊れているとみなし全操作を拒否するので、
+// 「今のアカウントには効いていない」は allow の中身に関わらず事実と逆になる
+setGuard({ rules: [{ tree: 'relative-path', allow: ['pro'] }] });
+check('書き損じのルールは、今のアカウントを許可していても黙る(向こうは全拒否)',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+console.log('\n名指しの注記は、その対象に効いている制限だけを説明する');
+
+// 制限ツリーが 2 本あり、TREE2 だけ account-guard 側にもある状態。
+// 「この制限は worklog 側の設定によるもの」が別のツリーの食い違いを指してはいけない
+setWorklog({ restrictedTrees: [{ tree: TREE, allow: ['team'] }, { tree: TREE2, allow: ['team'] }] });
+setGuard({ rules: [{ tree: TREE2, allow: ['team'] }] });
+
+const aboutTree2 = run(['list', '--project', projectKey(TREE2)]).out;
+check('両方に書いてあるツリーの注記に、別ツリーの食い違いを混ぜない',
+  !MISMATCH.test(aboutTree2), aboutTree2);
+check('その注記自体は今までどおり出ている',
+  /別アカウント専用のツリーのため表示していない/.test(aboutTree2), aboutTree2);
+
+const aboutTree1 = run(['list', '--project', projectKey(TREE)]).out;
+check('worklog 側だけのツリーの注記には食い違いを出す', MISMATCH.test(aboutTree1), aboutTree1);
+check('その説明に挙がるのは当該ツリーだけ',
+  aboutTree1.includes(TREE) && !aboutTree1.includes(TREE2), aboutTree1);
+
+// cwd 基準の案内も同じ。TREE2 に cd している体で叩く
+const cwdTree2 = run(['list', '--cwd', TREE2]).out;
+check('cwd 基準の案内でも対象を取り違えない', !MISMATCH.test(cwdTree2), cwdTree2);
+
+// 件数ベースの注記は横断的な話なので、絞らずに全ての食い違いを挙げてよい
+const acrossAll = run(['today', '--days', '3650']).out;
+check('件数ベースの注記は横断的なので食い違いを挙げる', MISMATCH.test(acrossAll), acrossAll);
+
+console.log('\nexport の Markdown では継続行にも引用記号を付ける');
+
+// `> ` の引用は 2 行目に `>` が無いと lazy continuation で前の行に繋がり、
+// 改行が消えて 1 行に潰れる
+setWorklog(RESTRICTED);
+setGuard({ rules: [] });
+const exported = run(['export', '--project', projectKey(TREE)]).out;
+check('export の注記が引用として出る', /^> .*別アカウント専用/m.test(exported), exported);
+check('食い違いの説明の継続行にも > が付く',
+  /^> この制限は worklog 側の設定によるもの/m.test(exported)
+  && /^> \(.*account-guard 側では今のアカウントに効いていない/m.test(exported), exported);
+check('引用記号の無い裸の継続行が残っていない',
+  !/^この制限は worklog 側の設定によるもの/m.test(exported), exported);
+
+console.log('\n1 行に収める書式へ埋め込む経路(handoff の括弧書き)');
+
+// 括弧の中に複数行を入れると開き括弧と閉じ括弧・末尾の一文が別々の行に散る。
+// 括弧は 1 行に保ち、食い違いの説明は括弧の外に別立てで出す
+const handoff = run(['handoff', '--all'], { cwd: OTHER }).out;
+check('括弧書きが 1 行に収まっている(閉じ括弧が同じ行にある)',
+  /\(別アカウント専用のツリーのため.*より新しい引き継ぎがそちらにある可能性がある\)/.test(handoff), handoff);
+check('括弧の中に食い違いの説明を埋め込んでいない',
+  !/\(別アカウント専用[\s\S]*この制限は worklog 側の設定によるもの[\s\S]*\)/.test(handoff.split('\n').slice(0, 2).join('\n')), handoff);
+check('食い違いの説明そのものは落とさず別行で出す', MISMATCH.test(handoff), handoff);
+
+console.log('\nmove の拒否理由も対象を絞る');
+
+// TREE と TREE2 を伏せ、account-guard には TREE2 だけ書いてある状態。TREE2 の move を
+// 断るとき、TREE の食い違いを持ち出すと「worklog 側だけ外せばよい」と誤誘導し、
+// 実際には保護されているツリーの制限を外させかねない
+setWorklog({ restrictedTrees: [{ tree: TREE, allow: ['team'] }, { tree: TREE2, allow: ['team'] }] });
+setGuard({ rules: [{ tree: TREE2, allow: ['team'] }] });
+const moveTree2 = run(['move', '--from', projectKey(TREE2), '--to', projectKey(OTHER), '--all', '--dry-run']);
+check('両方に書いてあるツリーの move 拒否に、別ツリーの食い違いを混ぜない',
+  !MISMATCH.test(moveTree2.err), moveTree2.err || moveTree2.out);
+check('その拒否理由自体は出ている', /move できない/.test(moveTree2.err), moveTree2.err);
+
+const moveTree1 = run(['move', '--from', projectKey(TREE), '--to', projectKey(OTHER), '--all', '--dry-run']);
+check('worklog 側だけのツリーの move 拒否には食い違いを出す', MISMATCH.test(moveTree1.err), moveTree1.err);
+check('エラーの継続行が字下げされている(行頭に貼り付かない)',
+  /\n {2}この制限は worklog 側の設定によるもの/.test(moveTree1.err), moveTree1.err);
+
+console.log('\nmove の「対象外」一覧(セッション単位)にも食い違いを添える');
+
+// キー自体は可視なので resolveMoveKey の拒否理由は通らない。cwd が保護ツリー配下の
+// レコードだけがセッション単位で外れ、その説明はこの経路でしか出ない。
+// 制限ツリーを 2 本にし、account-guard 側はどちらも守っていない状態にする。1 本だけだと
+// 説明を絞っていなくても同じ出力になり、絞り込みを外しても検査が通ってしまう
+setWorklog({ restrictedTrees: [{ tree: TREE, allow: ['team'] }, { tree: TREE2, allow: ['team'] }] });
+setGuard({ rules: [] });
+write(MIXED, [
+  { sid: 'm1', ts: T, summary: '普通の記録' },
+  { sid: 'm2', ts: T, summary: '保護ツリーの孤児記録', cwd: TREE },
+]);
+const movePartial = run(['move', '--from', projectKey(MIXED), '--to', projectKey(OTHER), '--all', '--dry-run']);
+check('一部だけ対象外になる move が成立している(検査が空振りしていないことの確認)',
+  /対象外 .*別アカウント専用のツリーの記録/.test(movePartial.out), movePartial.out || movePartial.err);
+check('セッション単位の「対象外」にも食い違いを出す', MISMATCH.test(movePartial.out), movePartial.out);
+check('保護ツリーの要約は出さない(制限そのものは緩めない)',
+  !/保護ツリーの孤児記録/.test(movePartial.out), movePartial.out);
+// 名指しの注記と同じく、説明の対象はその記録に効いているルールに限る。TREE2 も同じだけ
+// 食い違っているが、対象外になったのは TREE 配下の記録なので TREE2 は挙げない
+check('「対象外」の説明に、その記録と無関係なツリーを混ぜない',
+  movePartial.out.includes(TREE) && !movePartial.out.includes(TREE2), movePartial.out);
+
+setWorklog(RESTRICTED);
+
+console.log('\n自分の tree も解釈が一致する形か検める');
+
+// worklog 側の loadConfig は path.isAbsolute を通すので、ドライブ文字を落とした
+// `/org-tree` は書き損じにならない。しかし account-guard 側では「どのドライブでも
+// 一致する広いルール」として働き、こちらの path.resolve とは別の場所を指す。
+// 相手の tree だけ検めても、この差は消えない
+// guard 側は worklog の tree を覆わない場所にする。覆う形(C:/org-tree)にすると、
+// path.resolve がたまたま同じ場所へ解決して「食い違いなし」になり、チェックを外しても
+// 検査が通ってしまう(= 退行を検出できないテストになる)
+setWorklog({ restrictedTrees: [{ tree: '/org-tree', allow: ['team'] }] });
+setGuard({ rules: [{ tree: 'C:/somewhere-else', allow: ['team'] }] });
+const ownTreeOdd = run(['list', '--all']).out;
+check('その tree の制限は実際に効いている(検査が空振りしていないことの確認)',
+  /別アカウント専用のツリーのため/.test(ownTreeOdd) && !/ドライブ直下ツリーの作業/.test(ownTreeOdd),
+  ownTreeOdd);
+check('自分の tree がドライブ文字から始まらなければ照合しない',
+  !MISMATCH.test(ownTreeOdd), ownTreeOdd);
+
+finish();
