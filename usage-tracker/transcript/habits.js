@@ -141,16 +141,27 @@ function activeMinutes(sorted, gapMin) {
   };
   const bump = (m, k, n = 1) => m.set(k, (m.get(k) || 0) + n);
 
+  // 同じ API 応答から分割されたレコードを二重に数えないための既出 id。ファイル内で閉じず
+  // 全ファイルで共有する: --resume や fork でセッションを継いだとき、前の会話のレコードが
+  // message.id・usage・timestamp ごと新しいファイルへ複製される(実測: あるセッションは
+  // 118 件すべてが継ぎ先に完全一致で入っていた)。跨ファイルの重複は 30 日で 167/39746 =
+  // 0.42% と小さいが、放置するとターン数もコストもそのぶん水増しされる。
+  // どちらのセッションに計上されるかは読み順で決まるので、セッション単位の内訳は継ぎ元に
+  // 寄る。総計を正しくすることを優先した扱い。
+  const seenMsgIds = new Set();
+  // 親セッションが非対話かの判定結果(同じ親の下に子が何本もあるので覚えておく)。
+  const sdkParent = new Map();
+  const isSdkParent = (p) => {
+    if (!sdkParent.has(p)) sdkParent.set(p, fs.existsSync(p) && isNonInteractiveSession(p));
+    return sdkParent.get(p);
+  };
+
   for (const f of transcriptFiles()) {
     // 期間外のファイルは開かない。全 transcript は数百 MB あり、mtime で落とすと大幅に速い。
     // (追記のみのファイルなので mtime < since なら中身も必ず期間外)
     let mtime;
     try { mtime = fs.statSync(f).mtimeMs; } catch { continue; }
     if (mtime < since) continue;
-
-    // 非対話実行(claude -p / SDK)のセッションは丸ごと外す。レコード単位の判定だけだと
-    // entrypoint を持たない型(queue-operation)が残り、時間軸と架空プロジェクトに現れる。
-    if (isNonInteractiveSession(f)) { stat.sdkSessions++; continue; }
 
     // サブエージェントの transcript は projects/<プロジェクト>/<親セッションID>/subagents/agent-*.jsonl
     // に置かれる。dirname をそのままプロジェクト名にすると "subagents" という架空の
@@ -161,14 +172,24 @@ function activeMinutes(sorted, gapMin) {
     const isSub = parts.includes('subagents');
     const sid = isSub ? parts[1] : path.basename(f, '.jsonl');
 
+    // 非対話実行(claude -p / SDK)のセッションは丸ごと外す。レコード単位の判定だけだと
+    // entrypoint を持たない型(queue-operation)が残り、時間軸と架空プロジェクトに現れる。
+    // サブエージェント側の transcript には印が付かない(印は親のレコードにある)ので、
+    // 子は親を見て落とす。親だけ落として子を読むと、除外したはずの架空プロジェクトが
+    // 委譲の数え上げごと復活する。走査順は保証されないため「既に見た親」ではなく
+    // 親ファイルを直接引く。
+    if (isSub) {
+      if (isSdkParent(path.join(ROOT, project, `${sid}.jsonl`))) continue;
+    } else if (isNonInteractiveSession(f)) {
+      stat.sdkSessions++; continue;
+    }
+
     // 期間内に記録のあるサブエージェントの transcript を 1 本と数える。Agent/Task の
     // tool_use だけでは、スキルやワークフローが起こしたサブエージェント(/code-review など)
     // が親の transcript に現れないぶん落ちる。実データ 30 日で tool_use 457 に対し
     // 実際のサブエージェントは 1014 本あり、subTurns はそちらを含むので、両方出さないと
     // 「1 委譲あたり 67 ターン」という実態と違う読みになる。
     let sawSubRecord = false;
-    // 同じ API 応答から分割されたレコードを二重に数えないための既出 id(ファイル内で閉じる)。
-    const seenMsgIds = new Set();
 
     try {
       for await (const o of records(f)) {
@@ -177,7 +198,10 @@ function activeMinutes(sorted, gapMin) {
         // セッション単位の判定を抜けた個別レコードの保険(対話セッションに sdk 由来の
         // レコードが混ざる形が将来出ても、ここで落ちる)。
         if (isNonInteractive(o)) { stat.sdkSkipped++; continue; }
-        if (isSub) sawSubRecord = true;
+        // 読み終わりでなくレコードを見た時点で数える。ENOENT で途中終了したファイルは
+        // 下の catch が continue するので、後置きだと「ターンとコストは入ったのに委譲 0 本」
+        // になり、そこから割る「1 委譲あたり N ターン」が実態より大きく出る。
+        if (isSub && !sawSubRecord) { sawSubRecord = true; stat.subAgentRuns++; }
 
         stat.events.push(t);
         stat.hours[new Date(t).getHours()]++;
@@ -278,7 +302,6 @@ function activeMinutes(sorted, gapMin) {
       if (!e || e.code !== 'ENOENT') throw e;
       continue;
     }
-    if (sawSubRecord) stat.subAgentRuns++;
   }
 
   if (!stat.events.length) {

@@ -195,6 +195,12 @@ try { parsed = JSON.parse(hbj.out); } catch (e) { parsed = null; }
 check('--json が機械可読な集計を返す',
   parsed && parsed.input.userMsgs === 2 && parsed.delegation.subToolUses === 2,
   parsed ? JSON.stringify(parsed.input) : hbj.out.slice(0, 200));
+// agent-abc123 は s1/s2 の2レコードを持つ。1ファイル=1本のはずで、レコードごとに
+// 数えると2本になってしまう(subAgentRuns はファイル内で最初のレコードを見た時点で
+// 1回だけ加算する実装なので、2レコードでも 1 のままであるべき)。
+check('複数レコードを持つサブエージェントも1本と数える',
+  parsed && parsed.delegation.runs === 1,
+  parsed ? JSON.stringify(parsed.delegation) : hbj.out.slice(0, 200));
 
 // ---- 数値引数の検証 ----
 // Number() を素通しすると NaN が下流の比較を常に false にし、エラーにならないまま
@@ -336,6 +342,75 @@ check('非対話実行を送信・ツール・プロジェクトのどれにも�
 check('非対話実行の時刻を作業時間に入れない',
   pp && pp.time.hours[3] === 0, pp ? `hours[3]=${pp.time.hours[3]}` : '');
 
+// ---- 会話本文の文字列で非対話と誤判定しない (lib.js: isNonInteractiveSession) ----
+// 先頭 64KB を正規表現で見ていた旧実装は、transcript のレコードを会話に貼り付けただけで
+// "entrypoint": "sdk-cli" という文字列に反応し、対話セッションが丸ごと集計から消えていた。
+// 行ごとに JSON として解し entrypoint をフィールドとしてのみ見る新実装を、
+// lib.js を直接 require して確かめる(habits.js を経由するより直接的)。
+// 注意: content がただの文字列だと、貼り付けたテキスト中の引用符は JSON.stringify で
+// \" にエスケープされ、生バイト上では旧正規表現も素通りしてしまい再現にならない
+// (実測済み)。tool_result の content をオブジェクトのまま埋め込む形にすると、
+// ネストした entrypoint フィールドがエスケープなしの生の "entrypoint":"sdk-cli" として
+// バイト列に現れ、かつレコード自身の(トップレベルの)entrypoint ではないので、
+// 新実装が見るべきものと旧実装が誤反応するものを正しく作り分けられる。
+console.log('\nisNonInteractiveSession');
+const libDir = path.join(BASE, 'lib-entrypoint');
+fs.mkdirSync(libDir, { recursive: true });
+const pastedFile = path.join(libDir, 'pasted.jsonl');
+fs.writeFileSync(pastedFile, JSON.stringify({
+  type: 'user', timestamp: at('00:00'),
+  message: {
+    content: [{
+      type: 'tool_result', tool_use_id: 't1',
+      // ネストした値としての entrypoint。トップレベルのフィールドではない。
+      content: { note: '貼り付けた transcript レコードの例', entrypoint: 'sdk-cli', other: 'x' },
+    }],
+  },
+}) + '\n', 'utf8');
+check('レコード内にネストした "entrypoint":"sdk-cli" という文字列だけでは非対話と判定しない',
+  lib.isNonInteractiveSession(pastedFile) === false);
+const fieldFile = path.join(libDir, 'field.jsonl');
+fs.writeFileSync(fieldFile, JSON.stringify({
+  type: 'user', timestamp: at('00:00'), entrypoint: 'sdk-cli',
+  message: { content: 'ping' },
+}) + '\n', 'utf8');
+check('entrypoint がレコードのフィールドにあるセッションは従来どおり非対話と判定する',
+  lib.isNonInteractiveSession(fieldFile) === true);
+
+// ---- 非対話セッションのサブエージェント transcript もファイルごと外す ----
+// 親セッション(entrypoint: sdk-cli)を落としても、配下の subagents/agent-*.jsonl を
+// 素通りさせると、子には印が付かないぶん統計に残ってしまう。対話セッションのデータも
+// 混ぜて集計を空にせず(空だと非0終了する)、除外対象のプロジェクトが結果に一切
+// 現れないこと・委譲の本数やツール数がそのぶん増えていないことを確かめる。
+console.log('\nhabits.js (非対話セッションの子)');
+const homeK = sandbox('habits-sdk-child');
+writeTranscript(homeK, 'proj', 'ffffffff-0000-0000-0000-000000000001', [
+  uTurn('00:00', '人間の送信'),
+  aTurn('00:01', [{ type: 'tool_use', id: 'k1', name: 'Bash', input: {} }]),
+]);
+const SDKSID = 'ffffffff-0000-0000-0000-000000000002';
+writeTranscript(homeK, 'proj2', SDKSID, [
+  { ...uTurn('01:00', 'ping'), entrypoint: 'sdk-cli' },
+  { ...aTurn('01:01', [{ type: 'tool_use', id: 'k2', name: 'Bash', input: {} }]), entrypoint: 'sdk-cli' },
+]);
+writeTranscript(homeK, path.join('proj2', SDKSID, 'subagents'), 'agent-child1', [
+  aTurn('01:02', [{ type: 'tool_use', id: 'k3', name: 'Read', input: {} }]),
+]);
+const hbk = run('habits.js', homeK, ['--since', '2026-01-01', '--json']);
+let pk = null;
+try { pk = JSON.parse(hbk.out); } catch (e) { pk = null; }
+check('非対話セッションの子プロジェクトが perProject に現れない',
+  pk && !pk.projects.some(p => p.name === 'proj2'),
+  pk ? JSON.stringify(pk.projects.map(p => p.name)) : hbk.out.slice(0, 200));
+check('非対話セッションの子はサブエージェントの本数に数えない',
+  pk && pk.delegation.runs === 0,
+  pk ? JSON.stringify(pk.delegation) : hbk.out.slice(0, 200));
+// 子は isSub 側の集計(subToolUses / subCost)に乗るので、そちらで確かめる。
+// tools.total は元から isSub のレコードを含まない集計なので、この観点の検証にはならない。
+check('非対話セッションの子のツール実行・コストをサブ側の集計に含めない',
+  pk && pk.delegation.subToolUses === 0 && pk.delegation.subCost === 0,
+  pk ? JSON.stringify(pk.delegation) : hbk.out.slice(0, 200));
+
 // ---- 同じ API 応答の分割レコードを二重に数えない ----
 // 1 回の応答は content ブロックごとに複数レコードへ分けて書かれ、その全部が同じ
 // message.id と完全に同じ usage を持つ。素朴に足すとターン数もコストも約 1.9 倍になる。
@@ -360,6 +435,35 @@ check('分割された同一応答をターン数・コストで二重に数え�
   pu ? `turnsPerMsg=${pu.input.turnsPerMsg} medianTurns=${pu.sessions.medianTurns}` : hbu.out.slice(0, 200));
 check('二重計上を防いでもツール回数は全ブロックを数える',
   pu && pu.tools.total === 2, pu ? `tools=${pu.tools.total}` : '');
+
+// ---- セッションをまたぐ同一 message.id を二重に数えない ----
+// --resume や fork でセッションを継ぐと、前の会話のレコードが message.id・usage ごと
+// 新しいファイルへ複製される。既出 id の Set をファイル内で閉じると、複製先の
+// ファイルで同じ id がまた「初出」として数えられ、ターンもコストも二重になる。
+console.log('\nhabits.js (跨ファイルの message.id 重複)');
+const homeV = sandbox('habits-dup-crossfile');
+const crossUsage = usage({ input_tokens: 1e6, output_tokens: 0 }); // opus-5 の in 単価どおり $5 になる値
+const crossRec = (time) => ({
+  type: 'assistant', timestamp: at(time), isSidechain: false,
+  message: { id: 'msg_resume_1', model: 'claude-opus-5', usage: crossUsage },
+});
+writeTranscript(homeV, 'proj', 'eeeeeeee-0000-0000-0000-000000000001', [
+  uTurn('00:00', '送信'),
+  crossRec('00:01'),
+]);
+// --resume / fork で継いだ先の別ファイル。同じ message.id・同じ usage を持つ複製レコード。
+writeTranscript(homeV, 'proj', 'eeeeeeee-0000-0000-0000-000000000002', [
+  crossRec('01:00'),
+]);
+const hbv = run('habits.js', homeV, ['--since', '2026-01-01', '--json']);
+let pv = null;
+try { pv = JSON.parse(hbv.out); } catch (e) { pv = null; }
+check('跨ファイルの複製ターンを assistantTurns で二重に数えない(送信1に対し1ターン)',
+  pv && pv.input.turnsPerMsg === 1,
+  pv ? JSON.stringify(pv.input) : hbv.out.slice(0, 200));
+check('跨ファイルの複製ターンをコストで二重に数えない',
+  pv && Math.abs(pv.cost - 5) < 1e-9,
+  pv ? `cost=${pv.cost}` : hbv.out.slice(0, 200));
 
 // ---- スキル起動のサブエージェントも本数として数える ----
 // Agent/Task の tool_use は親の transcript にしか現れないので、スキルやワークフローが

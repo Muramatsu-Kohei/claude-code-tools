@@ -96,13 +96,34 @@ const isNonInteractive = o => !!o && o.entrypoint === 'sdk-cli';
 // ping の transcript には entrypoint を持たない型(queue-operation など)が混ざり、
 // それらは timestamp を持つので時間軸と架空プロジェクトに残ってしまう(実測 18 件)。
 // 非対話セッションは短く印は先頭に出るので、頭だけ読んで判定する(全読みは数百 MB になる)。
+// 読んだ範囲を正規表現で見るのではなく行ごとに JSON として解し、判定は isNonInteractive() に
+// 合流させる: 生文字列を検査すると、会話の本文に "entrypoint": "sdk-cli" という文字列が
+// 出ただけでセッションが丸ごと全統計から消える(このリポジトリでは transcript のレコードを
+// そのまま貼って調べることがあり、実際に起こりうる)。消えた合図は「非対話実行 N 本」の
+// 数字だけで気づけない。実データの sdk-cli 103 本はすべてフィールドとして印を持つので、
+// 厳密化しても取りこぼしはない。
 function isNonInteractiveSession(file, bytes = 65536) {
   let fd;
   try {
     fd = fs.openSync(file, 'r');
     const buf = Buffer.alloc(bytes);
     const n = fs.readSync(fd, buf, 0, bytes, 0);
-    return /"entrypoint"\s*:\s*"sdk-cli"/.test(buf.toString('utf8', 0, n));
+    const head = buf.toString('utf8', 0, n);
+    const lines = head.split('\n');
+    // 末尾は次の読み出し位置で切れている可能性があるので捨てる(ファイル全体を読み切った
+    // ときは最終行が空になるだけなので、同じ扱いでよい)。
+    lines.pop();
+    let parsed = 0;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let o;
+      try { o = JSON.parse(line); } catch { continue; }
+      parsed++;
+      if (isNonInteractive(o)) return true;
+    }
+    // 1 行も解せなかった場合(1 レコードが 64KB を超える、壊れたファイル)は判定材料が
+    // 無いので、従来どおり文字列一致に落とす。取りこぼすより誤検知する側に倒す。
+    return parsed === 0 && /"entrypoint"\s*:\s*"sdk-cli"/.test(head);
   } catch {
     return false;   // 読めないファイルはここで判定せず、本処理側の例外処理に任せる
   } finally {
