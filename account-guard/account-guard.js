@@ -2233,11 +2233,22 @@ function printWorklogRestrictions(account, guardRules) {
     const hidden = !allow.includes(account);
     console.log(`  ${r.tree}  allow=[${allow.join(', ')}]  → 現在は ${hidden ? '非表示' : '表示'}`);
     if (!hidden) continue;
-    // 伏せているツリーが、こちら側では今のアカウントに対して素通しになっていないか。
+    // 突き合わせる 2 つの tree が、両ツールで同じ場所を指すと言い切れる形かを先に検める。
+    // こちらの normalize は Git Bash 表記の `/c/x` を `c:/x` に寄せ、ドライブ文字を落とした
+    // `/x` を「どのドライブでも一致する広いルール」として扱うが、worklog の normPath
+    // (path.resolve)はどちらも実行時のドライブ基準で別の場所へ解決する。この差のまま
+    // 突き合わせると、実際には保護が効いているツリーに「保護ルールがありません」と出し、
+    // 生きている制限を外させる向きの誤りになる(worklog 側の comparableTree と対の判定)
+    const comparable = (t) => typeof t === 'string' && /^[a-zA-Z]:[\\/]/.test(t);
+    const relevant = guardRules.filter((g) => !g.allow.includes(account));
+    if (!comparable(r.tree) || !relevant.every((g) => comparable(g.tree))) {
+      console.log('    ? account-guard 側と突き合わせられません'
+        + '(tree をドライブ文字から書くと両者で同じ場所を指すと確かめられます)');
+      continue;
+    }
     // 判定は前方一致なので、親ツリーを守っていれば配下も守られている(向きは
     // 「worklog の tree がこちらの tree の内側」で固定する)
-    const covered = guardRules.some((g) => !g.allow.includes(account) && isInsideTree(r.tree, g.tree));
-    if (!covered) {
+    if (!relevant.some((g) => isInsideTree(r.tree, g.tree))) {
       console.log('    ! account-guard 側には対応する保護ルールがありません'
         + '(解除したつもりなら worklog 側の設定も外してください)');
     }

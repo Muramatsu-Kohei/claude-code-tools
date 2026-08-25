@@ -58,16 +58,29 @@ function write(repo, sessions) {
   const lines = [];
   for (const s of sessions) {
     lines.push(JSON.stringify({ k: 'start', sid: s.sid, ts: s.ts, cwd: s.cwd || repo, branch: 'main' }));
-    lines.push(JSON.stringify({ k: 'note', sid: s.sid, ts: s.ts, via: 'wrap', summary: s.summary }));
+    lines.push(JSON.stringify({
+      k: 'note', sid: s.sid, ts: s.ts, via: 'wrap', summary: s.summary, handoff: s.handoff || null,
+    }));
     lines.push(JSON.stringify({ k: 'end', sid: s.sid, ts: s.ts + 1000, reason: 'clear', stats: {} }));
   }
   fs.writeFileSync(path.join(logDir, `${projectKey(repo)}.ndjson`), `${lines.join('\n')}\n`);
 }
 
+// ドライブ文字を落とした tree(`/org-tree`)が実際に伏せる先は、path.resolve の解決で
+// 「実行時ドライブのルート直下」になる。そこに記録があることにしないと制限が働かず、
+// 「照合しない」ことを確かめる検査が、注記自体が出ないせいで素通りしてしまう。
+// ディスク上には作らない — 制限の判定は記録に書かれた cwd で行われるので実体は要らない。
+// ドライブ文字をハードコードしないのは、リポジトリが別ドライブにある環境で壊れないため
+const DRIVE_ROOT = path.parse(BASE).root;
+const ROOT_TREE_REPO = path.join(DRIVE_ROOT, 'org-tree', 'repo');
+
 const T = Date.now() - 3600 * 1000;
 write(TREE, [{ sid: 'r1', ts: T, summary: '保護ツリーの作業' }]);
+write(ROOT_TREE_REPO, [{ sid: 'd1', ts: T, summary: 'ドライブ直下ツリーの作業' }]);
 write(TREE2, [{ sid: 'r2', ts: T, summary: '2本目のツリーの作業' }]);
-write(OTHER, [{ sid: 'o1', ts: T, summary: '無関係ツリーの作業' }]);
+// OTHER には引き継ぎを持たせる。cmdHandoff の「括弧書きで伏せた件数を添える」経路は
+// 引き継ぎを出せたときにしか通らないため
+write(OTHER, [{ sid: 'o1', ts: T, summary: '無関係ツリーの作業', handoff: '次はここから' }]);
 
 const run = runner(home, OTHER);
 const { check, finish } = checks();
@@ -232,5 +245,51 @@ check('食い違いの説明の継続行にも > が付く',
   && /^> \(.*account-guard 側では保護されていない/m.test(exported), exported);
 check('引用記号の無い裸の継続行が残っていない',
   !/^この制限は worklog 側の設定によるもの/m.test(exported), exported);
+
+console.log('\n1 行に収める書式へ埋め込む経路(handoff の括弧書き)');
+
+// 括弧の中に複数行を入れると開き括弧と閉じ括弧・末尾の一文が別々の行に散る。
+// 括弧は 1 行に保ち、食い違いの説明は括弧の外に別立てで出す
+const handoff = run(['handoff', '--all'], { cwd: OTHER }).out;
+check('括弧書きが 1 行に収まっている(閉じ括弧が同じ行にある)',
+  /\(別アカウント専用のツリーのため.*より新しい引き継ぎがそちらにある可能性がある\)/.test(handoff), handoff);
+check('括弧の中に食い違いの説明を埋め込んでいない',
+  !/\(別アカウント専用[\s\S]*この制限は worklog 側の設定によるもの[\s\S]*\)/.test(handoff.split('\n').slice(0, 2).join('\n')), handoff);
+check('食い違いの説明そのものは落とさず別行で出す', MISMATCH.test(handoff), handoff);
+
+console.log('\nmove の拒否理由も対象を絞る');
+
+// TREE と TREE2 を伏せ、account-guard には TREE2 だけ書いてある状態。TREE2 の move を
+// 断るとき、TREE の食い違いを持ち出すと「worklog 側だけ外せばよい」と誤誘導し、
+// 実際には保護されているツリーの制限を外させかねない
+setWorklog({ restrictedTrees: [{ tree: TREE, allow: ['team'] }, { tree: TREE2, allow: ['team'] }] });
+setGuard({ rules: [{ tree: TREE2, allow: ['team'] }] });
+const moveTree2 = run(['move', '--from', projectKey(TREE2), '--to', projectKey(OTHER), '--all', '--dry-run']);
+check('両方に書いてあるツリーの move 拒否に、別ツリーの食い違いを混ぜない',
+  !MISMATCH.test(moveTree2.err), moveTree2.err || moveTree2.out);
+check('その拒否理由自体は出ている', /move できない/.test(moveTree2.err), moveTree2.err);
+
+const moveTree1 = run(['move', '--from', projectKey(TREE), '--to', projectKey(OTHER), '--all', '--dry-run']);
+check('worklog 側だけのツリーの move 拒否には食い違いを出す', MISMATCH.test(moveTree1.err), moveTree1.err);
+check('エラーの継続行が字下げされている(行頭に貼り付かない)',
+  /\n {2}この制限は worklog 側の設定によるもの/.test(moveTree1.err), moveTree1.err);
+
+console.log('\n自分の tree も解釈が一致する形か検める');
+
+// worklog 側の loadConfig は path.isAbsolute を通すので、ドライブ文字を落とした
+// `/org-tree` は書き損じにならない。しかし account-guard 側では「どのドライブでも
+// 一致する広いルール」として働き、こちらの path.resolve とは別の場所を指す。
+// 相手の tree だけ検めても、この差は消えない
+// guard 側は worklog の tree を覆わない場所にする。覆う形(C:/org-tree)にすると、
+// path.resolve がたまたま同じ場所へ解決して「食い違いなし」になり、チェックを外しても
+// 検査が通ってしまう(= 退行を検出できないテストになる)
+setWorklog({ restrictedTrees: [{ tree: '/org-tree', allow: ['team'] }] });
+setGuard({ rules: [{ tree: 'C:/somewhere-else', allow: ['team'] }] });
+const ownTreeOdd = run(['list', '--all']).out;
+check('その tree の制限は実際に効いている(検査が空振りしていないことの確認)',
+  /別アカウント専用のツリーのため/.test(ownTreeOdd) && !/ドライブ直下ツリーの作業/.test(ownTreeOdd),
+  ownTreeOdd);
+check('自分の tree がドライブ文字から始まらなければ照合しない',
+  !MISMATCH.test(ownTreeOdd), ownTreeOdd);
 
 finish();

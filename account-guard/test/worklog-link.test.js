@@ -98,6 +98,40 @@ check('こちらが配下しか守っていなければ警告する', WARN.test(
 setGuard({ rules: [{ tree: TREE, allow: ['pro'] }] });
 check('こちらが今のアカウントを許可しているなら警告する', WARN.test(status()), status());
 
+console.log('\n両者で解釈が食い違う tree は突き合わせない');
+
+// こちらの normalize はドライブ文字を落とした `/org-tree` を「どのドライブでも、パスの
+// 途中でも一致する広いルール」として扱い、Git Bash 表記の `/c/org-tree` は `c:/org-tree` に
+// 寄せる。一方 worklog の normPath(path.resolve)はどちらも実行時ドライブ基準の別の場所へ
+// 解決する。この差のまま突き合わせると、両方向に誤る
+const UNCOMPARABLE = /突き合わせられません/;
+
+// ケースA(誤警告): 保護は生きているのに「保護ルールがありません」と出し、
+// 効いている制限を外させる向きの誤り。プライバシー機能としては最悪の向き
+setGuard({ rules: [{ tree: TREE, allow: ['team'] }] });
+setWorklog({ restrictedTrees: [{ tree: '/org-tree', allow: ['team'] }] });
+const worklogNoDrive = status();
+check('worklog の tree にドライブ文字が無ければ突き合わせない', UNCOMPARABLE.test(worklogNoDrive), worklogNoDrive);
+check('その状態で誤って「保護ルールがありません」と出さない', !WARN.test(worklogNoDrive), worklogNoDrive);
+
+// ケースB(誤って一致扱い): worklog 自身は `<実行時ドライブ>:\c\org-tree` を伏せているのに、
+// こちらの normalize が `c:/org-tree` に寄せるせいで一致と見なし、食い違いを黙って見逃す
+setWorklog({ restrictedTrees: [{ tree: '/c/org-tree', allow: ['team'] }] });
+const worklogGitBash = status();
+check('Git Bash 表記の tree も突き合わせない(黙って一致扱いしない)',
+  UNCOMPARABLE.test(worklogGitBash), worklogGitBash);
+
+// こちら側の tree に解釈の差があるときも同じ。worklog の tree だけ検めても差は消えない
+setGuard({ rules: [{ tree: '/org-tree', allow: ['team'] }] });
+setWorklog({ restrictedTrees: [{ tree: TREE, allow: ['team'] }] });
+const guardNoDrive = status();
+check('こちらの tree にドライブ文字が無ければ突き合わせない', UNCOMPARABLE.test(guardNoDrive), guardNoDrive);
+check('その状態でも誤って「保護ルールがありません」と出さない', !WARN.test(guardNoDrive), guardNoDrive);
+
+// 制限の一覧そのものは出す。突き合わせられないのは食い違いの判定だけで、
+// 「worklog がどのツリーを伏せているか」は status の主題として残す
+check('突き合わせられなくても制限の一覧は出す', LISTED.test(guardNoDrive), guardNoDrive);
+
 console.log('\n黙るべきとき');
 
 setGuard({ rules: [] });

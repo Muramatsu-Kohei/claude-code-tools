@@ -194,6 +194,22 @@ function blockedTrees(cfg, account) {
 
 const GUARD_CONFIG_PATH = path.join(CLAUDE_DIR, 'account-guard', 'config.json');
 
+// 両ツールで解釈が一致すると言い切れる tree の形。照合に使う tree は、自分の側も相手の側も
+// これを通ったものだけにする。
+//
+// account-guard の normalize は Git Bash 表記の `/c/org-tree` を `c:/org-tree` に寄せ、
+// ドライブ文字を落とした `/org-tree` は「どのドライブでも、パスの途中でも一致する広い
+// ルール」として扱う(向こうの README と issue #6)。一方こちらの normPath(path.resolve)は
+// どちらも実行時のドライブを基準にした別の場所へ解決する。この差を持ち込むと、実際には
+// 保護が効いているツリーに対して「保護されていない、外してよい」と案内してしまう —
+// プライバシー機能として最も避けたい向きの誤りなので、言い切れない形は照合ごと降りる。
+//
+// ドライブ文字を必須にしているので、この照合は Windows でしか働かない(POSIX では常に
+// 何も出ない)。両ツールとも Windows 前提なので割り切っている。README に明記した
+function comparableTree(t) {
+  return typeof t === 'string' && /^[a-zA-Z]:[\\/]/.test(t);
+}
+
 // account-guard 側で「現在のアカウントに対して今まさに効いている」保護ルールを返す。
 // 照合できないときは null を返し、呼び出し側は何も言わない:
 //  - 未作成(ENOENT): account-guard を入れていない構成。「向こうは保護していない」のは
@@ -211,17 +227,10 @@ function guardActiveRules(account) {
   }
   if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.rules)) return null;
   // 1件でも安全に照合できない tree があれば、全体をあきらめる。壊れたルールだけを捨てて
-  // 残りで判定すると、どちらの取りこぼし方も「保護されていない」と誤って案内する向きに倒れる:
-  //  - 相対パス・tree の書き損じ(型違い/空)は、account-guard 側では設定全体を壊れている
-  //    とみなす材料になる。その状態の向こうは全ての操作を拒否している(= 保護が最も強く
-  //    効いている)ので、こちらが残りのルールだけで「保護されていない」と言うと正反対になる
-  //  - ドライブ文字を落とした tree(`/org-tree`、Git Bash 表記の `/c/org-tree`)は向こうでは
-  //    書き損じにならず有効なルールとして働くが、こちらの normPath(path.resolve)は実行時の
-  //    ドライブを基準に別の場所として解決するため、同じツリーを指しているかを判定できない
-  //    (向こうの normalize は `/c/org-tree` を `c:/org-tree` に寄せる。ここを複製せず
-  //     判定を降りるのは、解釈の差そのものを持ち込まないため)
-  const comparable = (t) => typeof t === 'string' && /^[a-zA-Z]:[\\/]/.test(t);
-  if (!parsed.rules.every((r) => r && comparable(r.tree))) return null;
+  // 残りで判定すると、「保護されていない」と誤って案内する向きに倒れる: 相対パスや
+  // tree の書き損じ(型違い/空)は account-guard 側では設定全体を壊れているとみなす材料に
+  // なり、その状態の向こうは全ての操作を拒否している(= 保護が最も強く効いている)
+  if (!parsed.rules.every((r) => r && comparableTree(r.tree))) return null;
   return parsed.rules
     .filter((r) => !(Array.isArray(r.allow) && r.allow.includes(account)));
 }
@@ -232,8 +241,12 @@ function guardActiveRules(account) {
 // そのため。逆向きまで一致にすると、向こうが子ディレクトリだけを守っている構成を
 // 「同じものを守っている」と誤って扱ってしまう
 function guardMismatchedTrees(blocked, account) {
-  // BLOCK_ALL(設定を読めず全伏せ)は特定のツリーの話ではないので照合の対象外
-  const trees = blocked.filter((r) => !r.all).map((r) => r.tree);
+  // BLOCK_ALL(設定を読めず全伏せ)は特定のツリーの話ではないので照合の対象外。
+  // 自分の tree にも comparableTree を掛けるのは、突き合わせる 2 つのうち片方だけを
+  // 検めても解釈の差は消えないため。こちらの restrictedTrees は loadConfig の
+  // path.isAbsolute を通っているが、それはドライブ文字を落とした `/org-tree` を
+  // 通してしまう(issue #6 と同じ穴)
+  const trees = blocked.filter((r) => !r.all && comparableTree(r.tree)).map((r) => r.tree);
   if (!trees.length) return [];
   const guard = guardActiveRules(account);
   if (!guard) return [];
@@ -418,7 +431,12 @@ function filterVisibleSessions(sessions, cfg, account, fallbackKey = null) {
 // 非制限キーの下にある孤児(move で移された記録など)が件数に現れず、まさにその網が
 // 拾う取りこぼしだけが無言で消える — この注記が防ごうとしている誤解そのものになる。
 // scopeKeys はそのコマンドが実際に問い合わせたキー(制限フィルタ前)。省略時は全キー横断。
-function restrictionNote(cfg, account, hiddenSessions = 0, scopeKeys = null) {
+//
+// withMismatch を false にすると、食い違いの説明(複数行になる)を付けない。既定を true に
+// してあるのは、付け忘れが「事故に気づけないまま」になる向きだから。false を渡してよいのは、
+// 注記を 1 行に収めなければ壊れる書式へ埋め込む呼び出し側が、食い違いの説明を別立てで
+// 自分で出す場合だけ(cmdHandoff の括弧書きがそれ)
+function restrictionNote(cfg, account, hiddenSessions = 0, scopeKeys = null, { withMismatch = true } = {}) {
   if (cfg.configBroken) {
     return `設定 ${CONFIG_PATH} を読めないため、安全側に倒して全ての記録を伏せています`;
   }
@@ -438,9 +456,9 @@ function restrictionNote(cfg, account, hiddenSessions = 0, scopeKeys = null) {
   if (hiddenSessions > 0) parts.push(`${hiddenSessions} 件のセッション`);
   // 「と 」の後ろのスペースは意図的。各パートが数字で始まるので、詰めると
   // 「プロジェクトと2 件」と不揃いになる
-  return parts.length
-    ? withGuardMismatch(`別アカウント専用のツリーのため ${parts.join('と ')}を表示していません`, cfg, account)
-    : null;
+  if (!parts.length) return null;
+  const note = `別アカウント専用のツリーのため ${parts.join('と ')}を表示していません`;
+  return withMismatch ? withGuardMismatch(note, cfg, account) : note;
 }
 
 // フック実行中の失敗は表に出せない(出すとセッションが汚れる)ので、ここだけに残す
@@ -1160,7 +1178,9 @@ function buildContext(key, cwd, currentSid, cfg) {
     cfg, currentAccount(), key,
   );
   const parts = [];
-  if (cfg.configBroken) parts.push(`> ${restrictionNote(cfg, currentAccount())}`);
+  // configBroken 限定なので今は必ず 1 行だが、生の補間だと将来ここが複数行になったとき
+  // 引用が崩れる(export で実際に起きた)。整形はどの経路も同じヘルパに通す
+  if (cfg.configBroken) parts.push(mdNote(restrictionNote(cfg, currentAccount())));
 
   // どのツールの続きを渡すか。全ツール分の引き継ぎを入れると、まさに避けたかった
   // 「無関係な引き継ぎ」が増えるだけなので、主スコープ 1 本だけを全文にする。
@@ -1911,8 +1931,15 @@ function cmdHandoff(flags, scopeArg) {
   // 出せた引き継ぎより新しいものが制限で伏せられていることがある。何も言わずに古いほうを
   // 渡すと「これが最新」と受け取られるため、伏せた事実だけは添える(中身は出さない)
   if (hiddenKeys > 0 || hiddenSessions > 0) {
-    const note = restrictionNote(cfg, account, hiddenSessions, scopeKeys);
-    if (note) console.log(dim(`\n(${note}。より新しい引き継ぎがそちらにある可能性がある)`));
+    // 括弧の中に入れるので注記は 1 行でなければならない。食い違いの説明は複数行になり、
+    // 埋め込むと開き括弧と閉じ括弧・末尾の一文が別々の行に散って読めなくなるため、
+    // 括弧の外に別立てで出す(説明そのものは落とさない — この経路でしか伝わらない場合がある)
+    const note = restrictionNote(cfg, account, hiddenSessions, scopeKeys, { withMismatch: false });
+    if (note) {
+      console.log(dim(`\n(${note}。より新しい引き継ぎがそちらにある可能性がある)`));
+      const mismatch = guardMismatchNote(cfg, account);
+      if (mismatch) console.log(dim(noteLines(mismatch, '  ', '  ')));
+    }
   }
 }
 
@@ -2001,19 +2028,24 @@ function resolveMoveKey(spec, allowNew) {
   // 設定を読めていないときは BLOCK_ALL で全部伏せているので、理由は「別アカウント専用の
   // ツリーだから」ではない。そのまま案内するとアカウント切り替えという効かない対処へ
   // 誘導してしまうため、restrictionNote / explicitProjectRestrictionNote と同じ区別をする
-  const denyReason = (what) => (cfg.configBroken
+  // 一覧側と同じ食い違いの説明を添える。ここは「なぜ動かせないのか」を調べる入り口の
+  // 一つで、設定を片方だけ外したまま来た利用者が最初にぶつかる場所でもある。
+  // keys は what が名指ししている対象のキー。explicitProjectRestrictionNote と同じく、
+  // その対象に実際に効いているルールだけを説明の材料にする — 全ルールを見ると、
+  // 両方に書いてあるツリーの move を断りながら「worklog 側だけ外せばよい」と誤誘導する。
+  // 継続行を字下げするのは、この文字列が Error の message になり
+  // `エラー: <1行目>` の形で出るため(2 行目以降が行頭に付くと読みにくい)
+  const denyReason = (what, keys = null) => (cfg.configBroken
     ? `設定 ${CONFIG_PATH} を読めないため、安全側に倒して全ての記録を伏せている。設定を直してからやり直す。`
-    // 一覧側と同じ食い違いの説明を添える。ここは「なぜ動かせないのか」を調べる入り口の
-    // 一つで、設定を片方だけ外したまま来た利用者が最初にぶつかる場所でもある
-    : withGuardMismatch(
+    : noteLines(withGuardMismatch(
       `${what}は別アカウント専用のツリーのため move できない。許可されたアカウントに切り替える。`,
-      cfg, account,
-    ));
+      cfg, account, keys ? hitTrees(blocked, keys) : null,
+    ), '', '  '));
   if (blocked.length) {
     const raw = listProjectKeysRaw();
     const rawHit = raw.includes(spec) ? [spec] : raw.filter((k) => k.toLowerCase().includes(spec.toLowerCase()));
     if (rawHit.length && rawHit.every((k) => isKeyBlocked(k, blocked))) {
-      throw new Error(denyReason(`「${spec}」`));
+      throw new Error(denyReason(`「${spec}」`, rawHit));
     }
   }
 
@@ -2037,7 +2069,7 @@ function resolveMoveKey(spec, allowNew) {
   // ログを失ったのと同じになる。捏造するキーにもツリー判定を掛け、書けるが読めない
   // 置き場所を作らせない
   if (blocked.length && isKeyBlocked(key, blocked)) {
-    throw new Error(denyReason(`移動先「${spec}」`));
+    throw new Error(denyReason(`移動先「${spec}」`, [key]));
   }
   if (!existsSafe(normPath(spec))) console.log(yellow(`! 移動先 ${spec} はディスク上に無い。新しいキー ${key} を作る`));
   return key;
