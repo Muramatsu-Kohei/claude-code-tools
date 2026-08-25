@@ -82,10 +82,62 @@ async function* records(file) {
   }
 }
 
+// 非対話実行(claude -p / SDK 経由)のレコードか。ここに集約しているのは、同じ判定を
+// 各スクリプトで新設すると片方だけ直る形になるため(claude-window-keeper の ping は
+// 実データ 90 日で「送信」の 6.2% を占め、cwd が system32 なので架空のプロジェクトも作る)。
+// entrypoint は user と assistant の両方に付く。ただし queue-operation のように印を
+// 持たない型が同じセッションに混ざるので、これ単体では取りこぼす(実測 18 件が残り、
+// 時間軸と架空プロジェクトに現れた)。下の isNonInteractiveSession() と併せて使う。
+// 現時点で使っているのは habits.js のみ。sessions.js / turncost.js / breakdown.js は
+// まだ ping を含んだまま数えている(sessions.js のセッション数はそのぶん多い)。
+const isNonInteractive = o => !!o && o.entrypoint === 'sdk-cli';
+
+// ファイルごと非対話実行のセッションか。レコード単位の判定だけでは足りない:
+// ping の transcript には entrypoint を持たない型(queue-operation など)が混ざり、
+// それらは timestamp を持つので時間軸と架空プロジェクトに残ってしまう(実測 18 件)。
+// 非対話セッションは短く印は先頭に出るので、頭だけ読んで判定する(全読みは数百 MB になる)。
+// 読んだ範囲を正規表現で見るのではなく行ごとに JSON として解し、判定は isNonInteractive() に
+// 合流させる: 生文字列を検査すると、会話の本文に "entrypoint": "sdk-cli" という文字列が
+// 出ただけでセッションが丸ごと全統計から消える(このリポジトリでは transcript のレコードを
+// そのまま貼って調べることがあり、実際に起こりうる)。消えた合図は「非対話実行 N 本」の
+// 数字だけで気づけない。実データの sdk-cli 103 本はすべてフィールドとして印を持つので、
+// 厳密化しても取りこぼしはない。
+function isNonInteractiveSession(file, bytes = 65536) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(bytes);
+    const n = fs.readSync(fd, buf, 0, bytes, 0);
+    const head = buf.toString('utf8', 0, n);
+    const lines = head.split('\n');
+    // 窓を使い切ったときだけ末尾を捨てる(その 1 行は次の読み出し位置で切れている)。
+    // 無条件に捨てると、ファイル全体が窓に収まりかつ末尾に改行が無い場合 — 書き込み途中の
+    // transcript が該当する — 唯一の完全なレコードまで落ち、非対話セッションを取り逃がす。
+    if (n === bytes) lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let o;
+      try { o = JSON.parse(line); } catch { continue; }
+      if (isNonInteractive(o)) return true;
+    }
+    // 1 行も解せなかった場合(1 レコードが 64KB を超える、壊れたファイル)は判定材料が
+    // 無いので false に倒す。ここで文字列一致に落とすと、上で消したはずの誤検知が
+    // いちばん危ない条件で戻ってくる: 先頭レコードが 64KB を超えるのは巨大な貼り付けや
+    // tool_result を含むレコードで、印の文字列が本文に混ざりやすいのはまさにその型。
+    // 実測でも該当ファイルは 15 本あり、すべて対話セッションだった。非対話実行の
+    // transcript は短いので、この分岐に落ちること自体がほぼない。
+    return false;
+  } catch {
+    return false;   // 読めないファイルはここで判定せず、本処理側の例外処理に任せる
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* 既に閉じている */ }
+  }
+}
+
 function warnUnknownModels() {
   if (!unknownModels.size) return;
   const list = [...unknownModels.entries()].map(([m, n]) => `${m}(${n}件)`).join(', ');
   console.error(`\n警告: pricing.js に単価が無いモデルを $0 として集計した: ${list}`);
 }
 
-module.exports = { PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records, warnUnknownModels };
+module.exports = { PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records, isNonInteractive, isNonInteractiveSession, warnUnknownModels };
