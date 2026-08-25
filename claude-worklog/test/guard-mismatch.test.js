@@ -298,7 +298,11 @@ check('エラーの継続行が字下げされている(行頭に貼り付かな
 console.log('\nmove の「対象外」一覧(セッション単位)にも食い違いを添える');
 
 // キー自体は可視なので resolveMoveKey の拒否理由は通らない。cwd が保護ツリー配下の
-// レコードだけがセッション単位で外れ、その説明はこの経路でしか出ない
+// レコードだけがセッション単位で外れ、その説明はこの経路でしか出ない。
+// 制限ツリーを 2 本にし、account-guard 側はどちらも守っていない状態にする。1 本だけだと
+// 説明を絞っていなくても同じ出力になり、絞り込みを外しても検査が通ってしまう
+setWorklog({ restrictedTrees: [{ tree: TREE, allow: ['team'] }, { tree: TREE2, allow: ['team'] }] });
+setGuard({ rules: [] });
 write(MIXED, [
   { sid: 'm1', ts: T, summary: '普通の記録' },
   { sid: 'm2', ts: T, summary: '保護ツリーの孤児記録', cwd: TREE },
@@ -309,13 +313,10 @@ check('一部だけ対象外になる move が成立している(検査が空振
 check('セッション単位の「対象外」にも食い違いを出す', MISMATCH.test(movePartial.out), movePartial.out);
 check('保護ツリーの要約は出さない(制限そのものは緩めない)',
   !/保護ツリーの孤児記録/.test(movePartial.out), movePartial.out);
-
-// 名指しの注記と同じく、説明の対象はその記録に効いているルールに限る。
-// TREE2 も伏せているが、対象外になったのは TREE 配下の記録なので TREE2 は挙げない
-setWorklog({ restrictedTrees: [{ tree: TREE, allow: ['team'] }, { tree: TREE2, allow: ['team'] }] });
-const movePartialScoped = run(['move', '--from', projectKey(MIXED), '--to', projectKey(OTHER), '--all', '--dry-run']);
+// 名指しの注記と同じく、説明の対象はその記録に効いているルールに限る。TREE2 も同じだけ
+// 食い違っているが、対象外になったのは TREE 配下の記録なので TREE2 は挙げない
 check('「対象外」の説明に、その記録と無関係なツリーを混ぜない',
-  movePartialScoped.out.includes(TREE) && !movePartialScoped.out.includes(TREE2), movePartialScoped.out);
+  movePartial.out.includes(TREE) && !movePartial.out.includes(TREE2), movePartial.out);
 
 setWorklog(RESTRICTED);
 
