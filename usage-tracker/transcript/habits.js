@@ -20,6 +20,19 @@ const MIN_BLOCK_MIN = 2;
 // --days の上限(約10年)。transcript がこれより古いことはなく、Date の表現範囲も外れない。
 const DAYS_MAX = 3650;
 
+// ハーネスが user ロールで挿入するブロックの見出し。人間が打った文章ではないので、
+// 送信回数にも文字数にも入れない。実データ 30 日で、除外前は数えた 2418 件のうち
+// 754 件(31%)がこれで、文字数に至っては 90% が task-notification だった。
+// 種類はハーネス側の都合で増えるので、新しい見出しを見つけたらここに足す
+// (<command-name> はスラッシュコマンドとして別に数えるので、ここには入れない)。
+const INJECTED_HEAD = /^<(local-command|command-message|system-reminder|task-notification|bash-input|bash-stdout|bash-stderr)\b/;
+// /compact の継続要約。タグではなく決まり文句で始まる。
+const COMPACT_HEAD = /^This session is being continued from a previous conversation/;
+const isInjected = s => {
+  const h = String(s).trim();
+  return INJECTED_HEAD.test(h) || COMPACT_HEAD.test(h);
+};
+
 const USAGE = 'node habits.js [--days N] [--since YYYY-MM-DD] [--gap 分] [--json]';
 
 function die(msg) {
@@ -32,20 +45,23 @@ function die(msg) {
 // 作業時間が実時間になる」といった、エラーにならない誤集計になる。入口で止める。
 // 上限も要る: --days 1e9 のような値は since が Date の表現範囲(±8.64e15ms)を外れ、
 // 使い方エラーではなく toISOString() の RangeError になって使い方が伝わらない。
+// 日数も分数も小数に意味は無い。--days 2.5 は setDate() の切り捨てで実際には 3 日窓になり、
+// 指定と出力が食い違うので整数だけ受ける(Number.isInteger は NaN も弾く)。
 function numArg(v, name, min, max) {
   const n = Number(v);
-  if (!Number.isFinite(n) || n < min || n > max) {
-    die(`${name} には ${min}〜${max} の数値を指定してください(受け取った値: ${v === undefined ? '(なし)' : v})`);
+  if (!Number.isInteger(n) || n < min || n > max) {
+    die(`${name} には ${min}〜${max} の整数を指定してください(受け取った値: ${v === undefined ? '(なし)' : v})`);
   }
   return n;
 }
 
 function parseArgs(argv) {
   const o = { days: 14, json: false, since: null, gap: GAP_DEFAULT };
+  let daysGiven = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') o.json = true;
-    else if (a === '--days') o.days = numArg(argv[++i], '--days', 1, DAYS_MAX);
+    else if (a === '--days') { o.days = numArg(argv[++i], '--days', 1, DAYS_MAX); daysGiven = true; }
     else if (a === '--since') o.since = argv[++i];
     // 区切りが 1 日を超えると日別集計と噛み合わなくなるので 1440 分で頭打ちにする。
     else if (a === '--gap') o.gap = numArg(argv[++i], '--gap', 1, 1440);
@@ -54,6 +70,8 @@ function parseArgs(argv) {
       process.exit(0);
     } else die(`不明な引数: ${a}`);
   }
+  // 両方あると --since が勝って --days が黙って無視される。指定ミスの可能性が高いので止める。
+  if (o.since !== null && daysGiven) die('--days と --since は同時に指定できません(期間の起点が二重になります)');
   if (o.since !== null) {
     // 形式と実在の両方を見る。'2026-8-1' のような不揃いな表記は Date.parse が NaN に倒す。
     // 一方 '2026-02-30' は Invalid Date にはならず 3/2 へ黙って繰り上がるので(V8 実測)、
@@ -117,7 +135,7 @@ function activeMinutes(sorted, gapMin) {
     hours: new Array(24).fill(0),
     userMsgs: 0, userChars: 0, msgLens: [], commands: 0, interrupts: 0,
     assistantTurns: 0, toolUses: 0, totalCost: 0,
-    subTurns: 0, subToolUses: 0, subCost: 0, subTools: new Map(),
+    subTurns: 0, subToolUses: 0, subCost: 0, subAgentRuns: 0, subTools: new Map(),
     tools: new Map(), skills: new Map(), agents: new Map(), cmds: new Map(),
     models: new Map(),
   };
@@ -139,9 +157,17 @@ function activeMinutes(sorted, gapMin) {
     const isSub = parts.includes('subagents');
     const sid = isSub ? parts[1] : path.basename(f, '.jsonl');
 
+    // 期間内に記録のあるサブエージェントの transcript を 1 本と数える。Agent/Task の
+    // tool_use だけでは、スキルやワークフローが起こしたサブエージェント(/code-review など)
+    // が親の transcript に現れないぶん落ちる。実データ 30 日で tool_use 457 に対し
+    // 実際のサブエージェントは 1014 本あり、subTurns はそちらを含むので、両方出さないと
+    // 「1 委譲あたり 67 ターン」という実態と違う読みになる。
+    let sawSubRecord = false;
+
     for await (const o of records(f)) {
       const t = o.timestamp ? Date.parse(o.timestamp) : 0;
       if (!t || t < since) continue;
+      if (isSub) sawSubRecord = true;
 
       stat.events.push(t);
       stat.hours[new Date(t).getHours()]++;
@@ -166,20 +192,21 @@ function activeMinutes(sorted, gapMin) {
         // スラッシュコマンドと中断の記録に isMeta は付かないので、この除外では減らない。
         if (o.isMeta) continue;
         const c = o.message && o.message.content;
-        // 文字列の content は人間の入力。配列の content は tool_result を含む。
-        // どちらもフックやリマインダが混ざるので、人間が打った分だけを数える。
+        // 文字列の content は人間の入力。配列の content は tool_result とハーネス挿入の
+        // text ブロックを含む。連結してから前方一致で捨てると、人間の本文が先頭にあって
+        // 後ろに通知が続くレコードで挿入分まで入力文字数に入るので、ブロック単位で落とす。
         let text = null;
         if (typeof c === 'string') text = c;
         else if (Array.isArray(c)) {
-          const t2 = c.filter(x => x.type === 'text').map(x => x.text || '').join('');
+          const t2 = c.filter(x => x.type === 'text').map(x => x.text || '')
+            .filter(s => !isInjected(s)).join('');
           text = t2 || null;
         }
         if (text === null) continue;
         const cmd = text.match(/<command-name>([^<]+)<\/command-name>/);
         if (cmd) { stat.commands++; bump(stat.cmds, cmd[1].trim()); continue; }
         if (/\[Request interrupted/.test(text)) { stat.interrupts++; continue; }
-        // ローカルコマンドの出力やリマインダは人間の発話ではない
-        if (/^<(local-command|command-message|system-reminder)/.test(text.trim())) continue;
+        if (isInjected(text)) continue;
         stat.userMsgs++;
         stat.userChars += text.length;
         stat.msgLens.push(text.length);
@@ -226,6 +253,7 @@ function activeMinutes(sorted, gapMin) {
         }
       }
     }
+    if (sawSubRecord) stat.subAgentRuns++;
   }
 
   if (!stat.events.length) {
@@ -261,7 +289,10 @@ function activeMinutes(sorted, gapMin) {
     });
   }
 
-  const sweep = GAP_SWEEP.map(g => {
+  // 見出しに出る作業時間は opt.gap のもの。既定値以外を指定したとき、その行が表に無いと
+  // 「振れ幅を見せる」表の中で見出しの数字だけ根拠が見えなくなるので、指定値も混ぜる。
+  const sweepGaps = [...new Set([...GAP_SWEEP, opt.gap])].sort((a, b) => a - b);
+  const sweep = sweepGaps.map(g => {
     const a = activeMinutes(stat.events, g);
     return { gap: g, hours: a.minutes / 60, blocks: a.blocks };
   });
@@ -292,6 +323,9 @@ function activeMinutes(sorted, gapMin) {
 
   const sessions = [...stat.sessions.values()].filter(s => s.mainTurns > 0);
   const med = arr => { if (!arr.length) return 0; const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+  // Math.max(...arr) は引数の個数上限(V8 でおよそ 12 万)を超えると RangeError で落ちる。
+  // --days 3650 まで許す以上、送信数が上限に届く環境がありうるので畳み込みで取る。
+  const maxOf = arr => arr.reduce((a, v) => (v > a ? v : a), 0);
   const ctxBuckets = [
     ['〜50K', 0, 50e3], ['50K〜150K', 50e3, 150e3],
     ['150K〜250K', 150e3, 250e3], ['250K〜', 250e3, Infinity],
@@ -312,7 +346,15 @@ function activeMinutes(sorted, gapMin) {
     time: {
       totalHours, perDay: totalHours / nDays,
       perActiveDay: totalHours / Math.max(1, days.filter(d => d.events > 0).length),
-      sweep, days, hours: stat.hours,
+      sweep,
+      // 日別の first/last だけ epoch ミリ秒だと、同じペイロードの period や longestBlocks が
+      // ISO 文字列なのと食い違って消費側が型を取り違える。表示は生の days を使うのでここで揃える。
+      days: days.map(d => ({
+        ...d,
+        first: d.first === null ? null : new Date(d.first).toISOString(),
+        last: d.last === null ? null : new Date(d.last).toISOString(),
+      })),
+      hours: stat.hours,
       longestBlocks: longBlocks.slice(0, 8).map(b => ({
         start: new Date(b.start).toISOString(), end: new Date(b.end).toISOString(),
         hours: (b.end - b.start) / 3600000, events: b.events, maxGapMin: b.maxGap / 60000,
@@ -323,7 +365,7 @@ function activeMinutes(sorted, gapMin) {
       sends, userMsgs: stat.userMsgs, commands: stat.commands, interrupts: stat.interrupts,
       // 文字数は「打った文章」の話なので、本文を持たないスラッシュコマンドは分母に入れない。
       medianChars: med(stat.msgLens), meanChars: stat.userChars / Math.max(1, stat.userMsgs),
-      maxChars: Math.max(...stat.msgLens, 0),
+      maxChars: maxOf(stat.msgLens),
       // 「1送信あたり」の分子はスラッシュコマンドが起こしたターン・ツールも含むので、
       // 分母もコマンドを数える。文章だけを分母にすると、コマンドの比率のぶん過大に出る
       // (実データで 22% 上振れした)。
@@ -332,7 +374,9 @@ function activeMinutes(sorted, gapMin) {
     },
     tools: { total: stat.toolUses, top: top(stat.tools) },
     delegation: {
-      total: agentTotal, byType: top(stat.agents),
+      // total は自分が明示的に呼んだ Agent/Task の回数、runs は transcript として実在した
+      // サブエージェントの本数(スキル・ワークフロー起動を含むので total より多い)。
+      total: agentTotal, runs: stat.subAgentRuns, byType: top(stat.agents),
       ratioOfMsgs: agentTotal / Math.max(1, sends),
       subTurns: stat.subTurns, subToolUses: stat.subToolUses, subCost: stat.subCost,
       subTools: top(stat.subTools, 10),
@@ -344,7 +388,7 @@ function activeMinutes(sorted, gapMin) {
     sessions: {
       count: sessions.length,
       medianTurns: med(sessions.map(s => s.mainTurns)),
-      maxTurns: Math.max(...sessions.map(s => s.mainTurns), 0),
+      maxTurns: maxOf(sessions.map(s => s.mainTurns)),
       medianDurationMin: med(sessions.map(s => (s.last - s.first) / 60000)),
       medianMaxCtx: med(sessions.map(s => s.maxCtx)),
       ctxBuckets,
@@ -415,7 +459,9 @@ function activeMinutes(sorted, gapMin) {
     console.log(`${t.name.padEnd(20)} ${String(t.count).padStart(6)}  ${(t.count / stat.toolUses * 100).toFixed(1)}%`);
   }
 
-  console.log(`\n--- 委譲 ${agentTotal} 回(送信の ${(result.delegation.ratioOfMsgs * 100).toFixed(0)}%) ---`);
+  console.log('\n--- 委譲 ---');
+  console.log(`Agent 呼び出し ${agentTotal} 回(送信の ${(result.delegation.ratioOfMsgs * 100).toFixed(0)}%)`
+    + `  実際に走ったサブエージェント ${stat.subAgentRuns} 本(スキル・ワークフローが起こした分を含む)`);
   for (const a of result.delegation.byType) console.log(`  ${a.name.padEnd(22)} ${a.count}`);
   console.log(`サブエージェント側: ${stat.subTurns} ターン / ツール ${stat.subToolUses} 回 / $${stat.subCost.toFixed(0)}`
     + `  → ツール実行の ${(result.delegation.offloadRatio * 100).toFixed(0)}% ・ コストの ${(result.delegation.costRatio * 100).toFixed(0)}% を肩代わり`);

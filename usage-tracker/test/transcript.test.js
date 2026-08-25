@@ -278,6 +278,74 @@ check('配列 content の isMeta レコードを送信として数えない',
   pm && pm.input.sends === 1 && pm.input.userMsgs === 1 && pm.input.maxChars < 1000,
   pm ? JSON.stringify(pm.input) : hbm.out.slice(0, 200));
 
+// ---- ハーネスが user ロールで挿入する通知・出力を送信として数えない ----
+// isMeta が付かない挿入もある(バックグラウンド完了通知・! 実行の記録・compact の継続要約)。
+// 実データではこれで送信が 3 割水増しされ、文字数の 9 割が通知由来だった。
+// あわせて「本文 + 挿入ブロック」の混在レコードで挿入ぶんの文字数を数えないことも見る。
+const homeI = sandbox('habits-injected');
+writeTranscript(homeI, 'proj', 'cccccccc-0000-0000-0000-000000000008', [
+  uTurn('00:00', 'ふつうの送信'),
+  uTurn('00:01', '<task-notification>\n<task-id>abc</task-id>\n' + 'y'.repeat(4000) + '\n</task-notification>'),
+  uTurn('00:02', '<bash-stdout>' + 'z'.repeat(3000) + '</bash-stdout>'),
+  uTurn('00:03', 'This session is being continued from a previous conversation. ' + 'w'.repeat(3000)),
+  {
+    type: 'user', timestamp: at('00:04'),
+    message: {
+      content: [
+        { type: 'text', text: 'hi' },
+        { type: 'text', text: '<system-reminder>' + 'q'.repeat(2000) + '</system-reminder>' },
+      ],
+    },
+  },
+  aTurn('00:05', [{ type: 'tool_use', id: 'i1', name: 'Bash', input: {} }]),
+]);
+const hbi = run('habits.js', homeI, ['--since', '2026-01-01', '--json']);
+let pi = null;
+try { pi = JSON.parse(hbi.out); } catch (e) { pi = null; }
+check('通知・! 実行の記録・compact 要約を送信として数えない',
+  pi && pi.input.sends === 2 && pi.input.userMsgs === 2,
+  pi ? JSON.stringify(pi.input) : hbi.out.slice(0, 200));
+check('本文に続く挿入ブロックを入力の文字数に数えない',
+  pi && pi.input.maxChars === 6, pi ? `maxChars=${pi.input.maxChars}` : hbi.out.slice(0, 200));
+
+// ---- スキル起動のサブエージェントも本数として数える ----
+// Agent/Task の tool_use は親の transcript にしか現れないので、スキルやワークフローが
+// 起こしたサブエージェントは 0 回と出る。一方 subTurns はそれを含むため、両方出さないと
+// 「1 委譲あたり N ターン」が実態と食い違う。
+const homeR = sandbox('habits-runs');
+const RSID = 'cccccccc-0000-0000-0000-000000000009';
+writeTranscript(homeR, 'proj', RSID, [
+  uTurn('00:00', 'レビューして'),
+  aTurn('00:01', [{ type: 'tool_use', id: 'r1', name: 'Skill', input: { skill: 'code-review' } }]),
+]);
+writeTranscript(homeR, path.join('proj', RSID, 'subagents'), 'agent-review1', [
+  aTurn('00:02', [{ type: 'tool_use', id: 'r2', name: 'Read', input: {} }]),
+]);
+const hbr = run('habits.js', homeR, ['--since', '2026-01-01', '--json']);
+let pr = null;
+try { pr = JSON.parse(hbr.out); } catch (e) { pr = null; }
+check('Agent 呼び出しが無くてもサブエージェントの本数を数える',
+  pr && pr.delegation.total === 0 && pr.delegation.runs === 1,
+  pr ? JSON.stringify(pr.delegation).slice(0, 160) : hbr.out.slice(0, 200));
+
+// ---- 期間の起点を二重に指定させない / 小数を受けない ----
+const bothArgs = run('habits.js', homeH, ['--days', '2', '--since', '2026-01-01']);
+check('--days と --since の併用を弾く', bothArgs.code === 2, `code=${bothArgs.code} err=${bothArgs.err.slice(0, 120)}`);
+const fracDays = run('habits.js', homeH, ['--days', '2.5']);
+check('小数の --days を弾く', fracDays.code === 2, `code=${fracDays.code} err=${fracDays.err.slice(0, 120)}`);
+
+// ---- 指定した --gap が振れ幅の表に現れる ----
+const hbg = run('habits.js', homeH, ['--since', '2026-01-01', '--gap', '12', '--json']);
+let pg = null;
+try { pg = JSON.parse(hbg.out); } catch (e) { pg = null; }
+check('見出しの根拠になる --gap の行がスイープ表にある',
+  pg && pg.time.sweep.some(s => s.gap === 12), pg ? JSON.stringify(pg.time.sweep.map(s => s.gap)) : hbg.out.slice(0, 200));
+
+// ---- --json の時刻表現を揃える ----
+check('日別の first/last も ISO 文字列で返す',
+  parsed && typeof parsed.time.days[0].first === 'string' && !Number.isNaN(Date.parse(parsed.time.days[0].first)),
+  parsed ? JSON.stringify(parsed.time.days[0]) : '');
+
 // ---- DST のある地域でも日付境界がずれない ----
 // 日の加算を固定 86,400,000ms でやると、遷移日以降の境界が前日 23 時に落ちて
 // 同じ日付ラベルの行が 2 度出る(2025-11-02 の米国の切り戻し)。
