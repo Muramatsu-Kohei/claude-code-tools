@@ -110,9 +110,10 @@ function isNonInteractiveSession(file, bytes = 65536) {
     const n = fs.readSync(fd, buf, 0, bytes, 0);
     const head = buf.toString('utf8', 0, n);
     const lines = head.split('\n');
-    // 末尾は次の読み出し位置で切れている可能性があるので捨てる(ファイル全体を読み切った
-    // ときは最終行が空になるだけなので、同じ扱いでよい)。
-    lines.pop();
+    // 窓を使い切ったときだけ末尾を捨てる(その 1 行は次の読み出し位置で切れている)。
+    // 無条件に捨てると、ファイル全体が窓に収まりかつ末尾に改行が無い場合 — 書き込み途中の
+    // transcript が該当する — 唯一の完全なレコードまで落ち、非対話セッションを取り逃がす。
+    if (n === bytes) lines.pop();
     for (const line of lines) {
       if (!line.trim()) continue;
       let o;

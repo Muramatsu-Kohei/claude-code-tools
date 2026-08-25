@@ -240,6 +240,29 @@ check('スラッシュコマンドも 1 送信として分母に数える',
     && Math.abs(ps.input.turnsPerMsg - 1) < 1e-9 && Math.abs(ps.input.toolsPerMsg - 1) < 1e-9,
   ps ? JSON.stringify(ps.input) : hbs.out.slice(0, 200));
 
+// ---- 配列 content のスラッシュコマンドも commands と送信に数える ----
+// 実データのコマンド記録の 59% は <command-message> で始まり、これは INJECTED_HEAD に
+// 当たる。配列 content ではブロック単位で先に落ちるため、<command-name> を含む
+// ブロックを挿入除外より先に救わないと、コマンドが commands からも送信からも消える。
+const homeAC = sandbox('habits-array-cmd');
+writeTranscript(homeAC, 'proj', 'cccccccc-0000-0000-0000-00000000000d', [
+  {
+    type: 'user', timestamp: at('00:00'),
+    message: {
+      content: [
+        { type: 'text', text: '<command-message>wrap is running…</command-message>\n<command-name>/wrap</command-name>' },
+      ],
+    },
+  },
+  aTurn('00:01', [{ type: 'tool_use', id: 'ac1', name: 'Bash', input: {} }]),
+]);
+const hbac = run('habits.js', homeAC, ['--since', '2026-01-01', '--json']);
+let pac = null;
+try { pac = JSON.parse(hbac.out); } catch (e) { pac = null; }
+check('配列 content のスラッシュコマンドも commands と送信に数える',
+  pac && pac.input.commands === 1 && pac.input.sends === 1 && pac.commands.some(c => c.name === '/wrap'),
+  pac ? `${JSON.stringify(pac.input)} commands=${JSON.stringify(pac.commands)}` : hbac.out.slice(0, 200));
+
 // ---- 期間は since から今日まで ----
 // 最後のイベントで打ち切ると末尾の無操作日だけが落ちる非対称になり、同じ作業量でも
 // 窓のどこに寄っているかで perDay が倍近く変わる。
@@ -395,6 +418,16 @@ fs.writeFileSync(hugeFile, JSON.stringify({
 }) + '\n', 'utf8');
 check('先頭レコードが64KBを超えるとき、本文中の entrypoint 文字列があっても非対話と判定しない',
   lib.isNonInteractiveSession(hugeFile) === false);
+// 書き込み途中の transcript は末尾に改行が無いことがある。ファイル全体が 64KB の窓に
+// 収まる場合、無条件に lines.pop() すると唯一の完全なレコードまで捨ててしまい、
+// 非対話セッションを取り逃がす。
+const noNewlineFile = path.join(libDir, 'no-newline.jsonl');
+fs.writeFileSync(noNewlineFile, JSON.stringify({
+  type: 'user', timestamp: at('00:00'), entrypoint: 'sdk-cli',
+  message: { content: 'ping' },
+}), 'utf8'); // 末尾に改行を付けない
+check('末尾に改行が無い1レコードだけの transcript でも非対話と判定する',
+  lib.isNonInteractiveSession(noNewlineFile) === true);
 
 // ---- 非対話セッションのサブエージェント transcript もファイルごと外す ----
 // 親セッション(entrypoint: sdk-cli)を落としても、配下の subagents/agent-*.jsonl を
@@ -519,6 +552,30 @@ check('Agent 呼び出しが無くてもサブエージェントの本数を数�
   pr && pr.delegation.total === 0 && pr.delegation.runs === 1,
   pr ? JSON.stringify(pr.delegation).slice(0, 160) : hbr.out.slice(0, 200));
 
+// ---- usage を持たないサブエージェントの応答もターンとして数える ----
+// メイン側の assistantTurns は usage の有無に依らず数えているので、サブ側だけ usage
+// 必須にすると「1 委譲あたり N ターン」が比較相手より小さく出る非対称になる。
+// コストは usage が無いと計算できないので subCost には加算されない。
+const homeNU = sandbox('habits-sub-no-usage');
+const NUSID = 'cccccccc-0000-0000-0000-000000000010';
+writeTranscript(homeNU, 'proj', NUSID, [
+  uTurn('00:00', '調べて'),
+  aTurn('00:01', [{ type: 'tool_use', id: 'nu1', name: 'Agent', input: { subagent_type: 'sonnet-explorer' } }]),
+]);
+writeTranscript(homeNU, path.join('proj', NUSID, 'subagents'), 'agent-nousage', [
+  {
+    type: 'assistant', timestamp: at('00:02'), isSidechain: false,
+    // message.usage フィールドが無い応答(interrupted/synthetic 等を想定)。
+    message: { model: 'claude-opus-5', content: [{ type: 'tool_use', id: 'nu2', name: 'Read', input: {} }] },
+  },
+]);
+const hbnu = run('habits.js', homeNU, ['--since', '2026-01-01', '--json']);
+let pnu = null;
+try { pnu = JSON.parse(hbnu.out); } catch (e) { pnu = null; }
+check('usage の無いサブエージェントの応答もターンとして数える(コストは加算しない)',
+  pnu && pnu.delegation.subTurns === 1 && pnu.delegation.subCost === 0,
+  pnu ? JSON.stringify(pnu.delegation) : hbnu.out.slice(0, 200));
+
 // ---- 期間の起点を二重に指定させない / 小数を受けない ----
 const bothArgs = run('habits.js', homeH, ['--days', '2', '--since', '2026-01-01']);
 check('--days と --since の併用を弾く', bothArgs.code === 2, `code=${bothArgs.code} err=${bothArgs.err.slice(0, 120)}`);
@@ -557,6 +614,41 @@ const labels = pt ? pt.time.days.map(d => d.day) : [];
 check('DST を跨いでも日付ラベルが重複しない',
   pt && labels.length > 0 && new Set(labels).size === labels.length,
   pt ? labels.slice(0, 6).join(',') : hbt.err.slice(0, 200));
+
+// ---- 年をまたぐ期間では日別ラベルに年を出す ----
+// MM/DD だけだと年をまたいだ 2 つの日が同じラベルに畳まれ、--json の time.days[].day を
+// 鍵に使う側が黙って取りこぼす。「今日」は実行時刻に依存するので、今日から確実に
+// 年をまたぐ 400 日前(365 日超)を --since に使う(ago() は既存の DST テストの隣で
+// 定義済みの相対時刻ヘルパー)。
+const homeY = sandbox('habits-year-span');
+const sinceDate400 = new Date(Date.now() - 400 * 86400000);
+const sinceYearSpan = `${sinceDate400.getFullYear()}-${String(sinceDate400.getMonth() + 1).padStart(2, '0')}-${String(sinceDate400.getDate()).padStart(2, '0')}`;
+writeTranscript(homeY, 'proj', 'cccccccc-0000-0000-0000-00000000000e', [
+  { type: 'user', timestamp: ago(400), message: { content: '400日前' } },
+  { type: 'user', timestamp: ago(0), message: { content: '今日' } },
+]);
+const hby = run('habits.js', homeY, ['--since', sinceYearSpan, '--json']);
+let py = null;
+try { py = JSON.parse(hby.out); } catch (e) { py = null; }
+const yearLabels = py ? py.time.days.map(d => d.day) : [];
+check('年をまたぐ期間では日別ラベルが一意かつ YYYY/MM/DD 形式になる',
+  py && yearLabels.length > 0 && new Set(yearLabels).size === yearLabels.length
+    && yearLabels.every(l => /^\d{4}\/\d{2}\/\d{2}$/.test(l)),
+  py ? `${yearLabels.slice(0, 2).join(',')} ... ${yearLabels.slice(-2).join(',')}` : hby.out.slice(0, 200) + hby.err.slice(0, 200));
+
+// 年をまたがない既定の期間では従来どおり MM/DD のまま(短い期間で毎行に年が出ると
+// 日別テーブルが読みにくいので、そこは変えていない)。--days 7 の窓が実行日をまたいで
+// 年始をまたぐ確率は低いが 0 ではない(元日近辺の実行でのみ理論上フレーキーになりうる)。
+const homeNS = sandbox('habits-nonspan');
+writeTranscript(homeNS, 'proj', 'cccccccc-0000-0000-0000-00000000000f', [
+  { type: 'user', timestamp: ago(3), message: { content: '3日前' } },
+]);
+const hbns = run('habits.js', homeNS, ['--days', '7', '--json']);
+let pns = null;
+try { pns = JSON.parse(hbns.out); } catch (e) { pns = null; }
+check('年をまたがない既定の期間では日別ラベルが MM/DD のまま',
+  pns && pns.time.days.length > 0 && pns.time.days.every(d => /^\d{2}\/\d{2}$/.test(d.day)),
+  pns ? JSON.stringify(pns.time.days.map(d => d.day)) : hbns.out.slice(0, 200));
 
 // ---- transcript が無い環境 ----
 console.log('\ntranscript が無い場合');

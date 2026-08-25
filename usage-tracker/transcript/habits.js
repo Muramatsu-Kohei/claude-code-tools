@@ -86,7 +86,9 @@ function parseArgs(argv) {
     // --days と同じ上限を --since にも掛ける。掛けないと --days 側で防いだ「期間の指定
     // ミスが巨大な出力と巨大な配列確保になる」経路が素通りする(--since 1970-01-01 で
     // 日別テーブルが 2 万行を超え、そのほぼ全部が無操作日になる実例)。
-    const oldest = startOfDay(Date.now()) - (DAYS_MAX - 1) * 86400000;
+    // 固定ミリ秒で引くと DST のある地域で境界が現地の 0 時から 1 時間ずれ、上限ちょうどの
+    // 指定が季節によって通ったり弾かれたりする。addDays はそれを避けるために書いてある。
+    const oldest = addDays(Date.now(), -(DAYS_MAX - 1));
     if (dt.getTime() < oldest) {
       die(`--since が古すぎます(${DAYS_MAX} 日以内を指定してください): ${o.since}`);
     }
@@ -111,9 +113,13 @@ function addDays(t, n) {
   return d.getTime();
 }
 
-const dayKey = t => {
+// 期間が年をまたぐと MM/DD ではラベルが重複する。--days は 3650 まで許すので実際に起こり、
+// --json の time.days[].day を鍵に使う側は別々の日を黙って畳んでしまう。年をまたぐときだけ
+// 年を足す(短い期間で毎行に年が出ると日別テーブルが読みにくいので、常には付けない)。
+const dayKey = (t, withYear = false) => {
   const d = new Date(t);
-  return `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+  const md = `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+  return withYear ? `${d.getFullYear()}/${md}` : md;
 };
 
 // 時系列を gap で切り、各区間の長さの合計(分)とブロック数を返す。
@@ -253,8 +259,14 @@ function activeMinutes(sorted, gapMin) {
           let text = null;
           if (typeof c === 'string') text = c;
           else if (Array.isArray(c)) {
+            // スラッシュコマンドのブロックは挿入の除外より先に救う。実データの
+            // コマンド記録の 59% は <command-message> で始まり、これは INJECTED_HEAD に
+            // 当たる。今は文字列 content で書かれているから助かっているだけで、配列で
+            // 書かれた瞬間にブロックごと落ちてコマンドが commands からも送信からも消える
+            // (分母だけが縮んで 1 送信あたりの値が膨らむ)。文字列側は下で
+            // <command-name> を先に見ているので、これで両方の経路の意味が揃う。
             const t2 = c.filter(x => x.type === 'text').map(x => x.text || '')
-              .filter(s => !isInjected(s)).join('');
+              .filter(s => !isInjected(s) || /<command-name>/.test(s)).join('');
             text = t2 || null;
           }
           if (text === null) continue;
@@ -300,10 +312,15 @@ function activeMinutes(sorted, gapMin) {
               }
             }
           } else {
+            // ターン数は usage の有無に依らず数える。メイン側の assistantTurns が
+            // そうなっているので、ここだけ usage 必須にすると「1 委譲あたり N ターン」が
+            // 比較相手より小さく出る(実データでは usage 無しの応答は 0 件だが、
+            // 非対称を残すと将来その型が出たときに気づけないまま歪む)。
+            if (!dupTurn) stat.subTurns++;
             const u = dupTurn ? null : o.message.usage;
             if (u) {
               const c = cost(o.message.model, u);
-              s.cost += c; stat.totalCost += c; stat.subCost += c; stat.subTurns++;
+              s.cost += c; stat.totalCost += c; stat.subCost += c;
               bump(stat.models, String(o.message.model || 'unknown'), 1);
             }
             if (Array.isArray(o.message.content)) {
@@ -337,6 +354,8 @@ function activeMinutes(sorted, gapMin) {
   // 落ちて先頭の無操作日は残る非対称になり、同じ作業量でも窓のどこに寄っているかで
   // perDay が倍近く変わる(--days 30 で最初の週だけ働いた場合と最後の週だけの場合)。
   const nDays = Math.round((startOfDay(now) - startOfDay(since)) / 86400000) + 1;
+  // 年をまたぐ期間かどうかで日別ラベルに年を出す(dayKey のコメント参照)。
+  const spansYears = new Date(since).getFullYear() !== new Date(startOfDay(now)).getFullYear();
   // stat.events は昇順なので、日ごとに filter せず索引を進めて 1 パスで切る
   // (--since を古く取ると日数×イベント数の全走査になり、これが支配的になる)。
   let ei = 0;
@@ -352,7 +371,7 @@ function activeMinutes(sorted, gapMin) {
     // (繰り越すと徹夜が翌日の 0 時台に数時間まとめて計上され、実態とずれる)。
     const a = activeMinutes(seg, opt.gap);
     days.push({
-      day: dayKey(d0), dow: new Date(d0).getDay(),
+      day: dayKey(d0, spansYears), dow: new Date(d0).getDay(),
       hours: a.minutes / 60, blocks: a.blocks, events: seg.length,
       first: seg.length ? seg[0] : null, last: seg.length ? seg[seg.length - 1] : null,
     });
@@ -497,7 +516,8 @@ function activeMinutes(sorted, gapMin) {
   for (const s of sweep) console.log(`gap=${String(s.gap).padStart(2)}分  ${f1(s.hours).padStart(6)}h  ブロック ${s.blocks}`);
 
   console.log('\n--- 日別 ---');
-  console.log('日付  曜   作業h  ブロック  イベント  最初   最後');
+  // 年をまたぐ期間では日付が YYYY/MM/DD になるぶん、見出しも右へずらして列を合わせる。
+  console.log(`日付${days.length && days[0].day.length > 5 ? '     ' : ''}  曜   作業h  ブロック  イベント  最初   最後`);
   for (const d of days) {
     console.log(`${d.day} ${wd[d.dow]}  ${f1(d.hours).padStart(5)}  ${String(d.blocks).padStart(8)}`
       + `  ${String(d.events).padStart(8)}  ${hhmm(d.first)}  ${hhmm(d.last)}  `
