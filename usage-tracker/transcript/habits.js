@@ -8,7 +8,7 @@
 // 使い方: node habits.js [--days 14] [--gap 分] [--since YYYY-MM-DD] [--json]
 const fs = require('fs');
 const path = require('path');
-const { ROOT, cost, ctxLen, transcriptFiles, records, isNonInteractive, isNonInteractiveSession, warnUnknownModels } = require('./lib');
+const { ROOT, cost, ctxLen, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, warnUnknownModels } = require('./lib');
 
 // 作業時間の既定のギャップ閾値(分)。これより長い無操作は「作業していない」とみなす。
 // 5分だと 1 回の長い実行待ちで切れ、60分だと食事や仮眠を含んでしまう。
@@ -167,12 +167,8 @@ function activeMinutes(sorted, gapMin) {
   // 期間を最大(--days 3650)に取ると全 transcript 分の uuid を抱えるが、実測では
   // 1436 本 / 19.6 万レコードで 15.5 万件・ヒープ 84MB。線形に増えるだけなので放置してよい。
   const seenUuids = new Set();
-  // 親セッションが非対話かの判定結果(同じ親の下に子が何本もあるので覚えておく)。
-  const sdkParent = new Map();
-  const isSdkParent = (p) => {
-    if (!sdkParent.has(p)) sdkParent.set(p, fs.existsSync(p) && isNonInteractiveSession(p));
-    return sdkParent.get(p);
-  };
+  // 非対話実行のファイル単位の判定(親を見て子を落とす分も含めて lib.js に集約してある)。
+  const nonInteractiveFile = makeNonInteractiveFilter();
 
   for (const f of transcriptFiles()) {
     // 期間外のファイルは開かない。全 transcript は数百 MB あり、mtime で落とすと大幅に速い。
@@ -192,15 +188,11 @@ function activeMinutes(sorted, gapMin) {
 
     // 非対話実行(claude -p / SDK)のセッションは丸ごと外す。レコード単位の判定だけだと
     // entrypoint を持たない型(queue-operation)が残り、時間軸と架空プロジェクトに現れる。
-    // サブエージェント側の transcript には印が付かない(印は親のレコードにある)ので、
-    // 子は親を見て落とす。親だけ落として子を読むと、除外したはずの架空プロジェクトが
-    // 委譲の数え上げごと復活する。走査順は保証されないため「既に見た親」ではなく
-    // 親ファイルを直接引く。
-    if (isSub) {
-      if (isSdkParent(path.join(ROOT, project, `${sid}.jsonl`))) continue;
-    } else if (isNonInteractiveSession(f)) {
-      stat.sdkSessions++; continue;
-    }
+    // 親の巻き添えで落ちた子(= 'parent')は本数に数えない。数えると「除外したセッション」が
+    // 委譲の本数ぶん水増しされる。
+    const sdk = nonInteractiveFile(f);
+    if (sdk === 'session') { stat.sdkSessions++; continue; }
+    if (sdk) continue;
 
     // 期間内に記録のあるサブエージェントの transcript を 1 本と数える。Agent/Task の
     // tool_use だけでは、スキルやワークフローが起こしたサブエージェント(/code-review など)
@@ -208,9 +200,9 @@ function activeMinutes(sorted, gapMin) {
     // 実際のサブエージェントは 1014 本あり、subTurns はそちらを含むので、両方出さないと
     // 「1 委譲あたり 67 ターン」という実態と違う読みになる。
     let sawSubRecord = false;
-    // 同じ API 応答から分割されたレコードを二重に数えないための既出 id(ファイル内で閉じる)。
+    // 同じ API 応答から分割されたレコードを二重に数えないための収集器(ファイル内で閉じる)。
     // 跨ファイルの複製は上の seenUuids がレコードごと落とすので、こちらは分割の除去に徹する。
-    const seenMsgIds = new Set();
+    const usages = makeUsageCollector();
 
     try {
       for await (const o of records(f)) {
@@ -281,25 +273,12 @@ function activeMinutes(sorted, gapMin) {
           // サブエージェントのターンは委譲先の作業なので、メインの「1送信あたり何ターン
           // 回したか」やツールの偏りには混ぜない。ただし時間軸には含める(委譲が走っている
           // 間も作業時間ではある)。コストは合算しないと総額が実態より小さく出る。
-          // 1 回の API 応答は content ブロックごとに複数レコードへ分けて書かれ、その全部が
-          // 同じ message.id と「完全に同じ usage」を持つ(実測: 直近 3 日のメインで
-          // レコード 4899 / ユニーク id 2622、重複 1515 組はすべて usage 一致)。素朴に足すと
-          // ターン数もコストも約 1.9 倍に膨らむので、usage 由来の値は id ごとに 1 回だけ数える。
-          // tool_use はレコードごとに別のブロックなので、そちらは毎回数えてよい。
-          const mid = o.message.id;
-          const dupTurn = mid != null && seenMsgIds.has(mid);
-          if (mid != null) seenMsgIds.add(mid);
+          // 分割された同一応答の二重計上を防ぐ(規則と実測は lib.js の makeUsageCollector を
+          // 参照)。ターン数も usage と同じ id 単位で数える。tool_use はレコードごとに別の
+          // ブロックなので、そちらは毎回数えてよい。
+          const firstSeen = usages.add(o);
           if (!isSub) {
-            if (!dupTurn) stat.assistantTurns++;
-            const u = dupTurn ? null : o.message.usage;
-            if (u) {
-              s.mainTurns++;
-              s.maxCtx = Math.max(s.maxCtx, ctxLen(u));
-              const c = cost(o.message.model, u);
-              s.cost += c;
-              stat.totalCost += c;
-              bump(stat.models, String(o.message.model || 'unknown'), 1);
-            }
+            if (firstSeen) stat.assistantTurns++;
             if (Array.isArray(o.message.content)) {
               for (const x of o.message.content) {
                 if (x.type !== 'tool_use') continue;
@@ -316,13 +295,7 @@ function activeMinutes(sorted, gapMin) {
             // そうなっているので、ここだけ usage 必須にすると「1 委譲あたり N ターン」が
             // 比較相手より小さく出る(実データでは usage 無しの応答は 0 件だが、
             // 非対称を残すと将来その型が出たときに気づけないまま歪む)。
-            if (!dupTurn) stat.subTurns++;
-            const u = dupTurn ? null : o.message.usage;
-            if (u) {
-              const c = cost(o.message.model, u);
-              s.cost += c; stat.totalCost += c; stat.subCost += c;
-              bump(stat.models, String(o.message.model || 'unknown'), 1);
-            }
+            if (firstSeen) stat.subTurns++;
             if (Array.isArray(o.message.content)) {
               for (const x of o.message.content) {
                 if (x.type !== 'tool_use') continue;
@@ -337,8 +310,26 @@ function activeMinutes(sorted, gapMin) {
       // 走査中にファイルが消えることがある(セッションの後片付け、別の Claude Code の実行)。
       // statSync は上でガードしてあるが、読み出しは records() の中で起きるのでここで受ける。
       // 1 ファイルの消失で 1500 ファイル分の集計を捨てないための扱いで、他の例外は投げ直す。
+      // ここで continue しないのは、途中まで読めたぶんの usage を下で計上するため
+      // (ツールとターンは読みながら数えているので、捨てると同じファイル内で非対称になる)。
       if (!e || e.code !== 'ENOENT') throw e;
-      continue;
+    }
+
+    // usage 由来の値(コスト・到達コンテキスト長)は読み終えてから応答ごとに 1 回だけ足す。
+    // 収集器の isSub はレコードの isSidechain だが、ここではパスで決まる isSub を使う:
+    // フラグは欠落する行があり、ファイル単位で決まるパスの方が取りこぼしが無い。
+    const sess = stat.sessions.get(sid);
+    for (const { usage, model } of usages.entries()) {
+      const c = cost(model, usage);
+      stat.totalCost += c;
+      bump(stat.models, String(model || 'unknown'), 1);
+      if (isSub) stat.subCost += c;
+      if (!sess) continue;   // 期間内のレコードが 1 件も無ければセッションは作られていない
+      sess.cost += c;
+      if (!isSub) {
+        sess.mainTurns++;
+        sess.maxCtx = Math.max(sess.maxCtx, ctxLen(usage));
+      }
     }
   }
 

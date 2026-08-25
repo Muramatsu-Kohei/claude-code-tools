@@ -88,8 +88,6 @@ async function* records(file) {
 // entrypoint は user と assistant の両方に付く。ただし queue-operation のように印を
 // 持たない型が同じセッションに混ざるので、これ単体では取りこぼす(実測 18 件が残り、
 // 時間軸と架空プロジェクトに現れた)。下の isNonInteractiveSession() と併せて使う。
-// 現時点で使っているのは habits.js のみ。sessions.js / turncost.js / breakdown.js は
-// まだ ping を含んだまま数えている(sessions.js のセッション数はそのぶん多い)。
 const isNonInteractive = o => !!o && o.entrypoint === 'sdk-cli';
 
 // ファイルごと非対話実行のセッションか。レコード単位の判定だけでは足りない:
@@ -134,10 +132,90 @@ function isNonInteractiveSession(file, bytes = 65536) {
   }
 }
 
+// ファイル単位で「このファイルは集計対象か」を判定する関数を作る。判定結果はパスごとに
+// 覚える(サブエージェントは同じ親を何本も引くため)。集計スクリプト 4 本がここを共有する:
+// 同じ規則を各スクリプトで新設すると、片方だけ直る状態(PR #16 で見つけた漏れ)に戻る。
+// 戻り値は null(対象) / 'session'(そのファイル自身が非対話) / 'parent'(親が非対話の
+// サブエージェント)。呼び出し側が「除外した本数」を数えるとき、親の巻き添えで落ちた子まで
+// セッションとして数えないよう区別している。
+function makeNonInteractiveFilter() {
+  const cache = new Map();
+  const judge = (p) => {
+    if (!cache.has(p)) cache.set(p, fs.existsSync(p) && isNonInteractiveSession(p));
+    return cache.get(p);
+  };
+  return (file) => {
+    // サブエージェントの transcript は projects/<プロジェクト>/<親セッションID>/subagents/
+    // に置かれ、非対話の印は付かない(印は親のレコードにある)。親だけ落として子を読むと、
+    // 除外したはずの架空プロジェクトが委譲の数え上げごと復活するので、子は親を見て落とす。
+    // 走査順は保証されないため「既に見た親」ではなく親ファイルを直接引く。
+    const parts = path.relative(ROOT, file).split(path.sep);
+    const i = parts.indexOf('subagents');
+    if (i > 0) {
+      const parent = path.join(ROOT, ...parts.slice(0, i - 1), `${parts[i - 1]}.jsonl`);
+      return judge(parent) ? 'parent' : null;
+    }
+    return judge(file) ? 'session' : null;
+  };
+}
+
+// 分割された同一応答の usage を 1 件にまとめる収集器。呼び出し側はファイルごとに作る。
+//
+// 1 回の API 応答は content ブロック(thinking / text / tool_use)ごとに複数レコードへ
+// 分けて書かれ、その全部が同じ message.id を持つ。素朴に足すとターン数もコストも約 1.9 倍に
+// 膨らむので、usage 由来の値(ターン数・コスト・コンテキスト長・トークン内訳)は id ごとに
+// 1 回だけ数える。tool_use はレコードごとに別のブロックなので、こちらに通してはいけない
+// (ツール回数が減る)。
+//
+// 「どのレコードの usage を採るか」を最初の 1 件にしてはいけない。書かれ方が 2 通りあるため:
+//   - メインの transcript は分割された全レコードが完成形の同じ usage を持つ
+//     (実測 26294 組のうち食い違うのは 1 組)。どれを採っても同じ。
+//   - サブエージェントの transcript は途中のレコードが output_tokens: 2 のプレースホルダで、
+//     最後のレコードだけが完成形(実測 12089 組中 10111 組が食い違い、最後が最大なのは
+//     12089 組すべて)。最初を採ると output トークンが 12.25M → 1.29M と 1/10 に落ちる。
+// そこで output_tokens が最大のレコードを採る。「最後」でなく「最大」にするのは走査順に
+// 依存しない形にしておくため(実データではどちらでも同じ結果になる)。
+//
+// 跨ファイルの複製(--resume / fork)は uuid でレコードごと落とす対象で、こちらの仕事では
+// ない。message.id を跨ファイルに広げると正当な分割まで消える。
+function makeUsageCollector() {
+  const byId = new Map();
+  let anon = 0;
+  return {
+    // assistant レコードを渡す。戻り値は「その応答を初めて見たか」= ターンとして数えるか。
+    // usage を持たない応答もターンではあるので、id の登録は usage の有無に依らず行う。
+    add(o) {
+      const msg = o && o.message;
+      if (!msg) return false;
+      // id が無いと分割かどうか判別できないので、まとめずに 1 件ずつ数える側に倒す。
+      const key = msg.id != null ? msg.id : ` ${anon++}`;
+      const u = msg.usage || null;
+      const prev = byId.get(key);
+      if (!prev) {
+        byId.set(key, { usage: u, model: msg.model, isSub: !!o.isSidechain });
+        return true;
+      }
+      if (u && (!prev.usage || (u.output_tokens || 0) > (prev.usage.output_tokens || 0))) {
+        prev.usage = u;
+        prev.model = msg.model;
+      }
+      return false;
+    },
+    // usage を持つ応答だけを id ごとに 1 件返す。ファイルを読み終えてから回す。
+    *entries() {
+      for (const v of byId.values()) if (v.usage) yield v;
+    },
+  };
+}
+
 function warnUnknownModels() {
   if (!unknownModels.size) return;
   const list = [...unknownModels.entries()].map(([m, n]) => `${m}(${n}件)`).join(', ');
   console.error(`\n警告: pricing.js に単価が無いモデルを $0 として集計した: ${list}`);
 }
 
-module.exports = { PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records, isNonInteractive, isNonInteractiveSession, warnUnknownModels };
+module.exports = {
+  PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records,
+  isNonInteractive, isNonInteractiveSession, makeNonInteractiveFilter, makeUsageCollector,
+  warnUnknownModels,
+};

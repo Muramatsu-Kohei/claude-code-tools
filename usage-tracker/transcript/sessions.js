@@ -2,7 +2,7 @@
 // セッション単位で「コンテキストがどこまで膨らんだか」「委譲したか自分で読んだか」を集計する。
 // 目的は運用ルール(委譲率を上げる/セッションを短く保つ)を実データで裏付けること。
 const path = require('path');
-const { cost, ctxLen, transcriptFiles, records, warnUnknownModels } = require('./lib');
+const { cost, ctxLen, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, warnUnknownModels } = require('./lib');
 
 // メインスレッドで直接使うと文脈を太らせるツール群(委譲候補)
 const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch', 'WebSearch']);
@@ -10,8 +10,19 @@ const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch',
 (async () => {
   const files = transcriptFiles();
   const sessions = [];
+  // 非対話実行(claude -p / SDK)は「使い方」ではないので集計から外す。判定は lib.js に
+  // 集約してある(claude-window-keeper の ping が 1 セッション 1 送信でセッション数を
+  // 押し上げ、cwd 由来の架空プロジェクト C--WINDOWS-system32 としても現れる)。
+  const nonInteractiveFile = makeNonInteractiveFilter();
+  let sdkSessions = 0, sdkRecords = 0;
 
   for (const f of files) {
+    const sdk = nonInteractiveFile(f);
+    if (sdk === 'session') { sdkSessions++; continue; }
+    if (sdk) continue;   // 親が非対話のサブエージェント。本数には数えない(親で 1 本数えた)
+    // 分割された同一応答の二重計上を防ぐ(規則と実測は lib.js の makeUsageCollector を参照)。
+    const usages = makeUsageCollector();
+
     const s = {
       project: path.basename(path.dirname(f)),
       id: path.basename(f, '.jsonl').slice(0, 8),
@@ -23,6 +34,9 @@ const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch',
     };
 
     for await (const o of records(f)) {
+      // セッション単位の判定を抜けた個別レコードの保険(対話セッションに sdk 由来の
+      // レコードが混ざる形が将来出ても、ここで落ちる)。
+      if (isNonInteractive(o)) { sdkRecords++; continue; }
       if (o.timestamp) {
         if (!s.start || o.timestamp < s.start) s.start = o.timestamp;
         if (!s.end || o.timestamp > s.end) s.end = o.timestamp;
@@ -30,15 +44,8 @@ const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch',
       if (o.type !== 'assistant' || !o.message) continue;
 
       const sub = !!o.isSidechain;
-      const u = o.message.usage;
-      if (u) {
-        const c = cost(o.message.model, u);
-        if (sub) { s.subTurns++; s.costSub += c; }
-        else {
-          s.mainTurns++; s.costMain += c;
-          s.maxCtx = Math.max(s.maxCtx, ctxLen(u));
-        }
-      }
+      // usage 由来の値は収集器に預け、ファイルを読み終えてから応答ごとに 1 回だけ足す。
+      usages.add(o);
       // ツール呼び出しの内訳はメインスレッド分だけ見る(サブは委譲済みなので対象外)
       if (!sub && Array.isArray(o.message.content)) {
         for (const c of o.message.content) {
@@ -46,6 +53,15 @@ const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch',
           if (c.name === 'Task' || c.name === 'Agent') s.task++;
           else if (HEAVY.has(c.name)) s.heavy++;
         }
+      }
+    }
+    // 応答ごとに 1 回。ターン数・コスト・到達コンテキスト長はすべてここから出す。
+    for (const { usage, model, isSub } of usages.entries()) {
+      const c = cost(model, usage);
+      if (isSub) { s.subTurns++; s.costSub += c; }
+      else {
+        s.mainTurns++; s.costMain += c;
+        s.maxCtx = Math.max(s.maxCtx, ctxLen(usage));
       }
     }
     if (s.mainTurns > 0) sessions.push(s);
@@ -56,6 +72,13 @@ const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch',
   const totTask = sessions.reduce((a, s) => a + s.task, 0);
 
   console.log(`セッション数: ${sessions.length}  総換算コスト: $${totalCost.toFixed(0)}`);
+  // 0 でなければ ping などが走っている。何本を外したかを出さないと、セッション数が
+  // 減った理由が集計の変更なのか使い方の変化なのか読み手に分からない。
+  if (sdkSessions || sdkRecords) {
+    const excluded = [`セッション ${sdkSessions} 本`];
+    if (sdkRecords) excluded.push(`単独レコード ${sdkRecords} 件`);
+    console.log(`(非対話実行 claude -p の${excluded.join(' / ')}は集計から除外)`);
+  }
   // 対象ツールを一度も使っていない集計(絞り込みすぎ/空の transcript)では率が定義できない
   const delegation = totHeavy + totTask ? (totTask / (totHeavy + totTask) * 100).toFixed(1) + '%' : '-';
   console.log(`メインでの重いツール呼び出し: ${totHeavy} 回 / サブエージェント委譲: ${totTask} 回`

@@ -650,6 +650,88 @@ check('年をまたがない既定の期間では日別ラベルが MM/DD のま
   pns && pns.time.days.length > 0 && pns.time.days.every(d => /^\d{2}\/\d{2}$/.test(d.day)),
   pns ? JSON.stringify(pns.time.days.map(d => d.day)) : hbns.out.slice(0, 200));
 
+// ---- 3 本の集計スクリプトにも同じ規則を効かせる(issue #17) ----
+// habits.js だけが持っていた「非対話実行の除外」と「分割された同一応答の扱い」を
+// sessions / turncost / breakdown にも効かせた。判定は lib.js に集約してあるので、
+// ここでは規則そのものと、3 本が同じ結果を出すかを見る。
+console.log('\nsessions.js / turncost.js / breakdown.js の除外と重複排除');
+
+// 収集器の規則。実データではサブエージェントの transcript が「途中のレコードは
+// output_tokens: 2 のプレースホルダ、最後だけが完成形」という書かれ方をするので、
+// 最初のレコードを採ると output トークンが 1/10 に落ちる(実測 12.25M → 1.29M)。
+const col = lib.makeUsageCollector();
+const splitRec = (out, id = 'msg_a') => ({
+  type: 'assistant', isSidechain: false,
+  message: { id, model: 'claude-opus-5', usage: usage({ input_tokens: 10, output_tokens: out }) },
+});
+check('同じ message.id の応答は初回だけ true を返す(ターンを数えるのに使う)',
+  col.add(splitRec(2)) === true && col.add(splitRec(2)) === false && col.add(splitRec(999)) === false);
+const collected = [...col.entries()];
+check('採るのは output_tokens が最大のレコード(途中のプレースホルダではない)',
+  collected.length === 1 && collected[0].usage.output_tokens === 999, JSON.stringify(collected));
+col.add(splitRec(5, 'msg_b'));
+check('message.id が違えば別の応答として数える', [...col.entries()].length === 2);
+const colNoId = lib.makeUsageCollector();
+colNoId.add(assistant(usage({ output_tokens: 1 })));
+colNoId.add(assistant(usage({ output_tokens: 1 })));
+check('message.id が無いレコードはまとめない(分割か別応答か判別できない)',
+  [...colNoId.entries()].length === 2);
+
+const homeX = sandbox('exclude');
+const xTs = t => `2026-03-01T${t}:00.000Z`;
+// 1 回の応答が 3 レコードに分かれ、最後だけが完成形の usage を持つ形(実データと同じ)。
+// tool_use はレコードごとに別のブロックなので、こちらは 2 回とも数えられなければならない。
+const split = (t, out, content) => ({
+  type: 'assistant', timestamp: xTs(t), isSidechain: false,
+  message: {
+    id: 'msg_split_1', model: 'claude-opus-5',
+    usage: usage({ cache_read_input_tokens: 40e3, output_tokens: out }),
+    content,
+  },
+});
+writeTranscript(homeX, 'proj', 'dddddddd-0000-0000-0000-000000000001', [
+  { type: 'user', timestamp: xTs('00:00'), message: { content: '調べて' } },
+  split('00:01', 2, [{ type: 'thinking', thinking: '考える' }]),
+  split('00:02', 2, [{ type: 'tool_use', id: 'x1', name: 'Read', input: {} }]),
+  split('00:03', 1000, [{ type: 'tool_use', id: 'x2', name: 'Grep', input: {} }]),
+]);
+// 非対話実行(claude -p の ping)のセッションと、その下のサブエージェント。子には印が
+// 付かないので親を見て落とす。子は isSidechain も落ちている形にしてあり、フラグ頼みの
+// 除外では素通りする(turncost.js の 300K〜 帯に現れる)。
+const SDK_SID = 'eeeeeeee-0000-0000-0000-000000000001';
+writeTranscript(homeX, 'C--WINDOWS-system32', SDK_SID, [
+  { type: 'user', timestamp: xTs('02:00'), entrypoint: 'sdk-cli', message: { content: 'Reply with only the word: ok' } },
+  {
+    type: 'assistant', timestamp: xTs('02:01'), entrypoint: 'sdk-cli', isSidechain: false,
+    message: { id: 'msg_ping', model: 'claude-opus-5', usage: usage({ cache_read_input_tokens: 250e3, output_tokens: 5 }) },
+  },
+]);
+writeTranscript(homeX, path.join('C--WINDOWS-system32', SDK_SID, 'subagents'), 'agent-x', [
+  {
+    type: 'assistant', timestamp: xTs('02:02'), isSidechain: false,
+    message: { id: 'msg_ping_sub', model: 'claude-opus-5', usage: usage({ cache_read_input_tokens: 310e3, output_tokens: 7 }) },
+  },
+]);
+
+const ssx = run('sessions.js', homeX);
+check('sessions.js: 非対話実行のセッションを数えない', /^セッション数: 1 /m.test(ssx.out), ssx.out);
+check('sessions.js: 何本外したかを出力に添える',
+  /非対話実行 claude -p のセッション 1 本/.test(ssx.out), ssx.out);
+check('sessions.js: 分割された応答は 1 ターン、ツールは 2 回',
+  /^proj\s+dddddddd\s+1\s+0\s+40K\s+2\s+0\s/m.test(ssx.out), ssx.out);
+
+const tcx = run('turncost.js', homeX);
+check('turncost.js: 分割された応答は 1 ターン、単価は完成形の usage で出す',
+  /^30〜60K\s+1\s+\$0\s+\$0\.0450/m.test(tcx.out), tcx.out);
+check('turncost.js: 非対話実行のターンが帯に現れない(親も子も)',
+  !/^200〜300K/m.test(tcx.out) && !/^300K〜/m.test(tcx.out), tcx.out);
+
+const bdx = run('breakdown.js', homeX);
+check('breakdown.js: 分割された応答の output を二重にも過小にも数えない',
+  /^opus-5\s+main\s+1\s+1000\s/m.test(bdx.out), bdx.out);
+check('breakdown.js: 非対話実行のファイルを本数からも外す',
+  /^ファイル数: 1$/m.test(bdx.out), bdx.out);
+
 // ---- transcript が無い環境 ----
 console.log('\ntranscript が無い場合');
 const homeC = path.join(BASE, 'empty');
