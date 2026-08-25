@@ -215,7 +215,7 @@ function comparableTree(t) {
 //  - 未作成(ENOENT): account-guard を入れていない構成。「向こうは保護していない」のは
 //    事実だが、使ってもいないツールの名前を出しても混乱を増やすだけ
 //  - 読めない/壊れている: account-guard は壊れた設定を全拒否として扱う(fail-closed)ので、
-//    実際には保護が最も強く効いている。「保護されていない」と案内すると正反対になる
+//    実際には保護が最も強く効いている。「効いていない」と案内すると正反対になる
 // 一時解除(unlocks.json)は見ない。あれはセッション単位で消える一時的な状態で、
 // ここで知らせたいのは「設定を片方だけ書き換えたまま放置している」という恒久的な食い違い
 function guardActiveRules(account) {
@@ -226,13 +226,24 @@ function guardActiveRules(account) {
     return null;
   }
   if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.rules)) return null;
-  // 1件でも安全に照合できない tree があれば、全体をあきらめる。壊れたルールだけを捨てて
-  // 残りで判定すると、「保護されていない」と誤って案内する向きに倒れる: 相対パスや
-  // tree の書き損じ(型違い/空)は account-guard 側では設定全体を壊れているとみなす材料に
-  // なり、その状態の向こうは全ての操作を拒否している(= 保護が最も強く効いている)
-  if (!parsed.rules.every((r) => r && comparableTree(r.tree))) return null;
-  return parsed.rules
+  // 書き損じ(tree が非文字列・空・相対パス)は 1 件でも当たれば全体をあきらめる。
+  // account-guard の loadConfig はこれを「設定全体が壊れている」とみなし、修復するまで
+  // 全操作を拒否する(= 保護が最も強く効いている)。壊れたルールだけ捨てて残りで判定
+  // すると、その最中に「効いていない」と正反対の案内を出す。allow に誰が入っていても
+  // 向こうの倒れ方は同じなので、この検査だけは絞る前に全ルールへ掛ける
+  if (!parsed.rules.every((r) => r && typeof r.tree === 'string' && r.tree
+    && path.isAbsolute(r.tree))) return null;
+  // 今のアカウントを拒否しているルールだけが「今まさに保護している」ルール。allow に
+  // 今のアカウントが入っているルールは何も遮っていないので、以降の判定には関わらない
+  const relevant = parsed.rules
     .filter((r) => !(Array.isArray(r.allow) && r.allow.includes(account)));
+  // 両ツールで同じ場所を指すと言い切れない tree が保護側に 1 件でもあれば、そのルールが
+  // 対象ツリーを覆っているかを判定できない = 「効いていない」と言い切れないので降りる。
+  // 絞る範囲を account-guard の status 側と揃えてあるのは、両 README が「逆方向は同じ
+  // 食い違いを報告する」と約束しているため。片方だけ全ルールを検めると、同じ設定でも
+  // 報告する側としない側が生まれる
+  if (!relevant.every((r) => comparableTree(r.tree))) return null;
+  return relevant;
 }
 
 // worklog 側だけが伏せているツリー(= account-guard 側では今のアカウントで素通しになる
@@ -271,9 +282,14 @@ function guardMismatchNote(cfg, account, onlyTrees = null) {
     : blockedTrees(cfg, account);
   const mismatched = guardMismatchedTrees(blocked, account);
   if (!mismatched.length) return null;
+  // 「保護されていない」ではなく「今のアカウントに効いていない」と言う。ここが拾う
+  // 食い違いには「向こうの allow に今のアカウントが入っている」場合も含まれ、そのとき
+  // 保護ルール自体は存在して他のアカウントには効いている。「保護されていない」と読んで
+  // 向こうのルールごと消すと、まだ生きている保護まで外れる(それが起きるのは
+  // account-guard 側 = 操作の遮断なので、worklog 側を外すより被害が大きい)
   return `この制限は worklog 側の設定によるもの: ${CONFIG_PATH} の restrictedTrees`
-    + `\n(${mismatched.join(' / ')} は account-guard 側では保護されていない`
-    + ' — 解除するつもりなら両方から外す)';
+    + `\n(${mismatched.join(' / ')} は account-guard 側では今のアカウントに効いていない`
+    + ' — 解除するつもりなら両方の設定を見直す)';
 }
 
 // 注記に食い違いの説明を足す。改行で区切るだけで行頭は整えない — 呼び出し側の書式が
@@ -298,6 +314,16 @@ const mdNote = (note) => noteLines(note, '> ', '> ');
 // 「この制限は」と言うとき、その制限を作っているルールだけを説明の対象にするために使う
 function hitTrees(blocked, keys) {
   return blocked.filter((r) => !r.all && keys.some((k) => keyUnderTree(k, r.tree))).map((r) => r.tree);
+}
+
+// hitTrees の cwd 版。move はセッション単位で「対象外」を決めるので、説明の材料も
+// その記録に実際に効いているルールに限る(hitTrees と同じ理由)。判定を書き下ろさず
+// isCwdBlocked にルールを 1 件ずつ渡すのは、cwd を持たないレコードのキー単位
+// フォールバックまで含めて「対象外」を決めた判定と、同じものを使うため
+function hitTreesByCwd(blocked, sessions, key) {
+  return blocked
+    .filter((r) => !r.all && sessions.some((s) => isCwdBlocked(s.cwd, [r], key)))
+    .map((r) => r.tree);
 }
 
 // key のログファイルに現れる cwd のうち、「本来その key の記録である」と確認できる
@@ -2148,7 +2174,9 @@ function cmdMove(flags) {
   // すり抜けてここまで来ることがある(過去の move で非制限キーへ移された孤児など)。
   // 下の一覧は summary をそのまま出すので、外さないと読み出し制限の抜け穴になる。
   // 見えていない記録を動かせるのも筋が通らないので、--force でも押し切らせない
-  const blocked = blockedTrees(loadConfig(), currentAccount());
+  const cfg = loadConfig();
+  const account = currentAccount();
+  const blocked = blockedTrees(cfg, account);
   // キー(from)も渡す。cwd を持たない孤児レコードまで一律に対象外にすると、保護ツリーと
   // 何の関係もない自分の記録が「別アカウント専用のツリーの記録」という誤った理由で
   // 動かせなくなる(from は resolveMoveKey を通っており可視なキーだけが来る)
@@ -2173,6 +2201,14 @@ function cmdMove(flags) {
   // 「消えた」と誤解して探し回らずに済むようにする
   for (const s of restricted) {
     console.log(yellow(`  対象外 ${fmtTime(s.startTs)} ${s.sid.slice(0, 8)} — 別アカウント専用のツリーの記録`));
+  }
+  // この一覧にもどちらの設定が効いているかを添える。move が丸ごと断られたときは
+  // resolveMoveKey の拒否理由が同じ説明を出すが、こちらは「一部のセッションだけ対象外」の
+  // 経路で、拒否理由は通らない。片方だけ外したまま来た利用者が「移せない記録がある」と
+  // 気づくのはここなので、説明が落ちると原因にたどり着けないまま終わる
+  if (restricted.length) {
+    const mismatch = guardMismatchNote(cfg, account, hitTreesByCwd(blocked, restricted, from));
+    if (mismatch) console.log(yellow(noteLines(mismatch, '  ', '  ')));
   }
   if (!moving.length) {
     console.error('移動できる記録がない。');

@@ -21,8 +21,12 @@ const SUB = path.join(TREE, 'inner');            // その配下(前方一致の
 const TREE2 = path.join(BASE, 'second-tree');    // 2 本目。注記の対象を取り違えないことの確認用。
 // TREE と部分一致しない名前にするのは、--project や move の部分一致検索で巻き込まないため
 const OTHER = path.join(BASE, 'other-repo');     // 保護と無関係
+// 可視なキーの中に、cwd だけが保護ツリー配下のレコードが混ざった状態を作るためのリポジトリ。
+// move はキー単位の網(resolveMoveKey)を通ったあと、セッション単位でも cwd を見て外すので、
+// 「一部だけ対象外」という拒否理由とは別の経路がある
+const MIXED = path.join(BASE, 'mixed-repo');
 
-for (const r of [TREE, SUB, TREE2, OTHER]) {
+for (const r of [TREE, SUB, TREE2, OTHER, MIXED]) {
   fs.mkdirSync(r, { recursive: true });
   execFileSync('git', ['init', '-q'], { cwd: r, windowsHide: true, timeout: 30000, killSignal: 'SIGKILL' });
 }
@@ -87,7 +91,7 @@ const { check, finish } = checks();
 
 // 食い違いの説明が出ているか。文面全体ではなく「どちらの設定が効いているか」を
 // 伝える核だけを見る(言い回しの調整でテストが落ちないように)
-const MISMATCH = /account-guard 側では保護されていない/;
+const MISMATCH = /account-guard 側では今のアカウントに効いていない/;
 const WHICH_CONFIG = /この制限は worklog 側の設定によるもの/;
 
 setAccount('pro'); // allow=[team] に外れるので、以下すべて「伏せる」側
@@ -140,7 +144,7 @@ check('account-guard 未導入なら何も言わない(使っていないツー�
   !MISMATCH.test(noGuard), noGuard);
 
 // 壊れた設定を account-guard は「全拒否」として扱う(fail-closed)。つまり保護は
-// 最も強く効いている状態なので、「保護されていない」と案内すると正反対になる
+// 最も強く効いている状態なので、「効いていない」と案内すると正反対になる
 setGuard('{ "rules": [');
 check('account-guard の設定が壊れているときは何も言わない(向こうは全拒否なので逆の案内になる)',
   !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
@@ -181,7 +185,7 @@ console.log('\naccount-guard 側が壊れている・解釈できない書き方
 
 // account-guard は「1 つでも書き損じたルールがあれば設定全体を壊れているとみなし、
 // すべての操作を拒否する」。こちらが壊れたルールだけ捨てて残りで判定すると、
-// 向こうが全拒否している最中に「保護されていない」と正反対の案内を出す
+// 向こうが全拒否している最中に「効いていない」と正反対の案内を出す
 // 同居させる有効なルールは、TREE を覆わないもの(OTHER)にする。TREE を覆うルールを
 // 混ぜると、壊れたルールを無視しても「両方に書いてある」と判定されてしまい、
 // このチェックを外しても検査が通ってしまう(= 退行を検出できないテストになる)
@@ -195,7 +199,7 @@ check('tree が文字列でないルールがあっても黙る',
 
 // ドライブ文字を落とした tree は向こうでは有効なルールとして働くが、こちらの normPath
 // (path.resolve)は実行時のドライブを基準に別の場所として解決する。解釈が食い違う以上、
-// 「保護されていない」と言い切れない
+// 「効いていない」と言い切れない
 setGuard({ rules: [{ tree: '/org-tree', allow: ['team'] }] });
 check('ドライブ文字の無い tree があれば黙る(解釈が両者で食い違う)',
   !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
@@ -204,6 +208,23 @@ check('ドライブ文字の無い tree があれば黙る(解釈が両者で食
 // こちらの path.resolve は `<実行時のドライブ>:\c\org-tree` にしてしまう
 setGuard({ rules: [{ tree: '/c/org-tree', allow: ['team'] }] });
 check('Git Bash 表記の tree があれば黙る(保護が効いているのに外せと案内しない)',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+// 解釈できない tree でも、今のアカウントを allow しているルールは何も遮っていないので、
+// 覆っているかどうかを判定する必要がない = 照合を降りる理由にならない。
+// account-guard の status も「今拒否しているルール」だけを検めており(printWorklogRestrictions
+// の relevant)、両 README は「逆方向は同じ食い違いを報告する」と約束している。ここを
+// 全ルールに掛け直すと、同じ設定で報告する側としない側が生まれる
+setGuard({ rules: [{ tree: '/org-tree', allow: ['pro'] }] });
+const allowedOddTree = run(['list', '--cwd', TREE]).out;
+check('今のアカウントを許可しているだけのルールは、tree が解釈できなくても照合を止めない',
+  MISMATCH.test(allowedOddTree), allowedOddTree);
+
+// 一方、書き損じ(相対パス・非文字列・空)は allow に誰が入っていても降りる。
+// account-guard はルール 1 件の書き損じで設定全体を壊れているとみなし全操作を拒否するので、
+// 「今のアカウントには効いていない」は allow の中身に関わらず事実と逆になる
+setGuard({ rules: [{ tree: 'relative-path', allow: ['pro'] }] });
+check('書き損じのルールは、今のアカウントを許可していても黙る(向こうは全拒否)',
   !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
 
 console.log('\n名指しの注記は、その対象に効いている制限だけを説明する');
@@ -242,7 +263,7 @@ const exported = run(['export', '--project', projectKey(TREE)]).out;
 check('export の注記が引用として出る', /^> .*別アカウント専用/m.test(exported), exported);
 check('食い違いの説明の継続行にも > が付く',
   /^> この制限は worklog 側の設定によるもの/m.test(exported)
-  && /^> \(.*account-guard 側では保護されていない/m.test(exported), exported);
+  && /^> \(.*account-guard 側では今のアカウントに効いていない/m.test(exported), exported);
 check('引用記号の無い裸の継続行が残っていない',
   !/^この制限は worklog 側の設定によるもの/m.test(exported), exported);
 
@@ -273,6 +294,30 @@ const moveTree1 = run(['move', '--from', projectKey(TREE), '--to', projectKey(OT
 check('worklog 側だけのツリーの move 拒否には食い違いを出す', MISMATCH.test(moveTree1.err), moveTree1.err);
 check('エラーの継続行が字下げされている(行頭に貼り付かない)',
   /\n {2}この制限は worklog 側の設定によるもの/.test(moveTree1.err), moveTree1.err);
+
+console.log('\nmove の「対象外」一覧(セッション単位)にも食い違いを添える');
+
+// キー自体は可視なので resolveMoveKey の拒否理由は通らない。cwd が保護ツリー配下の
+// レコードだけがセッション単位で外れ、その説明はこの経路でしか出ない
+write(MIXED, [
+  { sid: 'm1', ts: T, summary: '普通の記録' },
+  { sid: 'm2', ts: T, summary: '保護ツリーの孤児記録', cwd: TREE },
+]);
+const movePartial = run(['move', '--from', projectKey(MIXED), '--to', projectKey(OTHER), '--all', '--dry-run']);
+check('一部だけ対象外になる move が成立している(検査が空振りしていないことの確認)',
+  /対象外 .*別アカウント専用のツリーの記録/.test(movePartial.out), movePartial.out || movePartial.err);
+check('セッション単位の「対象外」にも食い違いを出す', MISMATCH.test(movePartial.out), movePartial.out);
+check('保護ツリーの要約は出さない(制限そのものは緩めない)',
+  !/保護ツリーの孤児記録/.test(movePartial.out), movePartial.out);
+
+// 名指しの注記と同じく、説明の対象はその記録に効いているルールに限る。
+// TREE2 も伏せているが、対象外になったのは TREE 配下の記録なので TREE2 は挙げない
+setWorklog({ restrictedTrees: [{ tree: TREE, allow: ['team'] }, { tree: TREE2, allow: ['team'] }] });
+const movePartialScoped = run(['move', '--from', projectKey(MIXED), '--to', projectKey(OTHER), '--all', '--dry-run']);
+check('「対象外」の説明に、その記録と無関係なツリーを混ぜない',
+  movePartialScoped.out.includes(TREE) && !movePartialScoped.out.includes(TREE2), movePartialScoped.out);
+
+setWorklog(RESTRICTED);
 
 console.log('\n自分の tree も解釈が一致する形か検める');
 

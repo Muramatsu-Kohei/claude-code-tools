@@ -62,7 +62,7 @@ function status(argv = []) {
 
 // 「もう片方の設定を外し忘れている」ことを伝える核。言い回しの調整で落ちないよう、
 // 判定に関わる部分だけを見る
-const WARN = /account-guard 側には対応する保護ルールがありません/;
+const WARN = /account-guard 側には今のアカウントに効く保護ルールがありません/;
 const LISTED = /作業ログの読み出し制限 \(claude-worklog\)/;
 
 setAccount('pro');
@@ -127,6 +127,15 @@ setWorklog({ restrictedTrees: [{ tree: TREE, allow: ['team'] }] });
 const guardNoDrive = status();
 check('こちらの tree にドライブ文字が無ければ突き合わせない', UNCOMPARABLE.test(guardNoDrive), guardNoDrive);
 check('その状態でも誤って「保護ルールがありません」と出さない', !WARN.test(guardNoDrive), guardNoDrive);
+
+// 検めるのは「今このアカウントを拒否しているルール」だけ。allow に今のアカウントが
+// 入っているルールは何も遮っていないので、tree の書き方が食い違っていても結論は動かない。
+// worklog 側の guardActiveRules も同じ範囲で絞っており(両 README の「逆方向は同じ食い違いを
+// 報告する」)、ここを全ルールに広げると同じ設定で報告する側としない側が生まれる
+setGuard({ rules: [{ tree: '/org-tree', allow: ['pro'] }] });
+const allowedNoDrive = status();
+check('今のアカウントを許可しているだけのルールは、tree が解釈できなくても照合を止めない',
+  WARN.test(allowedNoDrive) && !UNCOMPARABLE.test(allowedNoDrive), allowedNoDrive);
 
 // 制限の一覧そのものは出す。突き合わせられないのは食い違いの判定だけで、
 // 「worklog がどのツリーを伏せているか」は status の主題として残す

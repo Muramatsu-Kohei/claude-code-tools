@@ -2248,8 +2248,13 @@ function printWorklogRestrictions(account, guardRules) {
     }
     // 判定は前方一致なので、親ツリーを守っていれば配下も守られている(向きは
     // 「worklog の tree がこちらの tree の内側」で固定する)
+    // 「対応する保護ルールがありません」とは言わない。relevant は今のアカウントを拒否して
+    // いるルールだけなので、ここには「ルールはあるが allow に今のアカウントが入っている」
+    // 場合も落ちてくる。直上の「保護ルール:」一覧にそのルールを表示しておきながら
+    // 「ありません」と書くと、その場で矛盾して見えるうえ、真に受けて向こうのルールごと
+    // 消すと他のアカウントにまだ効いている保護まで外れる
     if (!relevant.some((g) => isInsideTree(r.tree, g.tree))) {
-      console.log('    ! account-guard 側には対応する保護ルールがありません'
+      console.log('    ! account-guard 側には今のアカウントに効く保護ルールがありません'
         + '(解除したつもりなら worklog 側の設定も外してください)');
     }
   }
