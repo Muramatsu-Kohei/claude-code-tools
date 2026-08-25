@@ -43,7 +43,11 @@ const HEAVY_FROM = 150e3;
     for await (const o of records(f)) {
       if (isNonInteractive(o)) { sdkRecords++; continue; }
       if (isDuplicate(o)) continue;
-      if (o.type !== 'assistant' || !o.message || !o.message.usage) continue;
+      // usage の有無で先に落とさない。落とすと、分割された応答のうち usage を持たない
+      // レコードにだけ isSidechain が付いている形で、収集器の「フラグの論理和」が
+      // フラグを見ないまま終わり、サブの応答がメインの帯に入る。entries() が usage を
+      // 持つものだけ返すので、ここは全部通してよい。
+      if (o.type !== 'assistant' || !o.message) continue;
       usages.add(o);
     }
     // 応答ごとに 1 回だけ帯に入れる(ファイルを読み終えてから回す)。

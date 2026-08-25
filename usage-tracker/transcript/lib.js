@@ -72,13 +72,34 @@ function transcriptFiles() {
 // 1ファイル分のレコードを順に返す。壊れた行は飛ばす(書き込み中の末尾行がありうる)。
 // ファイル単位にしているのは、呼び出し側が tool_use_id → ツール名の対応表や
 // セッション単位の集計といったファイル内に閉じた状態を持てるようにするため。
+// 走査中にファイルが消えることがある(セッションの後片付け、別の Claude Code の実行)。
+// 呼び出し前の存在確認では防げない(確認から読み出しまでに窓がある)ので、読み出し側の
+// ENOENT だけを飲んで「途中まで読めたぶん」を返し、他の例外は投げ直す。1 ファイルの消失で
+// 1500 ファイル分の走査を捨てないための扱い。集計 4 本が同じ経路を通るのでここに置く。
+// next() だけを try で囲むのは、消費側が投げた例外まで飲まないため。
 async function* records(file) {
   const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    let o;
-    try { o = JSON.parse(line); } catch { continue; }
-    yield o;
+  const it = rl[Symbol.asyncIterator]();
+  try {
+    for (;;) {
+      let r;
+      try {
+        r = await it.next();
+      } catch (e) {
+        if (!e || e.code !== 'ENOENT') throw e;
+        return;
+      }
+      if (r.done) return;
+      const line = r.value;
+      if (!line.trim()) continue;
+      let o;
+      try { o = JSON.parse(line); } catch { continue; }
+      yield o;
+    }
+  } finally {
+    // 途中で抜けたときに読み込みハンドルを残さない(手で回しているので for await の
+    // 自動クローズが効かない)。
+    rl.close();
   }
 }
 
@@ -218,7 +239,10 @@ function makeUuidDedupe() {
 //     最後のレコードだけが完成形(実測 12089 組中 10111 組が食い違い、最後が最大なのは
 //     12089 組すべて)。最初を採ると output トークンが 12.25M → 1.29M と 1/10 に落ちる。
 // そこで output_tokens が最大のレコードを採る。「最後」でなく「最大」にするのは走査順に
-// 依存しない形にしておくため(実データではどちらでも同じ結果になる)。
+// 依存しない形にしておくため(実データではどちらでも同じ結果になる)。同点のときは先に見た
+// ものを残すが、これは実害が無い: 分割された 28380 組のうち同点は 18595 組あるものの、
+// そのうち input/cache(= ctxLen)まで食い違う組は 0 件だった。つまり同点は「完全に同じ
+// レコード」でしか起きない。ここを「後勝ち」にすると走査順非依存が崩れるだけなので変えない。
 //
 // 跨ファイルの複製(--resume / fork)は uuid でレコードごと落とす対象で、こちらの仕事では
 // ない(makeUuidDedupe)。message.id を跨ファイルに広げると正当な分割まで消える。

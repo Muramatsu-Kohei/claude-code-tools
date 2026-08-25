@@ -826,6 +826,69 @@ const bdxd = run('breakdown.js', homeXD);
 check('breakdown.js: 複製されたレコードのトークンを二重に数えない',
   /^opus-5\s+main\s+1\s+0\s+1000000\s/m.test(bdxd.out), bdxd.out);
 
+// ---- 親ファイルにインラインで書かれた sidechain ----
+// 実データでは 0 件だが、層をパスだけで決めるとこの形で非対称が生まれる:
+// ツールはメインの委譲率に入り、ターンとコストはサブに付く。判定は収集器と同じ
+// 「パス または フラグ」で揃える。
+console.log('\nインラインの sidechain');
+const homeIS = sandbox('inline-sidechain');
+const isTs = t => `2026-05-01T${t}:00.000Z`;
+writeTranscript(homeIS, 'proj', 'bbbb2222-0000-0000-0000-000000000001', [
+  {
+    type: 'assistant', timestamp: isTs('00:00'), isSidechain: false,
+    message: {
+      id: 'msg_is_main', model: 'claude-opus-5',
+      usage: usage({ cache_read_input_tokens: 40e3, output_tokens: 10 }),
+      content: [{ type: 'tool_use', id: 'is1', name: 'Read', input: {} }],
+    },
+  },
+  {
+    type: 'assistant', timestamp: isTs('00:01'), isSidechain: true,
+    message: {
+      id: 'msg_is_sub', model: 'claude-opus-5',
+      usage: usage({ cache_read_input_tokens: 10e3, output_tokens: 10 }),
+      content: [{ type: 'tool_use', id: 'is2', name: 'Read', input: {} }],
+    },
+  },
+]);
+const ssis = run('sessions.js', homeIS);
+check('sessions.js: インラインの sidechain のツールを委譲率の分母に入れない',
+  /重いツール呼び出し: 1 回/.test(ssis.out), ssis.out);
+check('sessions.js: インラインの sidechain のターンは sub 側に付く',
+  /^proj\s+bbbb2222\s+1\s+1\s/m.test(ssis.out), ssis.out);
+
+// ---- 分割応答のうちフラグを持つレコードだけ usage が無い場合 ----
+// turncost.js が usage の有無で先に落としていると、収集器がフラグを見ないまま終わり、
+// サブの応答が Opus メインの帯に入って $/ターン を歪める。
+const homeNF = sandbox('flag-without-usage');
+const nfTs = t => `2026-06-01T${t}:00.000Z`;
+writeTranscript(homeNF, 'proj', 'cccc3333-0000-0000-0000-000000000001', [
+  // 同じ message.id の分割。フラグを持つ側は usage を持たない(thinking ブロックなど)。
+  { type: 'assistant', timestamp: nfTs('00:00'), isSidechain: true, message: { id: 'msg_nf', model: 'claude-opus-5' } },
+  {
+    type: 'assistant', timestamp: nfTs('00:01'),
+    message: { id: 'msg_nf', model: 'claude-opus-5', usage: usage({ cache_read_input_tokens: 310e3, output_tokens: 10 }) },
+  },
+]);
+const tcnf = run('turncost.js', homeNF);
+check('turncost.js: フラグを持つレコードに usage が無くてもサブと判定する',
+  !/^300K〜/m.test(tcnf.out), tcnf.out);
+
+// ---- 走査中に消えたファイル ----
+// セッションの後片付けや別の Claude Code の実行でファイルが消えることがある。
+// 1 ファイルの消失で全体の走査を捨てないよう、読み出しの ENOENT だけを飲む。
+// CommonJS なのでトップレベル await が使えない。records() を直接回す検証だけ非同期にして、
+// 集計の出力もその中でやる(先に出すと、この検証の結果が件数に入らない)。
+const asyncChecks = (async () => {
+  const gone = path.join(BASE, 'no-such-transcript.jsonl');
+  let goneCount = 0, goneThrew = false;
+  try {
+    for await (const _ of lib.records(gone)) goneCount++;
+  } catch (e) { goneThrew = true; }
+  check('records(): 読めないファイルは投げずに 0 件で終わる',
+    !goneThrew && goneCount === 0, `threw=${goneThrew} count=${goneCount}`);
+})();
+
 // ---- transcript が無い環境 ----
 console.log('\ntranscript が無い場合');
 const homeC = path.join(BASE, 'empty');
@@ -834,5 +897,7 @@ const miss = run('turncost.js', homeC);
 check('探した場所を示して非 0 で終わる',
   miss.code === 1 && miss.err.includes(path.join(homeC, '.claude', 'projects')), `code=${miss.code} err=${miss.err}`);
 
-console.log(`\n  ${state.pass} PASS / ${state.fail} FAIL`);
-process.exitCode = state.fail ? 1 : 0;
+asyncChecks.then(() => {
+  console.log(`\n  ${state.pass} PASS / ${state.fail} FAIL`);
+  process.exitCode = state.fail ? 1 : 0;
+});

@@ -59,8 +59,11 @@ const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch',
 
       // usage 由来の値は収集器に預け、ファイルを読み終えてから応答ごとに 1 回だけ足す。
       usages.add(o);
-      // ツール呼び出しの内訳はメインスレッド分だけ見る(サブは委譲済みなので対象外)
-      if (!isSub && Array.isArray(o.message.content)) {
+      // ツール呼び出しの内訳はメインスレッド分だけ見る(サブは委譲済みなので対象外)。
+      // 層の判定は収集器と同じ「パス または フラグ」にする。ここだけパス単位にすると、
+      // 親ファイルにインラインで書かれた sidechain の tool_use が委譲率の分母・分子に
+      // メインの作業として入る一方、ターンとコストは sub 側に付く非対称が生まれる。
+      if (!isSub && !o.isSidechain && Array.isArray(o.message.content)) {
         for (const c of o.message.content) {
           if (c.type !== 'tool_use') continue;
           if (c.name === 'Task' || c.name === 'Agent') s.task++;
