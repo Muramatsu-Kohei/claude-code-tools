@@ -1,7 +1,7 @@
 'use strict';
 // コンテキスト長そのものが1ターンの単価をどれだけ押し上げるかを測る。
 // セッションを「どこで切るべきか」の閾値を決めるのが目的。
-const { cost, ctxLen, modelKey, transcriptFiles, records, warnUnknownModels } = require('./lib');
+const { cost, ctxLen, modelKey, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels } = require('./lib');
 
 const BUCKETS = [
   [0, 30e3, '〜30K'], [30e3, 60e3, '30〜60K'], [60e3, 100e3, '60〜100K'],
@@ -20,20 +20,53 @@ const HEAVY_FROM = 150e3;
 
 (async () => {
   const b = BUCKETS.map(() => ({ n: 0, cost: 0 }));
+  // 非対話実行(claude -p / SDK)は集計から外す。判定は lib.js に集約してある。
+  const nonInteractiveFile = makeNonInteractiveFilter();
+  let sdkSessions = 0, sdkRecords = 0;
+  // --resume / fork の複製をレコードごと落とす(規則と実測は lib.js の makeUuidDedupe)。
+  // 複製が残るとターン数が水増しされ、割って出す 1 ターンあたりの単価まで狂う。
+  const isDuplicate = makeUuidDedupe();
   // Opus 系メインスレッドのみに絞る(モデル混在による単価差を排除する)
   for (const f of transcriptFiles()) {
+    const sdk = nonInteractiveFile(f);
+    if (sdk === 'session') { sdkSessions++; continue; }
+    // 親が非対話のサブエージェント。isSidechain で弾けているように見えるが、あれはレコード
+    // 単位のフラグで欠落する行があるため、ファイル単位で落としておく。
+    if (sdk) continue;
+    // メイン/サブもパスで決める(規則は lib.js の fileIdentity)。レコードの isSidechain で
+    // 弾いていた頃は、分割された応答の完成形だけにフラグが付いていると完成形が捨てられ、
+    // 残ったプレースホルダ(output_tokens: 2)が「ほぼ 0 円のメインターン」として帯に入り、
+    // 単価を押し下げうる形になっていた。層はファイル単位で決めれば取りこぼしが無い。
+    const { isSub } = fileIdentity(f);
+    // 分割された同一応答の二重計上を防ぐ(規則と実測は lib.js の makeUsageCollector を参照)。
+    const usages = makeUsageCollector(isSub);
     for await (const o of records(f)) {
-      if (o.type !== 'assistant' || o.isSidechain || !o.message || !o.message.usage) continue;
-      const model = modelKey(o.message.model);
-      if (!model.startsWith('opus')) continue;
-      const ctx = ctxLen(o.message.usage);
+      if (isNonInteractive(o)) { sdkRecords++; continue; }
+      if (isDuplicate(o)) continue;
+      // usage の有無で先に落とさない。落とすと、分割された応答のうち usage を持たない
+      // レコードにだけ isSidechain が付いている形で、収集器の「フラグの論理和」が
+      // フラグを見ないまま終わり、サブの応答がメインの帯に入る。entries() が usage を
+      // 持つものだけ返すので、ここは全部通してよい。
+      if (o.type !== 'assistant' || !o.message) continue;
+      usages.add(o);
+    }
+    // 応答ごとに 1 回だけ帯に入れる(ファイルを読み終えてから回す)。
+    for (const { usage, model, isSub: entrySub } of usages.entries()) {
+      if (entrySub) continue;   // サブエージェントは対象外(メインの単価を測っている)
+      if (!modelKey(model).startsWith('opus')) continue;
+      const ctx = ctxLen(usage);
       const i = BUCKETS.findIndex(([lo, hi]) => ctx >= lo && ctx < hi);
       if (i < 0) continue;
-      b[i].n++; b[i].cost += cost(o.message.model, o.message.usage);
+      b[i].n++; b[i].cost += cost(model, usage);
     }
   }
 
   console.log('Opus メインスレッドのターン単価(コンテキスト長別)\n');
+  if (sdkSessions || sdkRecords) {
+    const excluded = [`セッション ${sdkSessions} 本`];
+    if (sdkRecords) excluded.push(`単独レコード ${sdkRecords} 件`);
+    console.log(`(非対話実行 claude -p の${excluded.join(' / ')}は集計から除外)\n`);
+  }
   console.log(`コンテキスト長      ターン数    合計$    $/ターン  ${BASE_LABEL}比`);
   const baseIdx = BUCKETS.findIndex(([, , label]) => label === BASE_LABEL);
   const base = b[baseIdx].n ? b[baseIdx].cost / b[baseIdx].n : 0;

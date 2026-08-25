@@ -1,46 +1,69 @@
 'use strict';
 // セッション単位で「コンテキストがどこまで膨らんだか」「委譲したか自分で読んだか」を集計する。
 // 目的は運用ルール(委譲率を上げる/セッションを短く保つ)を実データで裏付けること。
-const path = require('path');
-const { cost, ctxLen, transcriptFiles, records, warnUnknownModels } = require('./lib');
+const { cost, ctxLen, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels } = require('./lib');
 
 // メインスレッドで直接使うと文脈を太らせるツール群(委譲候補)
 const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch', 'WebSearch']);
 
 (async () => {
   const files = transcriptFiles();
-  const sessions = [];
+  // セッションはファイルではなくセッション ID で束ねる。サブエージェントの transcript は
+  // 別ファイル(subagents/agent-*.jsonl)なので、ファイル = セッションにすると架空の
+  // プロジェクト "subagents" が本数に並び、しかも中身は全部サブ層なので mainTurns 0 で
+  // 落ちる ── つまり委譲ぶんのコストが総額から丸ごと消える(実測で全体の 22.2%、$911)。
+  // 親セッション ID に合流させて costSub として数える。
+  const byId = new Map();
+  // --resume / fork の複製をレコードごと落とす(規則と実測は lib.js の makeUuidDedupe)。
+  const isDuplicate = makeUuidDedupe();
+  // 非対話実行(claude -p / SDK)は「使い方」ではないので集計から外す。判定は lib.js に
+  // 集約してある(claude-window-keeper の ping が 1 セッション 1 送信でセッション数を
+  // 押し上げ、cwd 由来の架空プロジェクト C--WINDOWS-system32 としても現れる)。
+  const nonInteractiveFile = makeNonInteractiveFilter();
+  let sdkSessions = 0, sdkRecords = 0;
 
   for (const f of files) {
-    const s = {
-      project: path.basename(path.dirname(f)),
-      id: path.basename(f, '.jsonl').slice(0, 8),
-      mainTurns: 0, subTurns: 0,
-      maxCtx: 0,          // メインの総プロンプト長の最大値 = 到達したコンテキスト長
-      heavy: 0, task: 0,  // メインでの重いツール呼び出し数 / サブエージェント委譲回数
-      costMain: 0, costSub: 0,
-      start: null, end: null,
-    };
+    const sdk = nonInteractiveFile(f);
+    if (sdk === 'session') { sdkSessions++; continue; }
+    if (sdk) continue;   // 親が非対話のサブエージェント。本数には数えない(親で 1 本数えた)
+    // プロジェクト・セッションID・メイン/サブはパスで決める(規則は lib.js の fileIdentity)。
+    const { project, sid, isSub } = fileIdentity(f);
+    // 分割された同一応答の二重計上を防ぐ(規則と実測は lib.js の makeUsageCollector を参照)。
+    const usages = makeUsageCollector(isSub);
+
+    let s = byId.get(sid);
+    if (!s) {
+      s = {
+        project,
+        id: sid.slice(0, 8),
+        mainTurns: 0, subTurns: 0,
+        maxCtx: 0,          // メインの総プロンプト長の最大値 = 到達したコンテキスト長
+        heavy: 0, task: 0,  // メインでの重いツール呼び出し数 / サブエージェント委譲回数
+        costMain: 0, costSub: 0,
+        start: null, end: null,
+      };
+      byId.set(sid, s);
+    }
 
     for await (const o of records(f)) {
+      // セッション単位の判定を抜けた個別レコードの保険(対話セッションに sdk 由来の
+      // レコードが混ざる形が将来出ても、ここで落ちる)。
+      if (isNonInteractive(o)) { sdkRecords++; continue; }
+      // 継いだセッションへ複製されたレコード。期間にもツール数にも入れない。
+      if (isDuplicate(o)) continue;
       if (o.timestamp) {
         if (!s.start || o.timestamp < s.start) s.start = o.timestamp;
         if (!s.end || o.timestamp > s.end) s.end = o.timestamp;
       }
       if (o.type !== 'assistant' || !o.message) continue;
 
-      const sub = !!o.isSidechain;
-      const u = o.message.usage;
-      if (u) {
-        const c = cost(o.message.model, u);
-        if (sub) { s.subTurns++; s.costSub += c; }
-        else {
-          s.mainTurns++; s.costMain += c;
-          s.maxCtx = Math.max(s.maxCtx, ctxLen(u));
-        }
-      }
-      // ツール呼び出しの内訳はメインスレッド分だけ見る(サブは委譲済みなので対象外)
-      if (!sub && Array.isArray(o.message.content)) {
+      // usage 由来の値は収集器に預け、ファイルを読み終えてから応答ごとに 1 回だけ足す。
+      usages.add(o);
+      // ツール呼び出しの内訳はメインスレッド分だけ見る(サブは委譲済みなので対象外)。
+      // 層の判定は収集器と同じ「パス または フラグ」にする。ここだけパス単位にすると、
+      // 親ファイルにインラインで書かれた sidechain の tool_use が委譲率の分母・分子に
+      // メインの作業として入る一方、ターンとコストは sub 側に付く非対称が生まれる。
+      if (!isSub && !o.isSidechain && Array.isArray(o.message.content)) {
         for (const c of o.message.content) {
           if (c.type !== 'tool_use') continue;
           if (c.name === 'Task' || c.name === 'Agent') s.task++;
@@ -48,14 +71,40 @@ const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch',
         }
       }
     }
-    if (s.mainTurns > 0) sessions.push(s);
+    // 応答ごとに 1 回。ターン数・コスト・到達コンテキスト長はすべてここから出す。
+    // 層は収集器が返す値を使う(ファイル単位の isSub とレコードの isSidechain の論理和で、
+    // 外側の isSub と同じかそれより広い ── lib.js の makeUsageCollector を参照)。
+    for (const { usage, model, isSub: entrySub } of usages.entries()) {
+      const c = cost(model, usage);
+      if (entrySub) { s.subTurns++; s.costSub += c; }
+      else {
+        s.mainTurns++; s.costMain += c;
+        s.maxCtx = Math.max(s.maxCtx, ctxLen(usage));
+      }
+    }
   }
+
+  // メインのターンが 1 つも無いものは落とす。サブだけが残るのは親 transcript が消えている
+  // 場合(削除・ローテート)で、どのセッションの委譲だったか復元できないため。
+  const sessions = [...byId.values()].filter(s => s.mainTurns > 0);
+  const orphanCost = [...byId.values()].reduce((a, s) => a + (s.mainTurns > 0 ? 0 : s.costSub), 0);
 
   const totalCost = sessions.reduce((a, s) => a + s.costMain + s.costSub, 0);
   const totHeavy = sessions.reduce((a, s) => a + s.heavy, 0);
   const totTask = sessions.reduce((a, s) => a + s.task, 0);
 
   console.log(`セッション数: ${sessions.length}  総換算コスト: $${totalCost.toFixed(0)}`);
+  // 親が消えていて合流先が無かった委譲ぶん。黙って落とすと総額が理由なく小さく出る。
+  if (orphanCost >= 1) {
+    console.log(`(親 transcript の無いサブエージェント $${orphanCost.toFixed(0)} は集計から除外)`);
+  }
+  // 0 でなければ ping などが走っている。何本を外したかを出さないと、セッション数が
+  // 減った理由が集計の変更なのか使い方の変化なのか読み手に分からない。
+  if (sdkSessions || sdkRecords) {
+    const excluded = [`セッション ${sdkSessions} 本`];
+    if (sdkRecords) excluded.push(`単独レコード ${sdkRecords} 件`);
+    console.log(`(非対話実行 claude -p の${excluded.join(' / ')}は集計から除外)`);
+  }
   // 対象ツールを一度も使っていない集計(絞り込みすぎ/空の transcript)では率が定義できない
   const delegation = totHeavy + totTask ? (totTask / (totHeavy + totTask) * 100).toFixed(1) + '%' : '-';
   console.log(`メインでの重いツール呼び出し: ${totHeavy} 回 / サブエージェント委譲: ${totTask} 回`

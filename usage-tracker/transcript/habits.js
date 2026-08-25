@@ -7,8 +7,7 @@
 //
 // 使い方: node habits.js [--days 14] [--gap 分] [--since YYYY-MM-DD] [--json]
 const fs = require('fs');
-const path = require('path');
-const { ROOT, cost, ctxLen, transcriptFiles, records, isNonInteractive, isNonInteractiveSession, warnUnknownModels } = require('./lib');
+const { cost, ctxLen, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels } = require('./lib');
 
 // 作業時間の既定のギャップ閾値(分)。これより長い無操作は「作業していない」とみなす。
 // 5分だと 1 回の長い実行待ちで切れ、60分だと食事や仮眠を含んでしまう。
@@ -154,25 +153,11 @@ function activeMinutes(sorted, gapMin) {
   };
   const bump = (m, k, n = 1) => m.set(k, (m.get(k) || 0) + n);
 
-  // --resume / fork でセッションを継ぐと、前の会話のレコードが丸ごと次のファイルへ
-  // 複製される。複製はレコードの uuid まで同じなので(実測 30 日で 632 件。食い違うのは
-  // sessionId などの帰属メタと、書き直されている usage だけ)、レコード単位でここに落とす。
-  // message.id ではなく uuid で見る: 1 回の応答は content ブロックごとに複数レコードへ
-  // 分かれ、その全部が同じ message.id を持つので、id で落とすと正当な分割まで消える。
-  // レコードごと落とせば、ターンとコストだけでなく送信数・ツール回数・時間軸も同じ規則で
-  // 複製が外れる。assistant のターンだけ直すと、1 送信あたりの分母(送信)は水増しされた
-  // まま分子(ターン)だけが正され、継いだセッションほど値が小さく出る非対称になる。
-  // どちらのセッションに計上されるかは読み順で決まるので、セッション単位の内訳は継ぎ元に
-  // 寄る。総計を正しくすることを優先した扱い。
-  // 期間を最大(--days 3650)に取ると全 transcript 分の uuid を抱えるが、実測では
-  // 1436 本 / 19.6 万レコードで 15.5 万件・ヒープ 84MB。線形に増えるだけなので放置してよい。
-  const seenUuids = new Set();
-  // 親セッションが非対話かの判定結果(同じ親の下に子が何本もあるので覚えておく)。
-  const sdkParent = new Map();
-  const isSdkParent = (p) => {
-    if (!sdkParent.has(p)) sdkParent.set(p, fs.existsSync(p) && isNonInteractiveSession(p));
-    return sdkParent.get(p);
-  };
+  // --resume / fork で継いだセッションへ複製されたレコードを落とす(規則と実測は lib.js の
+  // makeUuidDedupe を参照)。集計 4 本で共有する。
+  const isDuplicate = makeUuidDedupe();
+  // 非対話実行のファイル単位の判定(親を見て子を落とす分も含めて lib.js に集約してある)。
+  const nonInteractiveFile = makeNonInteractiveFilter();
 
   for (const f of transcriptFiles()) {
     // 期間外のファイルは開かない。全 transcript は数百 MB あり、mtime で落とすと大幅に速い。
@@ -181,26 +166,17 @@ function activeMinutes(sorted, gapMin) {
     try { mtime = fs.statSync(f).mtimeMs; } catch { continue; }
     if (mtime < since) continue;
 
-    // サブエージェントの transcript は projects/<プロジェクト>/<親セッションID>/subagents/agent-*.jsonl
-    // に置かれる。dirname をそのままプロジェクト名にすると "subagents" という架空の
-    // プロジェクトができ、しかもサブエージェントへの指示が人間の送信として数えられてしまう。
-    // パスの第1要素を実プロジェクトとし、サブ側は親セッションに合流させて別枠で数える。
-    const parts = path.relative(ROOT, f).split(path.sep);
-    const project = parts[0];
-    const isSub = parts.includes('subagents');
-    const sid = isSub ? parts[1] : path.basename(f, '.jsonl');
+    // プロジェクト・セッションID・メイン/サブはパスから決める(規則は lib.js の
+    // fileIdentity を参照)。サブ側は親セッションに合流させ、別枠で数える。
+    const { project, sid, isSub } = fileIdentity(f);
 
     // 非対話実行(claude -p / SDK)のセッションは丸ごと外す。レコード単位の判定だけだと
     // entrypoint を持たない型(queue-operation)が残り、時間軸と架空プロジェクトに現れる。
-    // サブエージェント側の transcript には印が付かない(印は親のレコードにある)ので、
-    // 子は親を見て落とす。親だけ落として子を読むと、除外したはずの架空プロジェクトが
-    // 委譲の数え上げごと復活する。走査順は保証されないため「既に見た親」ではなく
-    // 親ファイルを直接引く。
-    if (isSub) {
-      if (isSdkParent(path.join(ROOT, project, `${sid}.jsonl`))) continue;
-    } else if (isNonInteractiveSession(f)) {
-      stat.sdkSessions++; continue;
-    }
+    // 親の巻き添えで落ちた子(= 'parent')は本数に数えない。数えると「除外したセッション」が
+    // 委譲の本数ぶん水増しされる。
+    const sdk = nonInteractiveFile(f);
+    if (sdk === 'session') { stat.sdkSessions++; continue; }
+    if (sdk) continue;
 
     // 期間内に記録のあるサブエージェントの transcript を 1 本と数える。Agent/Task の
     // tool_use だけでは、スキルやワークフローが起こしたサブエージェント(/code-review など)
@@ -208,137 +184,130 @@ function activeMinutes(sorted, gapMin) {
     // 実際のサブエージェントは 1014 本あり、subTurns はそちらを含むので、両方出さないと
     // 「1 委譲あたり 67 ターン」という実態と違う読みになる。
     let sawSubRecord = false;
-    // 同じ API 応答から分割されたレコードを二重に数えないための既出 id(ファイル内で閉じる)。
-    // 跨ファイルの複製は上の seenUuids がレコードごと落とすので、こちらは分割の除去に徹する。
-    const seenMsgIds = new Set();
+    // 同じ API 応答から分割されたレコードを二重に数えないための収集器(ファイル内で閉じる)。
+    // 跨ファイルの複製は上の isDuplicate がレコードごと落とすので、こちらは分割の除去に徹する。
+    const usages = makeUsageCollector(isSub);
 
-    try {
-      for await (const o of records(f)) {
-        const t = o.timestamp ? Date.parse(o.timestamp) : 0;
-        if (!t || t < since) continue;
-        // セッション単位の判定を抜けた個別レコードの保険(対話セッションに sdk 由来の
-        // レコードが混ざる形が将来出ても、ここで落ちる)。
-        if (isNonInteractive(o)) { stat.sdkSkipped++; continue; }
-        // 継いだセッションへ複製されたレコード(上の seenUuids のコメント参照)。
-        // 時間軸に入る前に落とすので、複製は送信・ターン・ツール・時間帯のどれにも残らない。
-        if (o.uuid != null) {
-          if (seenUuids.has(o.uuid)) continue;
-          seenUuids.add(o.uuid);
+    for await (const o of records(f)) {
+      const t = o.timestamp ? Date.parse(o.timestamp) : 0;
+      if (!t || t < since) continue;
+      // セッション単位の判定を抜けた個別レコードの保険(対話セッションに sdk 由来の
+      // レコードが混ざる形が将来出ても、ここで落ちる)。
+      if (isNonInteractive(o)) { stat.sdkSkipped++; continue; }
+      // 継いだセッションへ複製されたレコード。時間軸に入る前に落とすので、複製は
+      // 送信・ターン・ツール・時間帯のどれにも残らない。
+      if (isDuplicate(o)) continue;
+      // 読み終わりでなくレコードを見た時点で数える。走査中に消えたファイルは records() が
+      // 途中までを返して終わるので(lib.js の ENOENT の扱い)、後置きだと「ターンとコストは
+      // 入ったのに委譲 0 本」になり、そこから割る「1 委譲あたり N ターン」が実態より大きく出る。
+      if (isSub && !sawSubRecord) { sawSubRecord = true; stat.subAgentRuns++; }
+
+      // レコード 1 件ごとの層。ファイル単位の isSub とレコードの isSidechain の論理和で、
+      // 収集器(lib.js の makeUsageCollector)が返す値と同じ意味になる。上の subAgentRuns
+      // だけは「サブの transcript が何本あったか」というファイル単位の数え上げなので、
+      // ここではなく isSub を使う。
+      const recSub = isSub || !!o.isSidechain;
+
+      stat.events.push(t);
+      stat.hours[new Date(t).getHours()]++;
+      if (!stat.perProject.has(project)) stat.perProject.set(project, []);
+      stat.perProject.get(project).push(t);
+      if (stat.firstTs === null || t < stat.firstTs) stat.firstTs = t;
+      if (stat.lastTs === null || t > stat.lastTs) stat.lastTs = t;
+
+      let s = stat.sessions.get(sid);
+      if (!s) {
+        s = { project, first: t, last: t, mainTurns: 0, maxCtx: 0, cost: 0 };
+        stat.sessions.set(sid, s);
+      }
+      if (t < s.first) s.first = t;
+      if (t > s.last) s.last = t;
+
+      if (o.type === 'user' && !recSub) {
+        // isMeta はハーネスが挿入したレコードの印(スキル本文の展開、システム側の注記)。
+        // content が文字列か配列かで意味が変わるものではないので、形に依らず先に落とす。
+        // 配列側を見落としていたとき、スキル本文が人間の送信として数えられ、実データで
+        // 送信の 12.7%(最長は 93 万文字)が偽の入力として混ざっていた。
+        // スラッシュコマンドと中断の記録に isMeta は付かないので、この除外では減らない。
+        if (o.isMeta) continue;
+        const c = o.message && o.message.content;
+        // 文字列の content は人間の入力。配列の content は tool_result とハーネス挿入の
+        // text ブロックを含む。連結してから前方一致で捨てると、人間の本文が先頭にあって
+        // 後ろに通知が続くレコードで挿入分まで入力文字数に入るので、ブロック単位で落とす。
+        let text = null;
+        if (typeof c === 'string') text = c;
+        else if (Array.isArray(c)) {
+          // スラッシュコマンドのブロックは挿入の除外より先に救う。実データの
+          // コマンド記録の 59% は <command-message> で始まり、これは INJECTED_HEAD に
+          // 当たる。今は文字列 content で書かれているから助かっているだけで、配列で
+          // 書かれた瞬間にブロックごと落ちてコマンドが commands からも送信からも消える
+          // (分母だけが縮んで 1 送信あたりの値が膨らむ)。文字列側は下で
+          // <command-name> を先に見ているので、これで両方の経路の意味が揃う。
+          const t2 = c.filter(x => x.type === 'text').map(x => x.text || '')
+            .filter(s => !isInjected(s) || /<command-name>/.test(s)).join('');
+          text = t2 || null;
         }
-        // 読み終わりでなくレコードを見た時点で数える。ENOENT で途中終了したファイルは
-        // 下の catch が continue するので、後置きだと「ターンとコストは入ったのに委譲 0 本」
-        // になり、そこから割る「1 委譲あたり N ターン」が実態より大きく出る。
-        if (isSub && !sawSubRecord) { sawSubRecord = true; stat.subAgentRuns++; }
-
-        stat.events.push(t);
-        stat.hours[new Date(t).getHours()]++;
-        if (!stat.perProject.has(project)) stat.perProject.set(project, []);
-        stat.perProject.get(project).push(t);
-        if (stat.firstTs === null || t < stat.firstTs) stat.firstTs = t;
-        if (stat.lastTs === null || t > stat.lastTs) stat.lastTs = t;
-
-        let s = stat.sessions.get(sid);
-        if (!s) {
-          s = { project, first: t, last: t, mainTurns: 0, maxCtx: 0, cost: 0 };
-          stat.sessions.set(sid, s);
-        }
-        if (t < s.first) s.first = t;
-        if (t > s.last) s.last = t;
-
-        if (o.type === 'user' && !isSub) {
-          // isMeta はハーネスが挿入したレコードの印(スキル本文の展開、システム側の注記)。
-          // content が文字列か配列かで意味が変わるものではないので、形に依らず先に落とす。
-          // 配列側を見落としていたとき、スキル本文が人間の送信として数えられ、実データで
-          // 送信の 12.7%(最長は 93 万文字)が偽の入力として混ざっていた。
-          // スラッシュコマンドと中断の記録に isMeta は付かないので、この除外では減らない。
-          if (o.isMeta) continue;
-          const c = o.message && o.message.content;
-          // 文字列の content は人間の入力。配列の content は tool_result とハーネス挿入の
-          // text ブロックを含む。連結してから前方一致で捨てると、人間の本文が先頭にあって
-          // 後ろに通知が続くレコードで挿入分まで入力文字数に入るので、ブロック単位で落とす。
-          let text = null;
-          if (typeof c === 'string') text = c;
-          else if (Array.isArray(c)) {
-            // スラッシュコマンドのブロックは挿入の除外より先に救う。実データの
-            // コマンド記録の 59% は <command-message> で始まり、これは INJECTED_HEAD に
-            // 当たる。今は文字列 content で書かれているから助かっているだけで、配列で
-            // 書かれた瞬間にブロックごと落ちてコマンドが commands からも送信からも消える
-            // (分母だけが縮んで 1 送信あたりの値が膨らむ)。文字列側は下で
-            // <command-name> を先に見ているので、これで両方の経路の意味が揃う。
-            const t2 = c.filter(x => x.type === 'text').map(x => x.text || '')
-              .filter(s => !isInjected(s) || /<command-name>/.test(s)).join('');
-            text = t2 || null;
+        if (text === null) continue;
+        const cmd = text.match(/<command-name>([^<]+)<\/command-name>/);
+        if (cmd) { stat.commands++; bump(stat.cmds, cmd[1].trim()); continue; }
+        if (/\[Request interrupted/.test(text)) { stat.interrupts++; continue; }
+        if (isInjected(text)) continue;
+        stat.userMsgs++;
+        stat.userChars += text.length;
+        stat.msgLens.push(text.length);
+      } else if (o.type === 'assistant' && o.message) {
+        // サブエージェントのターンは委譲先の作業なので、メインの「1送信あたり何ターン
+        // 回したか」やツールの偏りには混ぜない。ただし時間軸には含める(委譲が走っている
+        // 間も作業時間ではある)。コストは合算しないと総額が実態より小さく出る。
+        // 分割された同一応答の二重計上を防ぐ(規則と実測は lib.js の makeUsageCollector を
+        // 参照)。ターン数も usage と同じ id 単位で数える。tool_use はレコードごとに別の
+        // ブロックなので、そちらは毎回数えてよい。
+        const firstSeen = usages.add(o);
+        if (!recSub) {
+          if (firstSeen) stat.assistantTurns++;
+          if (Array.isArray(o.message.content)) {
+            for (const x of o.message.content) {
+              if (x.type !== 'tool_use') continue;
+              stat.toolUses++;
+              bump(stat.tools, x.name);
+              if (x.name === 'Skill' && x.input && x.input.skill) bump(stat.skills, x.input.skill);
+              if ((x.name === 'Task' || x.name === 'Agent') && x.input) {
+                bump(stat.agents, x.input.subagent_type || '(default)');
+              }
+            }
           }
-          if (text === null) continue;
-          const cmd = text.match(/<command-name>([^<]+)<\/command-name>/);
-          if (cmd) { stat.commands++; bump(stat.cmds, cmd[1].trim()); continue; }
-          if (/\[Request interrupted/.test(text)) { stat.interrupts++; continue; }
-          if (isInjected(text)) continue;
-          stat.userMsgs++;
-          stat.userChars += text.length;
-          stat.msgLens.push(text.length);
-        } else if (o.type === 'assistant' && o.message) {
-          // サブエージェントのターンは委譲先の作業なので、メインの「1送信あたり何ターン
-          // 回したか」やツールの偏りには混ぜない。ただし時間軸には含める(委譲が走っている
-          // 間も作業時間ではある)。コストは合算しないと総額が実態より小さく出る。
-          // 1 回の API 応答は content ブロックごとに複数レコードへ分けて書かれ、その全部が
-          // 同じ message.id と「完全に同じ usage」を持つ(実測: 直近 3 日のメインで
-          // レコード 4899 / ユニーク id 2622、重複 1515 組はすべて usage 一致)。素朴に足すと
-          // ターン数もコストも約 1.9 倍に膨らむので、usage 由来の値は id ごとに 1 回だけ数える。
-          // tool_use はレコードごとに別のブロックなので、そちらは毎回数えてよい。
-          const mid = o.message.id;
-          const dupTurn = mid != null && seenMsgIds.has(mid);
-          if (mid != null) seenMsgIds.add(mid);
-          if (!isSub) {
-            if (!dupTurn) stat.assistantTurns++;
-            const u = dupTurn ? null : o.message.usage;
-            if (u) {
-              s.mainTurns++;
-              s.maxCtx = Math.max(s.maxCtx, ctxLen(u));
-              const c = cost(o.message.model, u);
-              s.cost += c;
-              stat.totalCost += c;
-              bump(stat.models, String(o.message.model || 'unknown'), 1);
-            }
-            if (Array.isArray(o.message.content)) {
-              for (const x of o.message.content) {
-                if (x.type !== 'tool_use') continue;
-                stat.toolUses++;
-                bump(stat.tools, x.name);
-                if (x.name === 'Skill' && x.input && x.input.skill) bump(stat.skills, x.input.skill);
-                if ((x.name === 'Task' || x.name === 'Agent') && x.input) {
-                  bump(stat.agents, x.input.subagent_type || '(default)');
-                }
-              }
-            }
-          } else {
-            // ターン数は usage の有無に依らず数える。メイン側の assistantTurns が
-            // そうなっているので、ここだけ usage 必須にすると「1 委譲あたり N ターン」が
-            // 比較相手より小さく出る(実データでは usage 無しの応答は 0 件だが、
-            // 非対称を残すと将来その型が出たときに気づけないまま歪む)。
-            if (!dupTurn) stat.subTurns++;
-            const u = dupTurn ? null : o.message.usage;
-            if (u) {
-              const c = cost(o.message.model, u);
-              s.cost += c; stat.totalCost += c; stat.subCost += c;
-              bump(stat.models, String(o.message.model || 'unknown'), 1);
-            }
-            if (Array.isArray(o.message.content)) {
-              for (const x of o.message.content) {
-                if (x.type !== 'tool_use') continue;
-                stat.subToolUses++;
-                bump(stat.subTools, x.name);
-              }
+        } else {
+          // ターン数は usage の有無に依らず数える。メイン側の assistantTurns が
+          // そうなっているので、ここだけ usage 必須にすると「1 委譲あたり N ターン」が
+          // 比較相手より小さく出る(実データでは usage 無しの応答は 0 件だが、
+          // 非対称を残すと将来その型が出たときに気づけないまま歪む)。
+          if (firstSeen) stat.subTurns++;
+          if (Array.isArray(o.message.content)) {
+            for (const x of o.message.content) {
+              if (x.type !== 'tool_use') continue;
+              stat.subToolUses++;
+              bump(stat.subTools, x.name);
             }
           }
         }
       }
-    } catch (e) {
-      // 走査中にファイルが消えることがある(セッションの後片付け、別の Claude Code の実行)。
-      // statSync は上でガードしてあるが、読み出しは records() の中で起きるのでここで受ける。
-      // 1 ファイルの消失で 1500 ファイル分の集計を捨てないための扱いで、他の例外は投げ直す。
-      if (!e || e.code !== 'ENOENT') throw e;
-      continue;
+    }
+
+    // usage 由来の値(コスト・到達コンテキスト長)は読み終えてから応答ごとに 1 回だけ足す。
+    // 層は収集器が返す値を使う。走査中の recSub と同じ「パス または フラグ」なので、
+    // ファイル内で非対称にならず、sessions.js / turncost.js とも同じ意味になる。
+    const sess = stat.sessions.get(sid);
+    for (const { usage, model, isSub: entrySub } of usages.entries()) {
+      const c = cost(model, usage);
+      stat.totalCost += c;
+      bump(stat.models, String(model || 'unknown'), 1);
+      if (entrySub) stat.subCost += c;
+      if (!sess) continue;   // 期間内のレコードが 1 件も無ければセッションは作られていない
+      sess.cost += c;
+      if (!entrySub) {
+        sess.mainTurns++;
+        sess.maxCtx = Math.max(sess.maxCtx, ctxLen(usage));
+      }
     }
   }
 

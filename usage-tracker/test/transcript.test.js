@@ -650,6 +650,286 @@ check('年をまたがない既定の期間では日別ラベルが MM/DD のま
   pns && pns.time.days.length > 0 && pns.time.days.every(d => /^\d{2}\/\d{2}$/.test(d.day)),
   pns ? JSON.stringify(pns.time.days.map(d => d.day)) : hbns.out.slice(0, 200));
 
+// ---- 3 本の集計スクリプトにも同じ規則を効かせる(issue #17) ----
+// habits.js だけが持っていた「非対話実行の除外」と「分割された同一応答の扱い」を
+// sessions / turncost / breakdown にも効かせた。判定は lib.js に集約してあるので、
+// ここでは規則そのものと、3 本が同じ結果を出すかを見る。
+console.log('\nsessions.js / turncost.js / breakdown.js の除外と重複排除');
+
+// 収集器の規則。実データではサブエージェントの transcript が「途中のレコードは
+// output_tokens: 2 のプレースホルダ、最後だけが完成形」という書かれ方をするので、
+// 最初のレコードを採ると output トークンが 1/10 に落ちる(実測 12.25M → 1.29M)。
+const col = lib.makeUsageCollector();
+const splitRec = (out, id = 'msg_a') => ({
+  type: 'assistant', isSidechain: false,
+  message: { id, model: 'claude-opus-5', usage: usage({ input_tokens: 10, output_tokens: out }) },
+});
+check('同じ message.id の応答は初回だけ true を返す(ターンを数えるのに使う)',
+  col.add(splitRec(2)) === true && col.add(splitRec(2)) === false && col.add(splitRec(999)) === false);
+const collected = [...col.entries()];
+check('採るのは output_tokens が最大のレコード(途中のプレースホルダではない)',
+  collected.length === 1 && collected[0].usage.output_tokens === 999, JSON.stringify(collected));
+col.add(splitRec(5, 'msg_b'));
+check('message.id が違えば別の応答として数える', [...col.entries()].length === 2);
+const colNoId = lib.makeUsageCollector();
+colNoId.add(assistant(usage({ output_tokens: 1 })));
+colNoId.add(assistant(usage({ output_tokens: 1 })));
+check('message.id が無いレコードはまとめない(分割か別応答か判別できない)',
+  [...colNoId.entries()].length === 2);
+
+const homeX = sandbox('exclude');
+const xTs = t => `2026-03-01T${t}:00.000Z`;
+// 1 回の応答が 3 レコードに分かれ、最後だけが完成形の usage を持つ形(実データと同じ)。
+// tool_use はレコードごとに別のブロックなので、こちらは 2 回とも数えられなければならない。
+const split = (t, out, content) => ({
+  type: 'assistant', timestamp: xTs(t), isSidechain: false,
+  message: {
+    id: 'msg_split_1', model: 'claude-opus-5',
+    usage: usage({ cache_read_input_tokens: 40e3, output_tokens: out }),
+    content,
+  },
+});
+writeTranscript(homeX, 'proj', 'dddddddd-0000-0000-0000-000000000001', [
+  { type: 'user', timestamp: xTs('00:00'), message: { content: '調べて' } },
+  split('00:01', 2, [{ type: 'thinking', thinking: '考える' }]),
+  split('00:02', 2, [{ type: 'tool_use', id: 'x1', name: 'Read', input: {} }]),
+  split('00:03', 1000, [{ type: 'tool_use', id: 'x2', name: 'Grep', input: {} }]),
+]);
+// 非対話実行(claude -p の ping)のセッションと、その下のサブエージェント。子には印が
+// 付かないので親を見て落とす。子は isSidechain も落ちている形にしてあり、フラグ頼みの
+// 除外では素通りする(turncost.js の 300K〜 帯に現れる)。
+const SDK_SID = 'eeeeeeee-0000-0000-0000-000000000001';
+writeTranscript(homeX, 'C--WINDOWS-system32', SDK_SID, [
+  { type: 'user', timestamp: xTs('02:00'), entrypoint: 'sdk-cli', message: { content: 'Reply with only the word: ok' } },
+  {
+    type: 'assistant', timestamp: xTs('02:01'), entrypoint: 'sdk-cli', isSidechain: false,
+    message: { id: 'msg_ping', model: 'claude-opus-5', usage: usage({ cache_read_input_tokens: 250e3, output_tokens: 5 }) },
+  },
+]);
+writeTranscript(homeX, path.join('C--WINDOWS-system32', SDK_SID, 'subagents'), 'agent-x', [
+  {
+    type: 'assistant', timestamp: xTs('02:02'), isSidechain: false,
+    message: { id: 'msg_ping_sub', model: 'claude-opus-5', usage: usage({ cache_read_input_tokens: 310e3, output_tokens: 7 }) },
+  },
+]);
+
+const ssx = run('sessions.js', homeX);
+check('sessions.js: 非対話実行のセッションを数えない', /^セッション数: 1 /m.test(ssx.out), ssx.out);
+check('sessions.js: 何本外したかを出力に添える',
+  /非対話実行 claude -p のセッション 1 本/.test(ssx.out), ssx.out);
+check('sessions.js: 分割された応答は 1 ターン、ツールは 2 回',
+  /^proj\s+dddddddd\s+1\s+0\s+40K\s+2\s+0\s/m.test(ssx.out), ssx.out);
+
+const tcx = run('turncost.js', homeX);
+check('turncost.js: 分割された応答は 1 ターン、単価は完成形の usage で出す',
+  /^30〜60K\s+1\s+\$0\s+\$0\.0450/m.test(tcx.out), tcx.out);
+check('turncost.js: 非対話実行のターンが帯に現れない(親も子も)',
+  !/^200〜300K/m.test(tcx.out) && !/^300K〜/m.test(tcx.out), tcx.out);
+
+const bdx = run('breakdown.js', homeX);
+check('breakdown.js: 分割された応答の output を二重にも過小にも数えない',
+  /^opus-5\s+main\s+1\s+1000\s/m.test(bdx.out), bdx.out);
+check('breakdown.js: 非対話実行のファイルを本数からも外す',
+  /^ファイル数: 1$/m.test(bdx.out), bdx.out);
+
+// ---- パスで決まる帰属(fileIdentity) ----
+// 層をレコードの isSidechain でなくパスで決める規則。ここが崩れると、サブエージェントの
+// transcript が架空プロジェクト "subagents" のセッションとして現れる/メイン層に混ざる。
+const idSub = lib.fileIdentity(path.join(lib.ROOT, 'proj', 'sid-1', 'subagents', 'agent-7.jsonl'));
+check('fileIdentity: サブは実プロジェクトと親セッションIDに合流する',
+  idSub.project === 'proj' && idSub.sid === 'sid-1' && idSub.isSub === true,
+  JSON.stringify(idSub));
+check('fileIdentity: サブの親ファイルパスを返す',
+  idSub.parentFile === path.join(lib.ROOT, 'proj', 'sid-1.jsonl'), String(idSub.parentFile));
+const idMain = lib.fileIdentity(path.join(lib.ROOT, 'proj', 'sid-2.jsonl'));
+check('fileIdentity: メインはファイル名がセッションID、親は無い',
+  idMain.project === 'proj' && idMain.sid === 'sid-2' && idMain.isSub === false && idMain.parentFile === null,
+  JSON.stringify(idMain));
+
+// ---- サブエージェントの層はフラグでなくパスで決まる(集計 3 本) ----
+// 実測ではサブ側 1048 ファイルの assistant レコードすべてに isSidechain が付いているが、
+// フラグはレコード単位なので欠落しうる。フラグを **付けない** サブの transcript を置いて、
+// パスだけで層が決まることを確かめる。合わせて、サブのコストが親セッションに合流すること
+// (合流させないと mainTurns 0 で落ち、委譲ぶんが総額から丸ごと消える)も見る。
+console.log('\nサブエージェントの層はパスで決まる');
+const homeLP = sandbox('layer-by-path');
+const LPSID = 'ffffffff-1111-0000-0000-000000000001';
+const yTs = t => `2026-03-01T${t}:00.000Z`;
+writeTranscript(homeLP, 'proj', LPSID, [
+  { type: 'user', timestamp: yTs('00:00'), uuid: 'y-u1', message: { content: '調べて' } },
+  {
+    type: 'assistant', timestamp: yTs('00:01'), uuid: 'y-a1', isSidechain: false,
+    message: {
+      id: 'msg_y_main', model: 'claude-opus-5',
+      usage: usage({ cache_read_input_tokens: 40e3, output_tokens: 10 }),
+      content: [{ type: 'tool_use', id: 'y1', name: 'Task', input: {} }],
+    },
+  },
+]);
+// isSidechain を付けない。パスで落ちなければ「メインの 300K 超のターン」として現れる。
+writeTranscript(homeLP, path.join('proj', LPSID, 'subagents'), 'agent-y1', [
+  {
+    type: 'assistant', timestamp: yTs('00:02'), uuid: 'y-a2',
+    message: {
+      id: 'msg_y_sub', model: 'claude-opus-5',
+      usage: usage({ input_tokens: 1e6, output_tokens: 100 }),
+    },
+  },
+]);
+
+const sslp = run('sessions.js', homeLP);
+check('sessions.js: サブの transcript を架空プロジェクトのセッションにしない',
+  /^セッション数: 1 /m.test(sslp.out) && !/subagents/.test(sslp.out), sslp.out);
+check('sessions.js: サブのコストとターンが親セッションに合流する($5 を落とさない)',
+  /総換算コスト: \$5$/m.test(sslp.out) && /^proj\s+ffffffff\s+1\s+1\s+40K\s+0\s+1\s/m.test(sslp.out), sslp.out);
+
+const tclp = run('turncost.js', homeLP);
+check('turncost.js: フラグの無いサブのターンが帯に現れない',
+  /^30〜60K\s+1\s/m.test(tclp.out) && !/^300K〜/m.test(tclp.out), tclp.out);
+
+const bdlp = run('breakdown.js', homeLP);
+check('breakdown.js: フラグが無くてもパスで subagent 層に入る',
+  /^opus-5\s+subagent\s+1\s+100\s/m.test(bdlp.out) && /^opus-5\s+main\s+1\s+10\s/m.test(bdlp.out), bdlp.out);
+
+// ---- 跨ファイルの複製を集計 3 本でも落とす ----
+// --resume / fork は前の会話をそのまま次のファイルへ複製し、uuid まで一致する。
+// 落とさないとセッションもターンもトークンも二重に数える(実測 30 日で 632 レコード)。
+console.log('\n跨ファイルの複製(--resume / fork)');
+const homeXD = sandbox('crossfile-dup-3');
+const zTs = t => `2026-04-01T${t}:00.000Z`;
+const zRecs = [
+  { type: 'user', timestamp: zTs('00:00'), uuid: 'z-u1', message: { content: '送信' } },
+  {
+    type: 'assistant', timestamp: zTs('00:01'), uuid: 'z-a1', isSidechain: false,
+    message: {
+      id: 'msg_z', model: 'claude-opus-5',
+      usage: usage({ input_tokens: 1e6, output_tokens: 0 }),
+      content: [{ type: 'tool_use', id: 'z1', name: 'Read', input: {} }],
+    },
+  },
+];
+writeTranscript(homeXD, 'proj', 'aaaa1111-0000-0000-0000-000000000001', zRecs);
+// 継いだ先。レコードは完全な複製(帰属メタだけが違い、uuid は書き換わらない)。
+writeTranscript(homeXD, 'proj', 'aaaa1111-0000-0000-0000-000000000002', zRecs);
+
+const ssxd = run('sessions.js', homeXD);
+check('sessions.js: 複製されたセッションを 2 本に数えない',
+  /^セッション数: 1  総換算コスト: \$5$/m.test(ssxd.out), ssxd.out);
+check('sessions.js: 複製されたツール呼び出しを二重に数えない',
+  /重いツール呼び出し: 1 回/.test(ssxd.out), ssxd.out);
+
+const tcxd = run('turncost.js', homeXD);
+check('turncost.js: 複製されたターンを帯に二重に入れない',
+  /^300K〜\s+1\s+\$5\s/m.test(tcxd.out), tcxd.out);
+
+const bdxd = run('breakdown.js', homeXD);
+check('breakdown.js: 複製されたレコードのトークンを二重に数えない',
+  /^opus-5\s+main\s+1\s+0\s+1000000\s/m.test(bdxd.out), bdxd.out);
+
+// ---- 親ファイルにインラインで書かれた sidechain ----
+// 実データでは 0 件だが、層をパスだけで決めるとこの形で非対称が生まれる:
+// ツールはメインの委譲率に入り、ターンとコストはサブに付く。判定は収集器と同じ
+// 「パス または フラグ」で揃える。
+console.log('\nインラインの sidechain');
+const homeIS = sandbox('inline-sidechain');
+const isTs = t => `2026-05-01T${t}:00.000Z`;
+writeTranscript(homeIS, 'proj', 'bbbb2222-0000-0000-0000-000000000001', [
+  {
+    type: 'assistant', timestamp: isTs('00:00'), isSidechain: false,
+    message: {
+      id: 'msg_is_main', model: 'claude-opus-5',
+      usage: usage({ cache_read_input_tokens: 40e3, output_tokens: 10 }),
+      content: [{ type: 'tool_use', id: 'is1', name: 'Read', input: {} }],
+    },
+  },
+  {
+    type: 'assistant', timestamp: isTs('00:01'), isSidechain: true,
+    message: {
+      id: 'msg_is_sub', model: 'claude-opus-5',
+      usage: usage({ cache_read_input_tokens: 10e3, output_tokens: 10 }),
+      content: [{ type: 'tool_use', id: 'is2', name: 'Read', input: {} }],
+    },
+  },
+]);
+const ssis = run('sessions.js', homeIS);
+check('sessions.js: インラインの sidechain のツールを委譲率の分母に入れない',
+  /重いツール呼び出し: 1 回/.test(ssis.out), ssis.out);
+check('sessions.js: インラインの sidechain のターンは sub 側に付く',
+  /^proj\s+bbbb2222\s+1\s+1\s/m.test(ssis.out), ssis.out);
+
+// ---- 分割応答のうちフラグを持つレコードだけ usage が無い場合 ----
+// turncost.js が usage の有無で先に落としていると、収集器がフラグを見ないまま終わり、
+// サブの応答が Opus メインの帯に入って $/ターン を歪める。
+const homeNF = sandbox('flag-without-usage');
+const nfTs = t => `2026-06-01T${t}:00.000Z`;
+writeTranscript(homeNF, 'proj', 'cccc3333-0000-0000-0000-000000000001', [
+  // 同じ message.id の分割。フラグを持つ側は usage を持たない(thinking ブロックなど)。
+  { type: 'assistant', timestamp: nfTs('00:00'), isSidechain: true, message: { id: 'msg_nf', model: 'claude-opus-5' } },
+  {
+    type: 'assistant', timestamp: nfTs('00:01'),
+    message: { id: 'msg_nf', model: 'claude-opus-5', usage: usage({ cache_read_input_tokens: 310e3, output_tokens: 10 }) },
+  },
+]);
+const tcnf = run('turncost.js', homeNF);
+check('turncost.js: フラグを持つレコードに usage が無くてもサブと判定する',
+  !/^300K〜/m.test(tcnf.out), tcnf.out);
+
+// habits.js も同じ扱いに揃える。ここだけパス単位の isSub でコストを付けていると、
+// 同じ応答を sessions.js は sub、habits.js は main と数え、maxCtx の帯まで食い違う。
+const hbis = run('habits.js', homeIS, ['--since', '2026-01-01', '--json']);
+let pis = null;
+try { pis = JSON.parse(hbis.out); } catch (e) { pis = null; }
+check('habits.js: インラインの sidechain のコストを subCost に付ける',
+  pis && pis.delegation.subCost > 0 && pis.delegation.subTurns === 1,
+  pis ? JSON.stringify(pis.delegation).slice(0, 160) : hbis.out.slice(0, 200));
+// このサンドボックスには user レコードが無いので sends は 0 に潰れ、turnsPerMsg の分母は
+// 1 になる。つまりこの値がそのままメインの assistantTurns。
+check('habits.js: インラインの sidechain をメインのターンに数えない',
+  pis && pis.input.turnsPerMsg === 1,
+  pis ? JSON.stringify(pis.input).slice(0, 160) : hbis.out.slice(0, 200));
+
+// ---- --resume した先の tool_result がツール名を引けるか ----
+// 継いだファイルでは、複製された tool_use は uuid が一致して重複排除で落ちる一方、
+// 続きとして新しく書かれた tool_result は別の uuid を持つので残る。id → ツール名の
+// 対応表を複製から作らないと、その文字数が unknown に落ちる。
+console.log('\n--resume 後の tool_result');
+const homeTR = sandbox('resume-toolname');
+const trTs = t => `2026-07-01T${t}:00.000Z`;
+const trUse = {
+  type: 'assistant', timestamp: trTs('00:00'), uuid: 'tr-a1',
+  message: {
+    id: 'msg_tr', model: 'claude-opus-5', usage: usage({ input_tokens: 10, output_tokens: 10 }),
+    content: [{ type: 'tool_use', id: 'tr1', name: 'Grep', input: {} }],
+  },
+};
+writeTranscript(homeTR, 'proj', 'dddd4444-0000-0000-0000-000000000001', [
+  trUse,
+  { type: 'user', timestamp: trTs('00:01'), uuid: 'tr-u1', message: { content: [{ type: 'tool_result', tool_use_id: 'tr1', content: 'x'.repeat(2000) }] } },
+]);
+// 継いだ先: tool_use は複製(uuid 同じ)、tool_result は続きなので新しい uuid。
+writeTranscript(homeTR, 'proj', 'dddd4444-0000-0000-0000-000000000002', [
+  trUse,
+  { type: 'user', timestamp: trTs('01:01'), uuid: 'tr-u2', message: { content: [{ type: 'tool_result', tool_use_id: 'tr1', content: 'y'.repeat(3000) }] } },
+]);
+const bdtr = run('breakdown.js', homeTR);
+check('breakdown.js: 継いだ先の tool_result もツール名で数える(unknown に落ちない)',
+  /^Grep\s+5 K chars/m.test(bdtr.out) && !/^unknown\s/m.test(bdtr.out), bdtr.out);
+
+// ---- 走査中に消えたファイル ----
+// セッションの後片付けや別の Claude Code の実行でファイルが消えることがある。
+// 1 ファイルの消失で全体の走査を捨てないよう、読み出しの ENOENT だけを飲む。
+// CommonJS なのでトップレベル await が使えない。records() を直接回す検証だけ非同期にして、
+// 集計の出力もその中でやる(先に出すと、この検証の結果が件数に入らない)。
+const asyncChecks = (async () => {
+  const gone = path.join(BASE, 'no-such-transcript.jsonl');
+  let goneCount = 0, goneThrew = false;
+  try {
+    for await (const _ of lib.records(gone)) goneCount++;
+  } catch (e) { goneThrew = true; }
+  check('records(): 読めないファイルは投げずに 0 件で終わる',
+    !goneThrew && goneCount === 0, `threw=${goneThrew} count=${goneCount}`);
+})();
+
 // ---- transcript が無い環境 ----
 console.log('\ntranscript が無い場合');
 const homeC = path.join(BASE, 'empty');
@@ -658,5 +938,7 @@ const miss = run('turncost.js', homeC);
 check('探した場所を示して非 0 で終わる',
   miss.code === 1 && miss.err.includes(path.join(homeC, '.claude', 'projects')), `code=${miss.code} err=${miss.err}`);
 
-console.log(`\n  ${state.pass} PASS / ${state.fail} FAIL`);
-process.exitCode = state.fail ? 1 : 0;
+asyncChecks.then(() => {
+  console.log(`\n  ${state.pass} PASS / ${state.fail} FAIL`);
+  process.exitCode = state.fail ? 1 : 0;
+});
