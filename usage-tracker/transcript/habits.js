@@ -18,18 +18,42 @@ const GAP_SWEEP = [5, 10, 15, 20, 30];
 // 単発イベントだけの区間は長さ 0 になるが、実際には数分は使っている。最低これだけ割り当てる。
 const MIN_BLOCK_MIN = 2;
 
+const USAGE = 'node habits.js [--days N] [--since YYYY-MM-DD] [--gap 分] [--json]';
+
+function die(msg) {
+  console.error(`${msg}\n${USAGE}`);
+  process.exit(2);
+}
+
+// 数値引数を検証して返す。Number() の結果を素通しすると、値の欠落や打ち間違いが NaN として
+// 下流に流れ、比較が常に false になって「全期間を読む」「全イベントが 1 ブロックに繋がって
+// 作業時間が実時間になる」といった、エラーにならない誤集計になる。入口で止める。
+function numArg(v, name, min) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < min) die(`${name} には ${min} 以上の数値を指定してください(受け取った値: ${v === undefined ? '(なし)' : v})`);
+  return n;
+}
+
 function parseArgs(argv) {
   const o = { days: 14, json: false, since: null, gap: GAP_DEFAULT };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') o.json = true;
-    else if (a === '--days') o.days = Number(argv[++i]);
+    else if (a === '--days') o.days = numArg(argv[++i], '--days', 1);
     else if (a === '--since') o.since = argv[++i];
-    else if (a === '--gap') o.gap = Number(argv[++i]);
+    else if (a === '--gap') o.gap = numArg(argv[++i], '--gap', 1);
     else if (a === '--help' || a === '-h') {
-      console.log('node habits.js [--days N] [--since YYYY-MM-DD] [--gap 分] [--json]');
+      console.log(USAGE);
       process.exit(0);
-    }
+    } else die(`不明な引数: ${a}`);
+  }
+  if (o.since !== null) {
+    // 形式と実在の両方を見る。'2026-8-1' のような不揃いな表記や '2026-02-30' は
+    // Date.parse が NaN や別の日に倒すので、後段の toISOString() まで壊れが伝わる。
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(o.since))) die(`--since は YYYY-MM-DD で指定してください(受け取った値: ${o.since === undefined ? '(なし)' : o.since})`);
+    const t = new Date(o.since + 'T00:00:00').getTime();
+    if (!Number.isFinite(t)) die(`--since に存在しない日付が指定されています: ${o.since}`);
+    if (t > Date.now()) die(`--since が未来の日付です: ${o.since}`);
   }
   return o;
 }
@@ -185,10 +209,21 @@ function activeMinutes(sorted, gapMin) {
 
   // --- 集計 ---
   const days = [];
-  const nDays = Math.round((startOfDay(stat.lastTs) - startOfDay(since)) / 86400000) + 1;
+  // 期間は「since から今日まで」で固定する。最後のイベントで打ち切ると、末尾の無操作日だけが
+  // 落ちて先頭の無操作日は残る非対称になり、同じ作業量でも窓のどこに寄っているかで
+  // perDay が倍近く変わる(--days 30 で最初の週だけ働いた場合と最後の週だけの場合)。
+  const nDays = Math.round((startOfDay(now) - startOfDay(since)) / 86400000) + 1;
+  // stat.events は昇順なので、日ごとに filter せず索引を進めて 1 パスで切る
+  // (--since を古く取ると日数×イベント数の全走査になり、これが支配的になる)。
+  let ei = 0;
   for (let i = 0; i < nDays; i++) {
     const d0 = startOfDay(since) + i * 86400000;
-    const seg = stat.events.filter(t => t >= d0 && t < d0 + 86400000);
+    const d1 = d0 + 86400000;
+    const seg = [];
+    while (ei < stat.events.length && stat.events[ei] < d1) {
+      if (stat.events[ei] >= d0) seg.push(stat.events[ei]);
+      ei++;
+    }
     // 日をまたぐ作業は日付境界で切る。前日の最後のイベントとの間隔は繰り越さない
     // (繰り越すと徹夜が翌日の 0 時台に数時間まとめて計上され、実態とずれる)。
     const a = activeMinutes(seg, opt.gap);
@@ -237,6 +272,8 @@ function activeMinutes(sorted, gapMin) {
 
   const top = (m, n = 30) => [...m].sort((a, b) => b[1] - a[1]).slice(0, n).map(([k, v]) => ({ name: k, count: v }));
   const agentTotal = [...stat.agents.values()].reduce((a, c) => a + c, 0);
+  // 人間が Enter を押した回数。文章もスラッシュコマンドも 1 送信として同じに数える。
+  const sends = stat.userMsgs + stat.commands;
 
   const result = {
     period: {
@@ -256,16 +293,20 @@ function activeMinutes(sorted, gapMin) {
     },
     projects, projectSum, concurrency: projectSum / totalHours,
     input: {
-      userMsgs: stat.userMsgs, commands: stat.commands, interrupts: stat.interrupts,
+      sends, userMsgs: stat.userMsgs, commands: stat.commands, interrupts: stat.interrupts,
+      // 文字数は「打った文章」の話なので、本文を持たないスラッシュコマンドは分母に入れない。
       medianChars: med(stat.msgLens), meanChars: stat.userChars / Math.max(1, stat.userMsgs),
       maxChars: Math.max(...stat.msgLens, 0),
-      toolsPerMsg: stat.toolUses / Math.max(1, stat.userMsgs),
-      turnsPerMsg: stat.assistantTurns / Math.max(1, stat.userMsgs),
+      // 「1送信あたり」の分子はスラッシュコマンドが起こしたターン・ツールも含むので、
+      // 分母もコマンドを数える。文章だけを分母にすると、コマンドの比率のぶん過大に出る
+      // (実データで 22% 上振れした)。
+      toolsPerMsg: stat.toolUses / Math.max(1, sends),
+      turnsPerMsg: stat.assistantTurns / Math.max(1, sends),
     },
     tools: { total: stat.toolUses, top: top(stat.tools) },
     delegation: {
       total: agentTotal, byType: top(stat.agents),
-      ratioOfMsgs: agentTotal / Math.max(1, stat.userMsgs),
+      ratioOfMsgs: agentTotal / Math.max(1, sends),
       subTurns: stat.subTurns, subToolUses: stat.subToolUses, subCost: stat.subCost,
       subTools: top(stat.subTools, 10),
       // 委譲したツール実行が全体の何割か。メインの文脈を太らせずに済んだ分の目安。
@@ -295,8 +336,11 @@ function activeMinutes(sorted, gapMin) {
   const hhmm = t => t === null ? '--:--' : new Date(t).toTimeString().slice(0, 5);
   const f1 = n => n.toFixed(1);
 
-  console.log(`期間: ${new Date(stat.firstTs).toLocaleString('ja-JP')} 〜 ${new Date(stat.lastTs).toLocaleString('ja-JP')}`
+  // 集計の窓(since〜今日)と、その中で実際に記録があった範囲は別物。perDay は前者で割るので、
+  // 「14日と出ているのに記録は 9 日ぶんしかない」ことが読み手に分かるよう両方を出す。
+  console.log(`期間: ${new Date(since).toLocaleDateString('ja-JP')} 〜 ${new Date(now).toLocaleDateString('ja-JP')}`
     + `  (${nDays}日, ギャップ ${opt.gap} 分で区切り)`);
+  console.log(`記録: ${new Date(stat.firstTs).toLocaleString('ja-JP')} 〜 ${new Date(stat.lastTs).toLocaleString('ja-JP')}`);
   console.log(`作業時間 ${f1(totalHours)}h  稼働日 ${result.period.activeDays}/${nDays}日  `
     + `1稼働日あたり ${f1(result.time.perActiveDay)}h  換算コスト $${stat.totalCost.toFixed(0)}`);
 
@@ -334,8 +378,8 @@ function activeMinutes(sorted, gapMin) {
   console.log(`プロジェクト別の合計 ${f1(projectSum)}h / 実時間 ${f1(totalHours)}h = 並行度 ${result.concurrency.toFixed(2)}`);
 
   console.log('\n--- 入力の癖 ---');
-  console.log(`送信 ${stat.userMsgs} 回  スラッシュコマンド ${stat.commands} 回  中断 ${stat.interrupts} 回`
-    + ` (送信の ${(stat.interrupts / Math.max(1, stat.userMsgs) * 100).toFixed(1)}%)`);
+  console.log(`送信 ${sends} 回(文章 ${stat.userMsgs} / スラッシュコマンド ${stat.commands})  中断 ${stat.interrupts} 回`
+    + ` (送信の ${(stat.interrupts / Math.max(1, sends) * 100).toFixed(1)}%)`);
   console.log(`1メッセージ 中央値 ${result.input.medianChars} 文字 / 平均 ${result.input.meanChars.toFixed(0)} 文字 / 最長 ${result.input.maxChars} 文字`);
   console.log(`1送信あたり ツール ${result.input.toolsPerMsg.toFixed(1)} 回 / 応答 ${result.input.turnsPerMsg.toFixed(1)} ターン`);
 

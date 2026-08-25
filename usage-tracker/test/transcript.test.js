@@ -196,6 +196,60 @@ check('--json が機械可読な集計を返す',
   parsed && parsed.input.userMsgs === 2 && parsed.delegation.subToolUses === 2,
   parsed ? JSON.stringify(parsed.input) : hbj.out.slice(0, 200));
 
+// ---- 数値引数の検証 ----
+// Number() を素通しすると NaN が下流の比較を常に false にし、エラーにならないまま
+// 誤った集計が出る(--gap x で全イベントが 1 ブロックに繋がり、作業時間が実時間になった)。
+const badGap = run('habits.js', homeH, ['--since', '2026-01-01', '--gap', 'x']);
+check('不正な --gap は集計せず非 0 で終わる',
+  badGap.code === 2 && !/作業時間/.test(badGap.out), `code=${badGap.code} out=${badGap.out.slice(0, 120)}`);
+const noVal = run('habits.js', homeH, ['--days']);
+check('値の無い --days を弾く', noVal.code === 2, `code=${noVal.code} err=${noVal.err.slice(0, 120)}`);
+const badSince = run('habits.js', homeH, ['--since', '2026-1-1']);
+check('形式の崩れた --since を弾く', badSince.code === 2, `code=${badSince.code} err=${badSince.err.slice(0, 120)}`);
+
+// ---- スラッシュコマンドも 1 送信として数える ----
+// 分子(ターン・ツール)はコマンドが起こした分を含むので、分母から外すとコマンドの
+// 比率のぶん「1送信あたり」が過大に出る。
+const homeS = sandbox('habits-sends');
+writeTranscript(homeS, 'proj', 'cccccccc-0000-0000-0000-000000000004', [
+  uTurn('00:00', 'ふつうの送信'),
+  aTurn('00:01', [{ type: 'tool_use', id: 'c1', name: 'Bash', input: {} }]),
+  uTurn('00:05', '<command-name>/wrap</command-name>'),
+  aTurn('00:06', [{ type: 'tool_use', id: 'c2', name: 'Read', input: {} }]),
+]);
+const hbs = run('habits.js', homeS, ['--since', '2026-01-01', '--json']);
+let ps = null;
+try { ps = JSON.parse(hbs.out); } catch (e) { ps = null; }
+check('スラッシュコマンドも 1 送信として分母に数える',
+  ps && ps.input.sends === 2 && ps.input.userMsgs === 1 && ps.input.commands === 1
+    && Math.abs(ps.input.turnsPerMsg - 1) < 1e-9 && Math.abs(ps.input.toolsPerMsg - 1) < 1e-9,
+  ps ? JSON.stringify(ps.input) : hbs.out.slice(0, 200));
+
+// ---- 期間は since から今日まで ----
+// 最後のイベントで打ち切ると末尾の無操作日だけが落ちる非対称になり、同じ作業量でも
+// 窓のどこに寄っているかで perDay が倍近く変わる。
+const homeD = sandbox('habits-days');
+const ago = (d, min = 0) => new Date(Date.now() - d * 86400000 + min * 60000).toISOString();
+writeTranscript(homeD, 'proj', 'cccccccc-0000-0000-0000-000000000005', [
+  { type: 'user', timestamp: ago(3), message: { content: '3日前の作業' } },
+  {
+    type: 'assistant', timestamp: ago(3, 10), isSidechain: false,
+    message: {
+      model: 'claude-opus-5', usage: usage({ input_tokens: 10, output_tokens: 5 }),
+      content: [{ type: 'tool_use', id: 'd1', name: 'Bash', input: {} }],
+    },
+  },
+]);
+const hbd = run('habits.js', homeD, ['--days', '7', '--json']);
+let pd = null;
+try { pd = JSON.parse(hbd.out); } catch (e) { pd = null; }
+check('--days N の期間は末尾の無操作日を落とさない',
+  pd && pd.period.days === 7 && pd.time.days.length === 7,
+  pd ? JSON.stringify(pd.period) : hbd.out.slice(0, 200) + hbd.err.slice(0, 200));
+check('日別の合計イベント数が全体と一致する',
+  pd && pd.time.days.reduce((a, d) => a + d.events, 0) === 2,
+  pd ? JSON.stringify(pd.time.days.map(d => d.events)) : '');
+
 // ---- transcript が無い環境 ----
 console.log('\ntranscript が無い場合');
 const homeC = path.join(BASE, 'empty');
