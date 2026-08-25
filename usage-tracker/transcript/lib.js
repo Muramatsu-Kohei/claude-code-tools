@@ -85,11 +85,30 @@ async function* records(file) {
 // 非対話実行(claude -p / SDK 経由)のレコードか。ここに集約しているのは、同じ判定を
 // 各スクリプトで新設すると片方だけ直る形になるため(claude-window-keeper の ping は
 // 実データ 90 日で「送信」の 6.2% を占め、cwd が system32 なので架空のプロジェクトも作る)。
-// entrypoint は user だけでなく assistant にも付くので、入口で 1 回落とせば
-// 送信・ターン・コスト・時間軸のすべてから一貫して外れる。
+// entrypoint は user と assistant の両方に付く。ただし queue-operation のように印を
+// 持たない型が同じセッションに混ざるので、これ単体では取りこぼす(実測 18 件が残り、
+// 時間軸と架空プロジェクトに現れた)。下の isNonInteractiveSession() と併せて使う。
 // 現時点で使っているのは habits.js のみ。sessions.js / turncost.js / breakdown.js は
 // まだ ping を含んだまま数えている(sessions.js のセッション数はそのぶん多い)。
 const isNonInteractive = o => !!o && o.entrypoint === 'sdk-cli';
+
+// ファイルごと非対話実行のセッションか。レコード単位の判定だけでは足りない:
+// ping の transcript には entrypoint を持たない型(queue-operation など)が混ざり、
+// それらは timestamp を持つので時間軸と架空プロジェクトに残ってしまう(実測 18 件)。
+// 非対話セッションは短く印は先頭に出るので、頭だけ読んで判定する(全読みは数百 MB になる)。
+function isNonInteractiveSession(file, bytes = 65536) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(bytes);
+    const n = fs.readSync(fd, buf, 0, bytes, 0);
+    return /"entrypoint"\s*:\s*"sdk-cli"/.test(buf.toString('utf8', 0, n));
+  } catch {
+    return false;   // 読めないファイルはここで判定せず、本処理側の例外処理に任せる
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* 既に閉じている */ }
+  }
+}
 
 function warnUnknownModels() {
   if (!unknownModels.size) return;
@@ -97,4 +116,4 @@ function warnUnknownModels() {
   console.error(`\n警告: pricing.js に単価が無いモデルを $0 として集計した: ${list}`);
 }
 
-module.exports = { PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records, isNonInteractive, warnUnknownModels };
+module.exports = { PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records, isNonInteractive, isNonInteractiveSession, warnUnknownModels };

@@ -8,7 +8,7 @@
 // 使い方: node habits.js [--days 14] [--gap 分] [--since YYYY-MM-DD] [--json]
 const fs = require('fs');
 const path = require('path');
-const { ROOT, cost, ctxLen, transcriptFiles, records, isNonInteractive, warnUnknownModels } = require('./lib');
+const { ROOT, cost, ctxLen, transcriptFiles, records, isNonInteractive, isNonInteractiveSession, warnUnknownModels } = require('./lib');
 
 // 作業時間の既定のギャップ閾値(分)。これより長い無操作は「作業していない」とみなす。
 // 5分だと 1 回の長い実行待ちで切れ、60分だと食事や仮眠を含んでしまう。
@@ -133,7 +133,7 @@ function activeMinutes(sorted, gapMin) {
     sessions: new Map(),           // sid -> {project, first, last, mainTurns, maxCtx, cost}
     perProject: new Map(),         // project -> 時刻配列
     hours: new Array(24).fill(0),
-    userMsgs: 0, userChars: 0, msgLens: [], commands: 0, interrupts: 0, sdkSkipped: 0,
+    userMsgs: 0, userChars: 0, msgLens: [], commands: 0, interrupts: 0, sdkSkipped: 0, sdkSessions: 0,
     assistantTurns: 0, toolUses: 0, totalCost: 0,
     subTurns: 0, subToolUses: 0, subCost: 0, subAgentRuns: 0, subTools: new Map(),
     tools: new Map(), skills: new Map(), agents: new Map(), cmds: new Map(),
@@ -147,6 +147,10 @@ function activeMinutes(sorted, gapMin) {
     let mtime;
     try { mtime = fs.statSync(f).mtimeMs; } catch { continue; }
     if (mtime < since) continue;
+
+    // 非対話実行(claude -p / SDK)のセッションは丸ごと外す。レコード単位の判定だけだと
+    // entrypoint を持たない型(queue-operation)が残り、時間軸と架空プロジェクトに現れる。
+    if (isNonInteractiveSession(f)) { stat.sdkSessions++; continue; }
 
     // サブエージェントの transcript は projects/<プロジェクト>/<親セッションID>/subagents/agent-*.jsonl
     // に置かれる。dirname をそのままプロジェクト名にすると "subagents" という架空の
@@ -163,101 +167,116 @@ function activeMinutes(sorted, gapMin) {
     // 実際のサブエージェントは 1014 本あり、subTurns はそちらを含むので、両方出さないと
     // 「1 委譲あたり 67 ターン」という実態と違う読みになる。
     let sawSubRecord = false;
+    // 同じ API 応答から分割されたレコードを二重に数えないための既出 id(ファイル内で閉じる)。
+    const seenMsgIds = new Set();
 
-    for await (const o of records(f)) {
-      const t = o.timestamp ? Date.parse(o.timestamp) : 0;
-      if (!t || t < since) continue;
-      // 非対話実行(claude -p / SDK)は人間の使い方の記録ではない。claude-window-keeper の
-      // ping がこれで、実データ 90 日で「送信」の 6.2%(103 件)を占めていた。深夜に走るので
-      // 時間帯分布も歪め、cwd が system32 なので架空のプロジェクトとしても現れる。
-      // entrypoint は user だけでなく assistant にも付くので、入口で 1 回落とせば
-      // 送信・ターン・コスト・時間軸のすべてから一貫して外れる(判定を各集計に足さない)。
-      if (isNonInteractive(o)) { stat.sdkSkipped++; continue; }
-      if (isSub) sawSubRecord = true;
+    try {
+      for await (const o of records(f)) {
+        const t = o.timestamp ? Date.parse(o.timestamp) : 0;
+        if (!t || t < since) continue;
+        // セッション単位の判定を抜けた個別レコードの保険(対話セッションに sdk 由来の
+        // レコードが混ざる形が将来出ても、ここで落ちる)。
+        if (isNonInteractive(o)) { stat.sdkSkipped++; continue; }
+        if (isSub) sawSubRecord = true;
 
-      stat.events.push(t);
-      stat.hours[new Date(t).getHours()]++;
-      if (!stat.perProject.has(project)) stat.perProject.set(project, []);
-      stat.perProject.get(project).push(t);
-      if (stat.firstTs === null || t < stat.firstTs) stat.firstTs = t;
-      if (stat.lastTs === null || t > stat.lastTs) stat.lastTs = t;
+        stat.events.push(t);
+        stat.hours[new Date(t).getHours()]++;
+        if (!stat.perProject.has(project)) stat.perProject.set(project, []);
+        stat.perProject.get(project).push(t);
+        if (stat.firstTs === null || t < stat.firstTs) stat.firstTs = t;
+        if (stat.lastTs === null || t > stat.lastTs) stat.lastTs = t;
 
-      let s = stat.sessions.get(sid);
-      if (!s) {
-        s = { project, first: t, last: t, mainTurns: 0, maxCtx: 0, cost: 0 };
-        stat.sessions.set(sid, s);
-      }
-      if (t < s.first) s.first = t;
-      if (t > s.last) s.last = t;
-
-      if (o.type === 'user' && !isSub) {
-        // isMeta はハーネスが挿入したレコードの印(スキル本文の展開、システム側の注記)。
-        // content が文字列か配列かで意味が変わるものではないので、形に依らず先に落とす。
-        // 配列側を見落としていたとき、スキル本文が人間の送信として数えられ、実データで
-        // 送信の 12.7%(最長は 93 万文字)が偽の入力として混ざっていた。
-        // スラッシュコマンドと中断の記録に isMeta は付かないので、この除外では減らない。
-        if (o.isMeta) continue;
-        const c = o.message && o.message.content;
-        // 文字列の content は人間の入力。配列の content は tool_result とハーネス挿入の
-        // text ブロックを含む。連結してから前方一致で捨てると、人間の本文が先頭にあって
-        // 後ろに通知が続くレコードで挿入分まで入力文字数に入るので、ブロック単位で落とす。
-        let text = null;
-        if (typeof c === 'string') text = c;
-        else if (Array.isArray(c)) {
-          const t2 = c.filter(x => x.type === 'text').map(x => x.text || '')
-            .filter(s => !isInjected(s)).join('');
-          text = t2 || null;
+        let s = stat.sessions.get(sid);
+        if (!s) {
+          s = { project, first: t, last: t, mainTurns: 0, maxCtx: 0, cost: 0 };
+          stat.sessions.set(sid, s);
         }
-        if (text === null) continue;
-        const cmd = text.match(/<command-name>([^<]+)<\/command-name>/);
-        if (cmd) { stat.commands++; bump(stat.cmds, cmd[1].trim()); continue; }
-        if (/\[Request interrupted/.test(text)) { stat.interrupts++; continue; }
-        if (isInjected(text)) continue;
-        stat.userMsgs++;
-        stat.userChars += text.length;
-        stat.msgLens.push(text.length);
-      } else if (o.type === 'assistant' && o.message) {
-        // サブエージェントのターンは委譲先の作業なので、メインの「1送信あたり何ターン
-        // 回したか」やツールの偏りには混ぜない。ただし時間軸には含める(委譲が走っている
-        // 間も作業時間ではある)。コストは合算しないと総額が実態より小さく出る。
-        if (!isSub) {
-          stat.assistantTurns++;
-          const u = o.message.usage;
-          if (u) {
-            s.mainTurns++;
-            s.maxCtx = Math.max(s.maxCtx, ctxLen(u));
-            const c = cost(o.message.model, u);
-            s.cost += c;
-            stat.totalCost += c;
-            bump(stat.models, String(o.message.model || 'unknown'), 1);
+        if (t < s.first) s.first = t;
+        if (t > s.last) s.last = t;
+
+        if (o.type === 'user' && !isSub) {
+          // isMeta はハーネスが挿入したレコードの印(スキル本文の展開、システム側の注記)。
+          // content が文字列か配列かで意味が変わるものではないので、形に依らず先に落とす。
+          // 配列側を見落としていたとき、スキル本文が人間の送信として数えられ、実データで
+          // 送信の 12.7%(最長は 93 万文字)が偽の入力として混ざっていた。
+          // スラッシュコマンドと中断の記録に isMeta は付かないので、この除外では減らない。
+          if (o.isMeta) continue;
+          const c = o.message && o.message.content;
+          // 文字列の content は人間の入力。配列の content は tool_result とハーネス挿入の
+          // text ブロックを含む。連結してから前方一致で捨てると、人間の本文が先頭にあって
+          // 後ろに通知が続くレコードで挿入分まで入力文字数に入るので、ブロック単位で落とす。
+          let text = null;
+          if (typeof c === 'string') text = c;
+          else if (Array.isArray(c)) {
+            const t2 = c.filter(x => x.type === 'text').map(x => x.text || '')
+              .filter(s => !isInjected(s)).join('');
+            text = t2 || null;
           }
-          if (Array.isArray(o.message.content)) {
-            for (const x of o.message.content) {
-              if (x.type !== 'tool_use') continue;
-              stat.toolUses++;
-              bump(stat.tools, x.name);
-              if (x.name === 'Skill' && x.input && x.input.skill) bump(stat.skills, x.input.skill);
-              if ((x.name === 'Task' || x.name === 'Agent') && x.input) {
-                bump(stat.agents, x.input.subagent_type || '(default)');
+          if (text === null) continue;
+          const cmd = text.match(/<command-name>([^<]+)<\/command-name>/);
+          if (cmd) { stat.commands++; bump(stat.cmds, cmd[1].trim()); continue; }
+          if (/\[Request interrupted/.test(text)) { stat.interrupts++; continue; }
+          if (isInjected(text)) continue;
+          stat.userMsgs++;
+          stat.userChars += text.length;
+          stat.msgLens.push(text.length);
+        } else if (o.type === 'assistant' && o.message) {
+          // サブエージェントのターンは委譲先の作業なので、メインの「1送信あたり何ターン
+          // 回したか」やツールの偏りには混ぜない。ただし時間軸には含める(委譲が走っている
+          // 間も作業時間ではある)。コストは合算しないと総額が実態より小さく出る。
+          // 1 回の API 応答は content ブロックごとに複数レコードへ分けて書かれ、その全部が
+          // 同じ message.id と「完全に同じ usage」を持つ(実測: 直近 3 日のメインで
+          // レコード 4899 / ユニーク id 2622、重複 1515 組はすべて usage 一致)。素朴に足すと
+          // ターン数もコストも約 1.9 倍に膨らむので、usage 由来の値は id ごとに 1 回だけ数える。
+          // tool_use はレコードごとに別のブロックなので、そちらは毎回数えてよい。
+          const mid = o.message.id;
+          const dupTurn = mid != null && seenMsgIds.has(mid);
+          if (mid != null) seenMsgIds.add(mid);
+          if (!isSub) {
+            if (!dupTurn) stat.assistantTurns++;
+            const u = dupTurn ? null : o.message.usage;
+            if (u) {
+              s.mainTurns++;
+              s.maxCtx = Math.max(s.maxCtx, ctxLen(u));
+              const c = cost(o.message.model, u);
+              s.cost += c;
+              stat.totalCost += c;
+              bump(stat.models, String(o.message.model || 'unknown'), 1);
+            }
+            if (Array.isArray(o.message.content)) {
+              for (const x of o.message.content) {
+                if (x.type !== 'tool_use') continue;
+                stat.toolUses++;
+                bump(stat.tools, x.name);
+                if (x.name === 'Skill' && x.input && x.input.skill) bump(stat.skills, x.input.skill);
+                if ((x.name === 'Task' || x.name === 'Agent') && x.input) {
+                  bump(stat.agents, x.input.subagent_type || '(default)');
+                }
+              }
+            }
+          } else {
+            const u = dupTurn ? null : o.message.usage;
+            if (u) {
+              const c = cost(o.message.model, u);
+              s.cost += c; stat.totalCost += c; stat.subCost += c; stat.subTurns++;
+              bump(stat.models, String(o.message.model || 'unknown'), 1);
+            }
+            if (Array.isArray(o.message.content)) {
+              for (const x of o.message.content) {
+                if (x.type !== 'tool_use') continue;
+                stat.subToolUses++;
+                bump(stat.subTools, x.name);
               }
             }
           }
-        } else {
-          const u = o.message.usage;
-          if (u) {
-            const c = cost(o.message.model, u);
-            s.cost += c; stat.totalCost += c; stat.subCost += c; stat.subTurns++;
-            bump(stat.models, String(o.message.model || 'unknown'), 1);
-          }
-          if (Array.isArray(o.message.content)) {
-            for (const x of o.message.content) {
-              if (x.type !== 'tool_use') continue;
-              stat.subToolUses++;
-              bump(stat.subTools, x.name);
-            }
-          }
         }
       }
+    } catch (e) {
+      // 走査中にファイルが消えることがある(セッションの後片付け、別の Claude Code の実行)。
+      // statSync は上でガードしてあるが、読み出しは records() の中で起きるのでここで受ける。
+      // 1 ファイルの消失で 1500 ファイル分の集計を捨てないための扱いで、他の例外は投げ直す。
+      if (!e || e.code !== 'ENOENT') throw e;
+      continue;
     }
     if (sawSubRecord) stat.subAgentRuns++;
   }
@@ -348,7 +367,9 @@ function activeMinutes(sorted, gapMin) {
       last: new Date(stat.lastTs).toISOString(), days: nDays,
       activeDays: days.filter(d => d.events > 0).length,
       gapMinutes: opt.gap,
-      // 集計から外した非対話実行の記録数。0 でなければ ping などが走っている。
+      // 集計から外した非対話実行。0 でなければ ping などが走っている。
+      // Sessions はファイルごと外した本数、Records はそこを抜けた個別レコード(通常 0)。
+      excludedSdkSessions: stat.sdkSessions,
       excludedSdkRecords: stat.sdkSkipped,
     },
     time: {
@@ -420,7 +441,11 @@ function activeMinutes(sorted, gapMin) {
   console.log(`期間: ${new Date(since).toLocaleDateString('ja-JP')} 〜 ${new Date(now).toLocaleDateString('ja-JP')}`
     + `  (${nDays}日, ギャップ ${opt.gap} 分で区切り)`);
   console.log(`記録: ${new Date(stat.firstTs).toLocaleString('ja-JP')} 〜 ${new Date(stat.lastTs).toLocaleString('ja-JP')}`);
-  if (stat.sdkSkipped) console.log(`(非対話実行 claude -p の記録 ${stat.sdkSkipped} 件は集計から除外)`);
+  if (stat.sdkSessions || stat.sdkSkipped) {
+    const excluded = [`セッション ${stat.sdkSessions} 本`];
+    if (stat.sdkSkipped) excluded.push(`単独レコード ${stat.sdkSkipped} 件`);
+    console.log(`(非対話実行 claude -p の${excluded.join(' / ')}は集計から除外)`);
+  }
   console.log(`作業時間 ${f1(totalHours)}h  稼働日 ${result.period.activeDays}/${nDays}日  `
     + `1稼働日あたり ${f1(result.time.perActiveDay)}h  換算コスト $${stat.totalCost.toFixed(0)}`);
 

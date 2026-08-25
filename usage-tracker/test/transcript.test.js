@@ -317,6 +317,9 @@ writeTranscript(homeP, 'proj', 'cccccccc-0000-0000-0000-00000000000a', [
   aTurn('00:01', [{ type: 'tool_use', id: 'p1', name: 'Bash', input: {} }]),
 ]);
 writeTranscript(homeP, 'C--WINDOWS-system32', 'cccccccc-0000-0000-0000-00000000000b', [
+  // queue-operation は entrypoint を持たないのに timestamp は持つ。レコード単位の判定だけだと
+  // これが残り、時間軸と架空プロジェクト(cwd 由来)に現れる。実データでも 18 件残っていた。
+  { type: 'queue-operation', timestamp: at('03:00'), operation: 'add' },
   { ...uTurn('03:00', 'Reply with only the word: ok'), entrypoint: 'sdk-cli', promptSource: 'sdk' },
   { ...aTurn('03:01', [{ type: 'tool_use', id: 'p2', name: 'Bash', input: {} }]), entrypoint: 'sdk-cli' },
 ]);
@@ -328,10 +331,35 @@ try { pp = JSON.parse(hbp.out); } catch (e) { pp = null; }
 check('非対話実行を送信・ツール・プロジェクトのどれにも数えない',
   pp && pp.input.sends === 1 && pp.tools.total === 1
     && !pp.projects.some(p => p.name === 'C--WINDOWS-system32')
-    && pp.period.excludedSdkRecords === 2,
-  pp ? `sends=${pp.input.sends} tools=${pp.tools.total} projects=${pp.projects.map(p => p.name)} excluded=${pp.period.excludedSdkRecords}` : hbp.out.slice(0, 200));
+    && pp.period.excludedSdkSessions === 1,
+  pp ? `sends=${pp.input.sends} tools=${pp.tools.total} projects=${pp.projects.map(p => p.name)} excludedSessions=${pp.period.excludedSdkSessions}` : hbp.out.slice(0, 200));
 check('非対話実行の時刻を作業時間に入れない',
   pp && pp.time.hours[3] === 0, pp ? `hours[3]=${pp.time.hours[3]}` : '');
+
+// ---- 同じ API 応答の分割レコードを二重に数えない ----
+// 1 回の応答は content ブロックごとに複数レコードへ分けて書かれ、その全部が同じ
+// message.id と完全に同じ usage を持つ。素朴に足すとターン数もコストも約 1.9 倍になる。
+// 一方 tool_use はレコードごとに別のブロックなので、そちらは全部数える必要がある。
+const homeU = sandbox('habits-dup');
+const dupUsage = usage({ input_tokens: 100, output_tokens: 50 });
+const dupRec = (time, content) => ({
+  type: 'assistant', timestamp: at(time), isSidechain: false,
+  message: { id: 'msg_dup_1', model: 'claude-opus-5', usage: dupUsage, content },
+});
+writeTranscript(homeU, 'proj', 'cccccccc-0000-0000-0000-00000000000c', [
+  uTurn('00:00', '送信'),
+  dupRec('00:01', [{ type: 'thinking', thinking: '考える' }]),
+  dupRec('00:01', [{ type: 'tool_use', id: 'u1', name: 'Bash', input: {} }]),
+  dupRec('00:01', [{ type: 'tool_use', id: 'u2', name: 'Read', input: {} }]),
+]);
+const hbu = run('habits.js', homeU, ['--since', '2026-01-01', '--json']);
+let pu = null;
+try { pu = JSON.parse(hbu.out); } catch (e) { pu = null; }
+check('分割された同一応答をターン数・コストで二重に数えない',
+  pu && pu.input.turnsPerMsg === 1 && pu.sessions.medianTurns === 1,
+  pu ? `turnsPerMsg=${pu.input.turnsPerMsg} medianTurns=${pu.sessions.medianTurns}` : hbu.out.slice(0, 200));
+check('二重計上を防いでもツール回数は全ブロックを数える',
+  pu && pu.tools.total === 2, pu ? `tools=${pu.tools.total}` : '');
 
 // ---- スキル起動のサブエージェントも本数として数える ----
 // Agent/Task の tool_use は親の transcript にしか現れないので、スキルやワークフローが
