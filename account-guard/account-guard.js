@@ -120,7 +120,15 @@ const CONFIG = path.join(GUARD_DIR, 'config.json');
 
 // 姉妹ツール claude-worklog の設定。読むのは status の表示だけで、判定には一切使わない
 // (詳細は printWorklogRestrictions)。
-const WORKLOG_CONFIG = path.join(homeUnresolved ? '(home-unresolved)' : HOME, '.claude', 'worklog', 'config.json');
+//
+// HOME は上の解決結果ではなく worklog と同じ os.homedir() から作る。こちらは
+// credentials.HOME → USERPROFILE → HOME → os.homedir() の順で探すのに対し、worklog は
+// os.homedir() だけを見る(claude-worklog/worklog.js:46)。両者が食い違う環境では、
+// この解決を共有すると worklog が実際に従っているのとは別のファイルを読み、
+// 「制限なし」と報告しながら向こうは記録を伏せ続ける — この表示が消そうとしている
+// 診断の行き止まりを、別の形で作り直すことになる。報告する対象の設定は、その持ち主の
+// 解決に合わせるのが正しい
+const WORKLOG_CONFIG = path.join(usableHome(os.homedir()) || '(home-unresolved)', '.claude', 'worklog', 'config.json');
 
 // 一時解除(unlock)の状態。unlocks.json が現に効いている解除の集合で、unlock.log は
 // 追記型の履歴。config.json と同じディレクトリに置くのは、どちらも「ガードの判定を変える
@@ -2198,13 +2206,25 @@ function printWorklogRestrictions(account, guardRules) {
     console.log('  worklog はこの状態を「全ての記録を伏せる」として扱います(安全側)。');
     return;
   }
-  const trees = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-    ? parsed.restrictedTrees
-    : null;
+  // JSON として読めたことは「正常」を意味しない。worklog は書式が壊れた設定を
+  // 「全ての記録を伏せる」として扱う(fail-closed)ので、向こうの loadConfig と同じ基準で
+  // 見ないと、実際には全部伏せられている状態を「制限なし」あるいは「表示」と出してしまう。
+  // それはこの表示が消そうとしている診断の行き止まりそのものになる。
+  // 基準は claude-worklog/worklog.js の loadConfig と揃える(最上位がオブジェクトでない、
+  // restrictedTrees が配列でない、tree が文字列でない/空/相対パス)
+  const shapeBroken = !parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+    || (parsed.restrictedTrees !== undefined && (
+      !Array.isArray(parsed.restrictedTrees)
+      || parsed.restrictedTrees.some((r) => !r || typeof r.tree !== 'string' || !r.tree
+        || !path.isAbsolute(r.tree))
+    ));
+  if (shapeBroken) {
+    console.log(`作業ログの読み出し制限 (claude-worklog): ${WORKLOG_CONFIG} の書式が壊れています`);
+    console.log('  worklog はこの状態を「全ての記録を伏せる」として扱います(安全側)。');
+    return;
+  }
   // 制限を掛けていないなら黙る。worklog を入れているだけの人に毎回 0 件の行を見せない
-  const valid = Array.isArray(trees)
-    ? trees.filter((r) => r && typeof r.tree === 'string' && r.tree)
-    : [];
+  const valid = Array.isArray(parsed.restrictedTrees) ? parsed.restrictedTrees : [];
   if (!valid.length) return;
 
   console.log(`作業ログの読み出し制限 (claude-worklog): ${valid.length} 件  ${WORKLOG_CONFIG}`);

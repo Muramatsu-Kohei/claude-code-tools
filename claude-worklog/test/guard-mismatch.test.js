@@ -18,9 +18,11 @@ const BASE = tmpDir('guard-mismatch');
 
 const TREE = path.join(BASE, 'org-tree');        // worklog が伏せるツリー
 const SUB = path.join(TREE, 'inner');            // その配下(前方一致の確認用)
+const TREE2 = path.join(BASE, 'second-tree');    // 2 本目。注記の対象を取り違えないことの確認用。
+// TREE と部分一致しない名前にするのは、--project や move の部分一致検索で巻き込まないため
 const OTHER = path.join(BASE, 'other-repo');     // 保護と無関係
 
-for (const r of [TREE, SUB, OTHER]) {
+for (const r of [TREE, SUB, TREE2, OTHER]) {
   fs.mkdirSync(r, { recursive: true });
   execFileSync('git', ['init', '-q'], { cwd: r, windowsHide: true, timeout: 30000, killSignal: 'SIGKILL' });
 }
@@ -64,6 +66,7 @@ function write(repo, sessions) {
 
 const T = Date.now() - 3600 * 1000;
 write(TREE, [{ sid: 'r1', ts: T, summary: '保護ツリーの作業' }]);
+write(TREE2, [{ sid: 'r2', ts: T, summary: '2本目のツリーの作業' }]);
 write(OTHER, [{ sid: 'o1', ts: T, summary: '無関係ツリーの作業' }]);
 
 const run = runner(home, OTHER);
@@ -160,5 +163,74 @@ setGuard({ rules: [{ tree: TREE, allow: ['pro'] }] });
 const guardAllows = run(['list', '--cwd', TREE]).out;
 check('account-guard 側が今のアカウントを許可していれば食い違いとして出す',
   MISMATCH.test(guardAllows), guardAllows);
+
+console.log('\naccount-guard 側が壊れている・解釈できない書き方をしているとき');
+
+// account-guard は「1 つでも書き損じたルールがあれば設定全体を壊れているとみなし、
+// すべての操作を拒否する」。こちらが壊れたルールだけ捨てて残りで判定すると、
+// 向こうが全拒否している最中に「保護されていない」と正反対の案内を出す
+// 同居させる有効なルールは、TREE を覆わないもの(OTHER)にする。TREE を覆うルールを
+// 混ぜると、壊れたルールを無視しても「両方に書いてある」と判定されてしまい、
+// このチェックを外しても検査が通ってしまう(= 退行を検出できないテストになる)
+setGuard({ rules: [{ tree: OTHER, allow: ['team'] }, { tree: 'relative-path', allow: ['team'] }] });
+check('相対パスのルールが混じっていたら黙る(向こうは設定全体を壊れているとみなし全拒否)',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+setGuard({ rules: [{ tree: 42, allow: ['team'] }] });
+check('tree が文字列でないルールがあっても黙る',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+// ドライブ文字を落とした tree は向こうでは有効なルールとして働くが、こちらの normPath
+// (path.resolve)は実行時のドライブを基準に別の場所として解決する。解釈が食い違う以上、
+// 「保護されていない」と言い切れない
+setGuard({ rules: [{ tree: '/org-tree', allow: ['team'] }] });
+check('ドライブ文字の無い tree があれば黙る(解釈が両者で食い違う)',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+// Git Bash 表記。向こうの normalize は `/c/org-tree` を `c:/org-tree` に寄せるが、
+// こちらの path.resolve は `<実行時のドライブ>:\c\org-tree` にしてしまう
+setGuard({ rules: [{ tree: '/c/org-tree', allow: ['team'] }] });
+check('Git Bash 表記の tree があれば黙る(保護が効いているのに外せと案内しない)',
+  !MISMATCH.test(run(['list', '--cwd', TREE]).out), run(['list', '--cwd', TREE]).out);
+
+console.log('\n名指しの注記は、その対象に効いている制限だけを説明する');
+
+// 制限ツリーが 2 本あり、TREE2 だけ account-guard 側にもある状態。
+// 「この制限は worklog 側の設定によるもの」が別のツリーの食い違いを指してはいけない
+setWorklog({ restrictedTrees: [{ tree: TREE, allow: ['team'] }, { tree: TREE2, allow: ['team'] }] });
+setGuard({ rules: [{ tree: TREE2, allow: ['team'] }] });
+
+const aboutTree2 = run(['list', '--project', projectKey(TREE2)]).out;
+check('両方に書いてあるツリーの注記に、別ツリーの食い違いを混ぜない',
+  !MISMATCH.test(aboutTree2), aboutTree2);
+check('その注記自体は今までどおり出ている',
+  /別アカウント専用のツリーのため表示していない/.test(aboutTree2), aboutTree2);
+
+const aboutTree1 = run(['list', '--project', projectKey(TREE)]).out;
+check('worklog 側だけのツリーの注記には食い違いを出す', MISMATCH.test(aboutTree1), aboutTree1);
+check('その説明に挙がるのは当該ツリーだけ',
+  aboutTree1.includes(TREE) && !aboutTree1.includes(TREE2), aboutTree1);
+
+// cwd 基準の案内も同じ。TREE2 に cd している体で叩く
+const cwdTree2 = run(['list', '--cwd', TREE2]).out;
+check('cwd 基準の案内でも対象を取り違えない', !MISMATCH.test(cwdTree2), cwdTree2);
+
+// 件数ベースの注記は横断的な話なので、絞らずに全ての食い違いを挙げてよい
+const acrossAll = run(['today', '--days', '3650']).out;
+check('件数ベースの注記は横断的なので食い違いを挙げる', MISMATCH.test(acrossAll), acrossAll);
+
+console.log('\nexport の Markdown では継続行にも引用記号を付ける');
+
+// `> ` の引用は 2 行目に `>` が無いと lazy continuation で前の行に繋がり、
+// 改行が消えて 1 行に潰れる
+setWorklog(RESTRICTED);
+setGuard({ rules: [] });
+const exported = run(['export', '--project', projectKey(TREE)]).out;
+check('export の注記が引用として出る', /^> .*別アカウント専用/m.test(exported), exported);
+check('食い違いの説明の継続行にも > が付く',
+  /^> この制限は worklog 側の設定によるもの/m.test(exported)
+  && /^> \(.*account-guard 側では保護されていない/m.test(exported), exported);
+check('引用記号の無い裸の継続行が残っていない',
+  !/^この制限は worklog 側の設定によるもの/m.test(exported), exported);
 
 finish();

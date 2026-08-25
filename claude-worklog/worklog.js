@@ -210,8 +210,19 @@ function guardActiveRules(account) {
     return null;
   }
   if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.rules)) return null;
+  // 1件でも安全に照合できない tree があれば、全体をあきらめる。壊れたルールだけを捨てて
+  // 残りで判定すると、どちらの取りこぼし方も「保護されていない」と誤って案内する向きに倒れる:
+  //  - 相対パス・tree の書き損じ(型違い/空)は、account-guard 側では設定全体を壊れている
+  //    とみなす材料になる。その状態の向こうは全ての操作を拒否している(= 保護が最も強く
+  //    効いている)ので、こちらが残りのルールだけで「保護されていない」と言うと正反対になる
+  //  - ドライブ文字を落とした tree(`/org-tree`、Git Bash 表記の `/c/org-tree`)は向こうでは
+  //    書き損じにならず有効なルールとして働くが、こちらの normPath(path.resolve)は実行時の
+  //    ドライブを基準に別の場所として解決するため、同じツリーを指しているかを判定できない
+  //    (向こうの normalize は `/c/org-tree` を `c:/org-tree` に寄せる。ここを複製せず
+  //     判定を降りるのは、解釈の差そのものを持ち込まないため)
+  const comparable = (t) => typeof t === 'string' && /^[a-zA-Z]:[\\/]/.test(t);
+  if (!parsed.rules.every((r) => r && comparable(r.tree))) return null;
   return parsed.rules
-    .filter((r) => r && typeof r.tree === 'string' && r.tree)
     .filter((r) => !(Array.isArray(r.allow) && r.allow.includes(account)));
 }
 
@@ -231,24 +242,49 @@ function guardMismatchedTrees(blocked, account) {
 
 // 食い違いを利用者向けの一文にする。既存の注記の末尾へ連結して使う。
 // 平常時(両方に書いてある・account-guard 未導入・向こうが壊れている)は null を返すので、
-// 注記の文面は今までどおり一言一句変わらない
-function guardMismatchNote(cfg, account) {
+// 注記の文面は今までどおり一言一句変わらない。
+//
+// onlyTrees はこの注記が名指ししている対象に効いているルールの tree 一覧。--project や
+// cwd 基準の案内は特定のプロジェクトについて語っているので、そこに無関係なツリーの
+// 食い違いを混ぜると「この制限は」の指す先がずれ、実際には両方に書いてある制限を
+// 「worklog 側だけのもの」と誤って説明してしまう。件数ベースの注記(restrictionNote)は
+// 横断的な話なので null を渡して絞らない
+function guardMismatchNote(cfg, account, onlyTrees = null) {
   // 設定を読めていないときの理由は「別アカウント専用のツリーだから」ではないので、
   // ツリー単位の照合を持ち出しても噛み合わない(restrictionNote 側が本当の理由を出す)
   if (cfg.configBroken) return null;
-  const mismatched = guardMismatchedTrees(blockedTrees(cfg, account), account);
+  const blocked = onlyTrees
+    ? blockedTrees(cfg, account).filter((r) => onlyTrees.includes(r.tree))
+    : blockedTrees(cfg, account);
+  const mismatched = guardMismatchedTrees(blocked, account);
   if (!mismatched.length) return null;
   return `この制限は worklog 側の設定によるもの: ${CONFIG_PATH} の restrictedTrees`
-    + `\n  (${mismatched.join(' / ')} は account-guard 側では保護されていない`
+    + `\n(${mismatched.join(' / ')} は account-guard 側では保護されていない`
     + ' — 解除するつもりなら両方から外す)';
 }
 
-// 注記に食い違いの説明を足す。2行目以降を字下げするのは、呼び出し側がどこも
-// `! ${note}` の形で1行の記号を付けて出しているため(そのままだと続きの行が行頭に付く)
-function withGuardMismatch(note, cfg, account) {
+// 注記に食い違いの説明を足す。改行で区切るだけで行頭は整えない — 呼び出し側の書式が
+// 2 通り(CLI の `! ` と export の Markdown 引用 `> `)あり、必要な継続行の飾りが違うため
+// (noteLines 参照)
+function withGuardMismatch(note, cfg, account, onlyTrees = null) {
   if (!note) return note;
-  const extra = guardMismatchNote(cfg, account);
-  return extra ? `${note}\n  ${extra}` : note;
+  const extra = guardMismatchNote(cfg, account, onlyTrees);
+  return extra ? `${note}\n${extra}` : note;
+}
+
+// 複数行になりうる注記に行頭の飾りを付ける。1 行目と継続行で分けるのは、Markdown の
+// 引用が継続行にも `>` を要求するため。付けないと lazy continuation で前の行に繋がり、
+// 改行が消えて 1 行に潰れる(export の出力で実際に潰れた)
+function noteLines(note, first, cont) {
+  return String(note).split('\n').map((l, i) => `${i === 0 ? first : cont}${l}`).join('\n');
+}
+const cliNote = (note) => noteLines(note, '! ', '  ');
+const mdNote = (note) => noteLines(note, '> ', '> ');
+
+// 指定したキーのどれかに実際に効いている制限ルールの tree を返す。名指しの注記が
+// 「この制限は」と言うとき、その制限を作っているルールだけを説明の対象にするために使う
+function hitTrees(blocked, keys) {
+  return blocked.filter((r) => !r.all && keys.some((k) => keyUnderTree(k, r.tree))).map((r) => r.tree);
 }
 
 // key のログファイルに現れる cwd のうち、「本来その key の記録である」と確認できる
@@ -1643,9 +1679,11 @@ function explicitProjectRestrictionNote(flags, cfg, account) {
     const candidates = matchProjectKeys(raw, explicit).filter((k) => raw.includes(k));
     if (!candidates.length) return null;
     if (!candidates.every((k) => isKeyBlocked(k, blocked))) return null; // 一部でも見えるなら通常表示になる
+    // 食い違いの説明は、この注記が名指ししているプロジェクトに実際に効いているルールに限る。
+    // 全ルールを見ると、別のツリーの食い違いを「この制限は」の説明として出してしまう
     return withGuardMismatch(
       `「${explicit}」は別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。`,
-      cfg, account,
+      cfg, account, hitTrees(blocked, candidates),
     );
   }
   // --project 省略時(既定の cwd 解決)。--all は listProjectKeys() で既にキー単位
@@ -1656,7 +1694,7 @@ function explicitProjectRestrictionNote(flags, cfg, account) {
   if (!isKeyBlocked(cwdKey, blocked)) return null;
   return withGuardMismatch(
     '現在のディレクトリは別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。',
-    cfg, account,
+    cfg, account, hitTrees(blocked, [cwdKey]),
   );
 }
 
@@ -1696,20 +1734,20 @@ function cmdList(flags) {
     // 調べ回ることになるため、--project が保護ツリーに当たっている場合はそちらを優先する
     const restricted = explicitProjectRestrictionNote(flags, cfg, account);
     if (restricted) {
-      console.log(yellow(`! ${restricted}`));
+      console.log(yellow(cliNote(restricted)));
     } else {
       console.log(typeof scopeFilter === 'string'
         ? `スコープ「${scopeFilter}」に一致する記録がない。`
         : '記録がまだない。フックを設定したか、対象プロジェクトが合っているか確認する。');
     }
     // 個別の案内を出したときは件数の注記を重ねない(同じことを二度言うことになる)
-    if (note && !restricted) console.log(yellow(`! ${note}`));
+    if (note && !restricted) console.log(yellow(cliNote(note)));
     return;
   }
   const where = showProject ? '全プロジェクト' : keys.map((k) => repoLabel(k, all)).join(', ');
   console.log(bold(`直近の作業ログ (${where}${typeof scopeFilter === 'string' ? ` / scope ${scopeFilter}` : ''})`));
   for (const s of sessions) console.log(renderSession(s, { verbose, showProject, cfg }));
-  if (note) console.log(yellow(`! ${note}`));
+  if (note) console.log(yellow(cliNote(note)));
 }
 
 function cmdToday(flags) {
@@ -1747,12 +1785,12 @@ function cmdToday(flags) {
     // --project 省略時は cwd ではなく全プロジェクトが対象なので、cwd 基準の案内は使わない
     const restricted = flags.project ? explicitProjectRestrictionNote(flags, cfg, account) : null;
     if (restricted) {
-      console.log(yellow(`! ${restricted}`));
+      console.log(yellow(cliNote(restricted)));
     } else {
       console.log(days > 1 ? `直近 ${days} 日の記録はない。` : '今日の記録はまだない。');
     }
     // 個別の案内を出したときは件数の注記を重ねない
-    if (note && !restricted) console.log(yellow(`! ${note}`));
+    if (note && !restricted) console.log(yellow(cliNote(note)));
     return;
   }
   let currentDay = null;
@@ -1766,7 +1804,7 @@ function cmdToday(flags) {
   }
   const projects = uniq(sessions.map((s) => displayName(s, cfg)));
   console.log(`\n${dim(`${sessions.length} セッション / ${projects.length} プロジェクト: ${projects.join(', ')}`)}`);
-  if (note) console.log(yellow(`! ${note}`));
+  if (note) console.log(yellow(cliNote(note)));
 }
 
 function cmdLive() {
@@ -1853,7 +1891,7 @@ function cmdHandoff(flags, scopeArg) {
         ? restrictionNote(cfg, account, hiddenSessions, scopeKeys)
         : null);
     if (note) {
-      console.log(yellow(`! ${note}`));
+      console.log(yellow(cliNote(note)));
     } else {
       console.log('引き継ぎ文が記録されていない。セッション終了時に /finish を実行すると記録される。');
     }
@@ -1908,10 +1946,10 @@ function cmdExport(flags) {
   const hiddenKeys = scopeKeys.length - keys.length;
   const restricted = explicitProjectRestrictionNote(flags, cfg, account);
   if (restricted) {
-    out.push(`\n> ${restricted}`);
+    out.push(`\n${mdNote(restricted)}`);
   } else if (flags.all || cfg.configBroken || hiddenSessions > 0 || hiddenKeys > 0) {
     const note = restrictionNote(cfg, account, hiddenSessions, scopeKeys);
-    if (note) out.push(`\n> ${note}`);
+    if (note) out.push(`\n${mdNote(note)}`);
   }
   out.push('');
   let day = null;

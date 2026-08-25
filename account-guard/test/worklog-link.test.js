@@ -119,6 +119,27 @@ const brokenWorklog = status();
 check('worklog の設定が壊れていることを伝える', /読めません/.test(brokenWorklog), brokenWorklog);
 check('壊れているときは全て伏せる扱いだと伝える', /全ての記録を伏せる/.test(brokenWorklog), brokenWorklog);
 
+// JSON として読めることは「正常」を意味しない。worklog の loadConfig は書式の書き損じも
+// 全伏せ(fail-closed)として扱うので、同じ基準で見ないと「制限なし」や「表示」と出しながら
+// 向こうは全部伏せている、という診断の行き止まりを作る
+const SHAPE_BROKEN = /書式が壊れています/;
+
+setWorklog({ restrictedTrees: { tree: 'C:/org-tree' } }); // 配列にし忘れ
+check('restrictedTrees が配列でなければ壊れていると伝える', SHAPE_BROKEN.test(status()), status());
+
+setWorklog({ restrictedTrees: [{ tree: 'org-tree', allow: ['team'] }] }); // 相対パス
+check('tree が相対パスなら壊れていると伝える', SHAPE_BROKEN.test(status()), status());
+
+setWorklog({ restrictedTrees: [{ path: 'C:/org-tree', allow: ['team'] }] }); // キーの書き損じ
+check('tree キーの書き損じも壊れていると伝える', SHAPE_BROKEN.test(status()), status());
+
+setWorklog([{ tree: 'C:/org-tree' }]); // 最上位が配列
+check('最上位が配列なら壊れていると伝える', SHAPE_BROKEN.test(status()), status());
+
+setWorklog({ restrictedTrees: [{ tree: 'C:/org-tree', allow: ['team'] }, { tree: '', allow: [] }] });
+check('1 件でも壊れていれば全体を壊れているとして扱う(部分的に表示しない)',
+  SHAPE_BROKEN.test(status()) && !/現在は/.test(status()), status());
+
 console.log('\n表示するだけで判定は変えない');
 
 setGuard({ rules: [{ tree: TREE, allow: ['team'] }] });
