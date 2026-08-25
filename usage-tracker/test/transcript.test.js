@@ -308,6 +308,31 @@ check('通知・! 実行の記録・compact 要約を送信として数えない
 check('本文に続く挿入ブロックを入力の文字数に数えない',
   pi && pi.input.maxChars === 6, pi ? `maxChars=${pi.input.maxChars}` : hbi.out.slice(0, 200));
 
+// ---- 非対話実行(claude -p / SDK)を集計に入れない ----
+// claude-window-keeper の ping がこれ。送信としてだけでなく、ターン・コスト・時間軸からも
+// 外れる必要がある(深夜に走るので時間帯分布が歪み、cwd 由来の架空プロジェクトも生む)。
+const homeP = sandbox('habits-sdk');
+writeTranscript(homeP, 'proj', 'cccccccc-0000-0000-0000-00000000000a', [
+  uTurn('00:00', '人間の送信'),
+  aTurn('00:01', [{ type: 'tool_use', id: 'p1', name: 'Bash', input: {} }]),
+]);
+writeTranscript(homeP, 'C--WINDOWS-system32', 'cccccccc-0000-0000-0000-00000000000b', [
+  { ...uTurn('03:00', 'Reply with only the word: ok'), entrypoint: 'sdk-cli', promptSource: 'sdk' },
+  { ...aTurn('03:01', [{ type: 'tool_use', id: 'p2', name: 'Bash', input: {} }]), entrypoint: 'sdk-cli' },
+]);
+// 時間帯の検証があるので TZ を固定する。既定のローカル時刻では at() の UTC 時刻が
+// 何時に落ちるかが実行環境で変わり、時間帯のチェックが素通りする。
+const hbp = run('habits.js', homeP, ['--since', '2026-01-01', '--json'], { TZ: 'UTC' });
+let pp = null;
+try { pp = JSON.parse(hbp.out); } catch (e) { pp = null; }
+check('非対話実行を送信・ツール・プロジェクトのどれにも数えない',
+  pp && pp.input.sends === 1 && pp.tools.total === 1
+    && !pp.projects.some(p => p.name === 'C--WINDOWS-system32')
+    && pp.period.excludedSdkRecords === 2,
+  pp ? `sends=${pp.input.sends} tools=${pp.tools.total} projects=${pp.projects.map(p => p.name)} excluded=${pp.period.excludedSdkRecords}` : hbp.out.slice(0, 200));
+check('非対話実行の時刻を作業時間に入れない',
+  pp && pp.time.hours[3] === 0, pp ? `hours[3]=${pp.time.hours[3]}` : '');
+
 // ---- スキル起動のサブエージェントも本数として数える ----
 // Agent/Task の tool_use は親の transcript にしか現れないので、スキルやワークフローが
 // 起こしたサブエージェントは 0 回と出る。一方 subTurns はそれを含むため、両方出さないと

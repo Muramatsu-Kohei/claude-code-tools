@@ -8,7 +8,7 @@
 // 使い方: node habits.js [--days 14] [--gap 分] [--since YYYY-MM-DD] [--json]
 const fs = require('fs');
 const path = require('path');
-const { ROOT, cost, ctxLen, transcriptFiles, records, warnUnknownModels } = require('./lib');
+const { ROOT, cost, ctxLen, transcriptFiles, records, isNonInteractive, warnUnknownModels } = require('./lib');
 
 // 作業時間の既定のギャップ閾値(分)。これより長い無操作は「作業していない」とみなす。
 // 5分だと 1 回の長い実行待ちで切れ、60分だと食事や仮眠を含んでしまう。
@@ -133,7 +133,7 @@ function activeMinutes(sorted, gapMin) {
     sessions: new Map(),           // sid -> {project, first, last, mainTurns, maxCtx, cost}
     perProject: new Map(),         // project -> 時刻配列
     hours: new Array(24).fill(0),
-    userMsgs: 0, userChars: 0, msgLens: [], commands: 0, interrupts: 0,
+    userMsgs: 0, userChars: 0, msgLens: [], commands: 0, interrupts: 0, sdkSkipped: 0,
     assistantTurns: 0, toolUses: 0, totalCost: 0,
     subTurns: 0, subToolUses: 0, subCost: 0, subAgentRuns: 0, subTools: new Map(),
     tools: new Map(), skills: new Map(), agents: new Map(), cmds: new Map(),
@@ -167,6 +167,12 @@ function activeMinutes(sorted, gapMin) {
     for await (const o of records(f)) {
       const t = o.timestamp ? Date.parse(o.timestamp) : 0;
       if (!t || t < since) continue;
+      // 非対話実行(claude -p / SDK)は人間の使い方の記録ではない。claude-window-keeper の
+      // ping がこれで、実データ 90 日で「送信」の 6.2%(103 件)を占めていた。深夜に走るので
+      // 時間帯分布も歪め、cwd が system32 なので架空のプロジェクトとしても現れる。
+      // entrypoint は user だけでなく assistant にも付くので、入口で 1 回落とせば
+      // 送信・ターン・コスト・時間軸のすべてから一貫して外れる(判定を各集計に足さない)。
+      if (isNonInteractive(o)) { stat.sdkSkipped++; continue; }
       if (isSub) sawSubRecord = true;
 
       stat.events.push(t);
@@ -342,6 +348,8 @@ function activeMinutes(sorted, gapMin) {
       last: new Date(stat.lastTs).toISOString(), days: nDays,
       activeDays: days.filter(d => d.events > 0).length,
       gapMinutes: opt.gap,
+      // 集計から外した非対話実行の記録数。0 でなければ ping などが走っている。
+      excludedSdkRecords: stat.sdkSkipped,
     },
     time: {
       totalHours, perDay: totalHours / nDays,
@@ -412,6 +420,7 @@ function activeMinutes(sorted, gapMin) {
   console.log(`期間: ${new Date(since).toLocaleDateString('ja-JP')} 〜 ${new Date(now).toLocaleDateString('ja-JP')}`
     + `  (${nDays}日, ギャップ ${opt.gap} 分で区切り)`);
   console.log(`記録: ${new Date(stat.firstTs).toLocaleString('ja-JP')} 〜 ${new Date(stat.lastTs).toLocaleString('ja-JP')}`);
+  if (stat.sdkSkipped) console.log(`(非対話実行 claude -p の記録 ${stat.sdkSkipped} 件は集計から除外)`);
   console.log(`作業時間 ${f1(totalHours)}h  稼働日 ${result.period.activeDays}/${nDays}日  `
     + `1稼働日あたり ${f1(result.time.perActiveDay)}h  換算コスト $${stat.totalCost.toFixed(0)}`);
 

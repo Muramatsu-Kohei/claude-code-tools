@@ -82,10 +82,19 @@ async function* records(file) {
   }
 }
 
+// 非対話実行(claude -p / SDK 経由)のレコードか。ここに集約しているのは、同じ判定を
+// 各スクリプトで新設すると片方だけ直る形になるため(claude-window-keeper の ping は
+// 実データ 90 日で「送信」の 6.2% を占め、cwd が system32 なので架空のプロジェクトも作る)。
+// entrypoint は user だけでなく assistant にも付くので、入口で 1 回落とせば
+// 送信・ターン・コスト・時間軸のすべてから一貫して外れる。
+// 現時点で使っているのは habits.js のみ。sessions.js / turncost.js / breakdown.js は
+// まだ ping を含んだまま数えている(sessions.js のセッション数はそのぶん多い)。
+const isNonInteractive = o => !!o && o.entrypoint === 'sdk-cli';
+
 function warnUnknownModels() {
   if (!unknownModels.size) return;
   const list = [...unknownModels.entries()].map(([m, n]) => `${m}(${n}件)`).join(', ');
   console.error(`\n警告: pricing.js に単価が無いモデルを $0 として集計した: ${list}`);
 }
 
-module.exports = { PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records, warnUnknownModels };
+module.exports = { PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records, isNonInteractive, warnUnknownModels };
