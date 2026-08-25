@@ -17,6 +17,8 @@ const GAP_DEFAULT = 15;
 const GAP_SWEEP = [5, 10, 15, 20, 30];
 // 単発イベントだけの区間は長さ 0 になるが、実際には数分は使っている。最低これだけ割り当てる。
 const MIN_BLOCK_MIN = 2;
+// --days の上限(約10年)。transcript がこれより古いことはなく、Date の表現範囲も外れない。
+const DAYS_MAX = 3650;
 
 const USAGE = 'node habits.js [--days N] [--since YYYY-MM-DD] [--gap 分] [--json]';
 
@@ -28,9 +30,13 @@ function die(msg) {
 // 数値引数を検証して返す。Number() の結果を素通しすると、値の欠落や打ち間違いが NaN として
 // 下流に流れ、比較が常に false になって「全期間を読む」「全イベントが 1 ブロックに繋がって
 // 作業時間が実時間になる」といった、エラーにならない誤集計になる。入口で止める。
-function numArg(v, name, min) {
+// 上限も要る: --days 1e9 のような値は since が Date の表現範囲(±8.64e15ms)を外れ、
+// 使い方エラーではなく toISOString() の RangeError になって使い方が伝わらない。
+function numArg(v, name, min, max) {
   const n = Number(v);
-  if (!Number.isFinite(n) || n < min) die(`${name} には ${min} 以上の数値を指定してください(受け取った値: ${v === undefined ? '(なし)' : v})`);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    die(`${name} には ${min}〜${max} の数値を指定してください(受け取った値: ${v === undefined ? '(なし)' : v})`);
+  }
   return n;
 }
 
@@ -39,21 +45,26 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') o.json = true;
-    else if (a === '--days') o.days = numArg(argv[++i], '--days', 1);
+    else if (a === '--days') o.days = numArg(argv[++i], '--days', 1, DAYS_MAX);
     else if (a === '--since') o.since = argv[++i];
-    else if (a === '--gap') o.gap = numArg(argv[++i], '--gap', 1);
+    // 区切りが 1 日を超えると日別集計と噛み合わなくなるので 1440 分で頭打ちにする。
+    else if (a === '--gap') o.gap = numArg(argv[++i], '--gap', 1, 1440);
     else if (a === '--help' || a === '-h') {
       console.log(USAGE);
       process.exit(0);
     } else die(`不明な引数: ${a}`);
   }
   if (o.since !== null) {
-    // 形式と実在の両方を見る。'2026-8-1' のような不揃いな表記や '2026-02-30' は
-    // Date.parse が NaN や別の日に倒すので、後段の toISOString() まで壊れが伝わる。
+    // 形式と実在の両方を見る。'2026-8-1' のような不揃いな表記は Date.parse が NaN に倒す。
+    // 一方 '2026-02-30' は Invalid Date にはならず 3/2 へ黙って繰り上がるので(V8 実測)、
+    // 存在しない日は Invalid の有無ではなく「入力と同じ年月日になったか」で弾く。
     if (!/^\d{4}-\d{2}-\d{2}$/.test(String(o.since))) die(`--since は YYYY-MM-DD で指定してください(受け取った値: ${o.since === undefined ? '(なし)' : o.since})`);
-    const t = new Date(o.since + 'T00:00:00').getTime();
-    if (!Number.isFinite(t)) die(`--since に存在しない日付が指定されています: ${o.since}`);
-    if (t > Date.now()) die(`--since が未来の日付です: ${o.since}`);
+    const [y, m, d] = o.since.split('-').map(Number);
+    const dt = new Date(o.since + 'T00:00:00');
+    if (!Number.isFinite(dt.getTime()) || dt.getFullYear() !== y || dt.getMonth() + 1 !== m || dt.getDate() !== d) {
+      die(`--since に存在しない日付が指定されています: ${o.since}`);
+    }
+    if (dt.getTime() > Date.now()) die(`--since が未来の日付です: ${o.since}`);
   }
   return o;
 }
@@ -62,6 +73,16 @@ function parseArgs(argv) {
 function startOfDay(t) {
   const d = new Date(t);
   d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+// n 日後(負なら前)の 0 時。日の加減算をミリ秒の固定加算でやると、DST のある地域では
+// 遷移日以降 1 時間ずれて境界が前日 23 時に落ち、同じ日付ラベルの行が 2 度出る。
+// lib.js は HOME 経由で WSL / macOS 実行も見ているので、JST 前提にはしない。
+function addDays(t, n) {
+  const d = new Date(t);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() + n);
   return d.getTime();
 }
 
@@ -87,7 +108,7 @@ function activeMinutes(sorted, gapMin) {
   const now = Date.now();
   const since = opt.since
     ? new Date(opt.since + 'T00:00:00').getTime()
-    : startOfDay(now) - (opt.days - 1) * 86400000;
+    : addDays(now, -(opt.days - 1));
 
   const stat = {
     events: [], firstTs: null, lastTs: null,
@@ -138,11 +159,17 @@ function activeMinutes(sorted, gapMin) {
       if (t > s.last) s.last = t;
 
       if (o.type === 'user' && !isSub) {
+        // isMeta はハーネスが挿入したレコードの印(スキル本文の展開、システム側の注記)。
+        // content が文字列か配列かで意味が変わるものではないので、形に依らず先に落とす。
+        // 配列側を見落としていたとき、スキル本文が人間の送信として数えられ、実データで
+        // 送信の 12.7%(最長は 93 万文字)が偽の入力として混ざっていた。
+        // スラッシュコマンドと中断の記録に isMeta は付かないので、この除外では減らない。
+        if (o.isMeta) continue;
         const c = o.message && o.message.content;
-        // 文字列の content は人間の入力かシステム挿入。配列の content は tool_result を含む。
+        // 文字列の content は人間の入力。配列の content は tool_result を含む。
         // どちらもフックやリマインダが混ざるので、人間が打った分だけを数える。
         let text = null;
-        if (typeof c === 'string') text = o.isMeta ? null : c;
+        if (typeof c === 'string') text = c;
         else if (Array.isArray(c)) {
           const t2 = c.filter(x => x.type === 'text').map(x => x.text || '').join('');
           text = t2 || null;
@@ -217,8 +244,8 @@ function activeMinutes(sorted, gapMin) {
   // (--since を古く取ると日数×イベント数の全走査になり、これが支配的になる)。
   let ei = 0;
   for (let i = 0; i < nDays; i++) {
-    const d0 = startOfDay(since) + i * 86400000;
-    const d1 = d0 + 86400000;
+    const d0 = addDays(since, i);
+    const d1 = addDays(since, i + 1);
     const seg = [];
     while (ei < stat.events.length && stat.events[ei] < d1) {
       if (stat.events[ei] >= d0) seg.push(stat.events[ei]);

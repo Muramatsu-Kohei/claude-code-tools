@@ -38,8 +38,8 @@ function writeTranscript(home, project, id, recs) {
 }
 
 // 偽 HOME を向けてスクリプトを実行する。非 0 終了も検証対象なので投げずに返す
-function run(script, home, args = []) {
-  const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+function run(script, home, args = [], extraEnv = {}) {
+  const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1', ...extraEnv };
   // 孤児プロセスが残る事故(issue #8)の検出網として timeout を掛ける。stdin は既に
   // 'ignore' で閉じているのでこのスクリプト自体がハングする経路は無いはずだが、
   // 念のための保険。
@@ -206,6 +206,15 @@ const noVal = run('habits.js', homeH, ['--days']);
 check('値の無い --days を弾く', noVal.code === 2, `code=${noVal.code} err=${noVal.err.slice(0, 120)}`);
 const badSince = run('habits.js', homeH, ['--since', '2026-1-1']);
 check('形式の崩れた --since を弾く', badSince.code === 2, `code=${badSince.code} err=${badSince.err.slice(0, 120)}`);
+// '2026-02-30' は Invalid Date にならず 3/2 へ繰り上がるので、Invalid の有無では捕まらない。
+// 弾き損ねると 2 月末からのつもりで 3 月からの数字を読むことになる。
+const rollover = run('habits.js', homeH, ['--since', '2026-02-30']);
+check('存在しない日付の --since を弾く(黙って翌月に繰り上げない)',
+  rollover.code === 2, `code=${rollover.code} out=${rollover.out.slice(0, 120)}`);
+// 上限が無いと since が Date の表現範囲を外れ、使い方エラーではなく RangeError で落ちる。
+const hugeDays = run('habits.js', homeH, ['--days', '1e9']);
+check('大きすぎる --days は使い方エラーとして弾く',
+  hugeDays.code === 2 && !/RangeError/.test(hugeDays.err), `code=${hugeDays.code} err=${hugeDays.err.slice(0, 160)}`);
 
 // ---- スラッシュコマンドも 1 送信として数える ----
 // 分子(ターン・ツール)はコマンドが起こした分を含むので、分母から外すとコマンドの
@@ -249,6 +258,41 @@ check('--days N の期間は末尾の無操作日を落とさない',
 check('日別の合計イベント数が全体と一致する',
   pd && pd.time.days.reduce((a, d) => a + d.events, 0) === 2,
   pd ? JSON.stringify(pd.time.days.map(d => d.events)) : '');
+
+// ---- ハーネスが挿入したレコードを人間の送信として数えない ----
+// isMeta は content が文字列でも配列でも同じ意味なのに、配列側だけ見落としていたときは
+// スキル本文の展開(数十万文字)が「最長のメッセージ」として出ていた。
+const homeM = sandbox('habits-meta');
+writeTranscript(homeM, 'proj', 'cccccccc-0000-0000-0000-000000000006', [
+  uTurn('00:00', 'ふつうの送信'),
+  {
+    type: 'user', timestamp: at('00:02'), isMeta: true,
+    message: { content: [{ type: 'text', text: 'Base directory for this skill: /skills/wrap ' + 'x'.repeat(5000) }] },
+  },
+  aTurn('00:03', [{ type: 'tool_use', id: 'm9', name: 'Bash', input: {} }]),
+]);
+const hbm = run('habits.js', homeM, ['--since', '2026-01-01', '--json']);
+let pm = null;
+try { pm = JSON.parse(hbm.out); } catch (e) { pm = null; }
+check('配列 content の isMeta レコードを送信として数えない',
+  pm && pm.input.sends === 1 && pm.input.userMsgs === 1 && pm.input.maxChars < 1000,
+  pm ? JSON.stringify(pm.input) : hbm.out.slice(0, 200));
+
+// ---- DST のある地域でも日付境界がずれない ----
+// 日の加算を固定 86,400,000ms でやると、遷移日以降の境界が前日 23 時に落ちて
+// 同じ日付ラベルの行が 2 度出る(2025-11-02 の米国の切り戻し)。
+const homeT = sandbox('habits-dst');
+writeTranscript(homeT, 'proj', 'cccccccc-0000-0000-0000-000000000007', [
+  { type: 'user', timestamp: '2025-11-01T15:00:00.000Z', message: { content: '遷移前' } },
+  { type: 'user', timestamp: '2025-11-02T18:00:00.000Z', message: { content: '遷移後' } },
+]);
+const hbt = run('habits.js', homeT, ['--since', '2025-11-01', '--json'], { TZ: 'America/New_York' });
+let pt = null;
+try { pt = JSON.parse(hbt.out); } catch (e) { pt = null; }
+const labels = pt ? pt.time.days.map(d => d.day) : [];
+check('DST を跨いでも日付ラベルが重複しない',
+  pt && labels.length > 0 && new Set(labels).size === labels.length,
+  pt ? labels.slice(0, 6).join(',') : hbt.err.slice(0, 200));
 
 // ---- transcript が無い環境 ----
 console.log('\ntranscript が無い場合');
