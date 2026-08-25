@@ -118,6 +118,10 @@ const currentAccount = credentials ? credentials.currentAccount : () => ACCOUNT_
 const GUARD_DIR = path.join(homeUnresolved ? '(home-unresolved)' : HOME, '.claude', 'account-guard');
 const CONFIG = path.join(GUARD_DIR, 'config.json');
 
+// 姉妹ツール claude-worklog の設定。読むのは status の表示だけで、判定には一切使わない
+// (詳細は printWorklogRestrictions)。
+const WORKLOG_CONFIG = path.join(homeUnresolved ? '(home-unresolved)' : HOME, '.claude', 'worklog', 'config.json');
+
 // 一時解除(unlock)の状態。unlocks.json が現に効いている解除の集合で、unlock.log は
 // 追記型の履歴。config.json と同じディレクトリに置くのは、どちらも「ガードの判定を変える
 // 設定」で、保護も後始末も同じ場所で扱えるため。
@@ -2170,6 +2174,56 @@ function printUnlockStatus() {
   console.log('  取り消すには guard lock(範囲を指定するなら guard lock --path <dir>)。');
 }
 
+// 姉妹ツール claude-worklog の読み出し制限を status に並べる。
+//
+// 同じツリーを、こちらは「操作の遮断」で、worklog は「記録の読み出し制限」で守る。
+// 守備範囲が違うので設定は意図して別ファイルだが、書く内容の形は同じ({ tree, allow })
+// なので、片方だけ書き換えて「解除したつもり」になる事故が起きる(実際に起きた)。
+// status は「なぜ拒否される/されない」を調べに来る入り口なので、こちらの rules だけを見て
+// 「保護なし」で終わると、その事故の原因にたどり着けないまま帰すことになる。
+//
+// 読むのは表示のためだけで、ガードの判定には一切影響しない。相手の設定を判定に使うと、
+// account-guard 単体で使う構成が worklog に依存してしまう(worklog 側も同じ方針でこちらを
+// 覗いている)。読めなければ黙るか、読めないことだけを伝える。
+function printWorklogRestrictions(account, guardRules) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(WORKLOG_CONFIG, 'utf8'));
+  } catch (e) {
+    // 未導入(ENOENT)なら黙る。使ってもいないツールの設定を毎回案内しても混乱を増やすだけ。
+    // 読めるのに壊れている場合だけは伝える: worklog はその状態を「全ての記録を伏せる」と
+    // 扱う(fail-closed)ので、記録が消えたように見える原因になる
+    if (e && e.code === 'ENOENT') return;
+    console.log(`作業ログの読み出し制限 (claude-worklog): ${WORKLOG_CONFIG} を読めません`);
+    console.log('  worklog はこの状態を「全ての記録を伏せる」として扱います(安全側)。');
+    return;
+  }
+  const trees = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? parsed.restrictedTrees
+    : null;
+  // 制限を掛けていないなら黙る。worklog を入れているだけの人に毎回 0 件の行を見せない
+  const valid = Array.isArray(trees)
+    ? trees.filter((r) => r && typeof r.tree === 'string' && r.tree)
+    : [];
+  if (!valid.length) return;
+
+  console.log(`作業ログの読み出し制限 (claude-worklog): ${valid.length} 件  ${WORKLOG_CONFIG}`);
+  for (const r of valid) {
+    const allow = Array.isArray(r.allow) ? r.allow : [];
+    const hidden = !allow.includes(account);
+    console.log(`  ${r.tree}  allow=[${allow.join(', ')}]  → 現在は ${hidden ? '非表示' : '表示'}`);
+    if (!hidden) continue;
+    // 伏せているツリーが、こちら側では今のアカウントに対して素通しになっていないか。
+    // 判定は前方一致なので、親ツリーを守っていれば配下も守られている(向きは
+    // 「worklog の tree がこちらの tree の内側」で固定する)
+    const covered = guardRules.some((g) => !g.allow.includes(account) && isInsideTree(r.tree, g.tree));
+    if (!covered) {
+      console.log('    ! account-guard 側には対応する保護ルールがありません'
+        + '(解除したつもりなら worklog 側の設定も外してください)');
+    }
+  }
+}
+
 function main() {
   const mode = process.argv[2] || '';
   const account = currentAccount();
@@ -2238,12 +2292,16 @@ function main() {
     }
     if (!config.rules.length) {
       console.log('保護ルール: なし。config.json に rules を書くまで何も拒否しません。');
+      // 「なし」で打ち切らない。同じツリーを worklog 側が別の設定で伏せている場合、
+      // ここで終わると「保護は外したはずなのに作業ログだけ見えない」の原因に届かない
+      printWorklogRestrictions(account, config.rules);
       return;
     }
     for (const r of config.rules) {
       const state = r.allow.includes(account) ? '許可' : '拒否';
       console.log(`  ${r.tree}  allow=[${r.allow.join(', ')}]  → 現在は ${state}`);
     }
+    printWorklogRestrictions(account, config.rules);
     const probe = process.argv[3];
     if (probe) {
       // 解除も反映して判定する。status は「なぜ拒否される/されない」を確かめに来る入り口なので、

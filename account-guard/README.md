@@ -182,6 +182,38 @@ swap.js のコピーのパスを渡せば対象を差し替えられるので、
 
 `config.example.json` がひな形。
 
+### 姉妹ツール claude-worklog との関係(設定は別物)
+
+同じツリーを守る仕組みが 2 つあり、**設定ファイルは別**。片方だけ書き換えると
+「解除したつもり」で残る。
+
+| ツール | 守るもの | 設定 |
+| --- | --- | --- |
+| account-guard | そのツリーへの**操作**を遮断する(読み書きとも) | `~/.claude/account-guard/config.json` の `rules` |
+| [claude-worklog](../claude-worklog/README.md) | そのツリーの**作業ログの表示**を伏せる(記録は残す) | `~/.claude/worklog/config.json` の `restrictedTrees` |
+
+分けてあるのは守備範囲が違うため。「操作は許すが作業ログは伏せる」も、その逆も書ける。
+account-guard は worklog が無くても動く(依存しない)。
+
+**保護を掛けるときも外すときも両方に書く。** `guard status` は worklog 側の制限も並べ、
+こちらに対応する保護ルールが無ければ警告する:
+
+```
+$ guard status
+アカウント: max
+設定: C:\Users\<name>\.claude\account-guard\config.json
+保護ルール: なし。config.json に rules を書くまで何も拒否しません。
+作業ログの読み出し制限 (claude-worklog): 1 件  C:\Users\<name>\.claude\worklog\config.json
+  C:/org-tree  allow=[team]  → 現在は 非表示
+    ! account-guard 側には対応する保護ルールがありません(解除したつもりなら worklog 側の設定も外してください)
+```
+
+読むのは**表示のためだけ**で、ガードの判定には一切影響しない。worklog を入れていなければ
+何も出さない。逆方向は worklog が記録を伏せたときに同じ食い違いを注記する。
+
+一時解除(`guard unlock`)は worklog 側には及ばない。あちらは表示の制限で、こちらの解除は
+セッション単位で消える一時的な状態なので、追随させると解除が終わったあとの状態が読めなくなる。
+
 ## インストール
 
 1. 上記の `config.json` を作る。

@@ -1,5 +1,6 @@
 {
   "_comment": "~/.claude/account-guard/config.json として配置する。tree はそのアカウント専用にしたいディレクトリ、allow は触れてよいアカウント(.credentials.json の subscriptionType の値。組織は team、個人は pro / max)。allow に含まれないアカウントでログイン中は、このツリーへの操作が拒否される。",
+  "_comment_worklog": "同じツリーを守る仕組みがもう一つある。claude-worklog の ~/.claude/worklog/config.json の restrictedTrees は、そのツリーの作業ログの表示を伏せる(操作の遮断はしない)。設定は別なので連動しない — 保護を掛けるときも外すときも両方に書く。片方だけになっていると guard status が警告する。",
   "rules": [
     {
       "tree": "C:/work/org-only",

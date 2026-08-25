@@ -176,6 +176,81 @@ function blockedTrees(cfg, account) {
     .filter((r) => !(Array.isArray(r.allow) && r.allow.includes(account)));
 }
 
+// ---------------------------------------------------------------------------
+//  姉妹ツール account-guard との照合
+//
+//  同じツリーを、account-guard は「操作の遮断」で、worklog は「記録の読み出し制限」で
+//  守る。守備範囲が違うので設定は意図して別ファイルに分けてあるが、書く内容の形は同じ
+//  ({ tree, allow })なので、片方だけ書き換えて「解除したつもり」になる事故が起きる。
+//  実際に起きた: account-guard の rules を空にしたあとも worklog 側が残っていて、
+//  ツリー保護は外したはずなのに作業ログだけ伏せられ続け、原因を調べ直すことになった。
+//  そのとき手掛かりが無かったのは、伏せた理由が「別アカウント専用のツリーだから」としか
+//  出ず、どちらの設定が効いているのかが利用者から見えなかったため。
+//
+//  ここでするのは照合と報告だけで、判定には一切影響しない。相手の設定を判定に使うと、
+//  worklog 単体で使う構成が account-guard に依存し、「操作は許すが表示は伏せる」という
+//  正当な使い分けも書けなくなる。照合できないときは黙る(下の guardActiveRules 参照)。
+// ---------------------------------------------------------------------------
+
+const GUARD_CONFIG_PATH = path.join(CLAUDE_DIR, 'account-guard', 'config.json');
+
+// account-guard 側で「現在のアカウントに対して今まさに効いている」保護ルールを返す。
+// 照合できないときは null を返し、呼び出し側は何も言わない:
+//  - 未作成(ENOENT): account-guard を入れていない構成。「向こうは保護していない」のは
+//    事実だが、使ってもいないツールの名前を出しても混乱を増やすだけ
+//  - 読めない/壊れている: account-guard は壊れた設定を全拒否として扱う(fail-closed)ので、
+//    実際には保護が最も強く効いている。「保護されていない」と案内すると正反対になる
+// 一時解除(unlocks.json)は見ない。あれはセッション単位で消える一時的な状態で、
+// ここで知らせたいのは「設定を片方だけ書き換えたまま放置している」という恒久的な食い違い
+function guardActiveRules(account) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(GUARD_CONFIG_PATH, 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.rules)) return null;
+  return parsed.rules
+    .filter((r) => r && typeof r.tree === 'string' && r.tree)
+    .filter((r) => !(Array.isArray(r.allow) && r.allow.includes(account)));
+}
+
+// worklog 側だけが伏せているツリー(= account-guard 側では今のアカウントで素通しになる
+// ツリー)を返す。account-guard の判定も前方一致なので、親ツリーが保護されていれば配下も
+// 保護される。cwdUnderTree で向き(worklog の tree が向こうの tree の内側)を固定するのは
+// そのため。逆向きまで一致にすると、向こうが子ディレクトリだけを守っている構成を
+// 「同じものを守っている」と誤って扱ってしまう
+function guardMismatchedTrees(blocked, account) {
+  // BLOCK_ALL(設定を読めず全伏せ)は特定のツリーの話ではないので照合の対象外
+  const trees = blocked.filter((r) => !r.all).map((r) => r.tree);
+  if (!trees.length) return [];
+  const guard = guardActiveRules(account);
+  if (!guard) return [];
+  return trees.filter((t) => !guard.some((g) => cwdUnderTree(t, g.tree)));
+}
+
+// 食い違いを利用者向けの一文にする。既存の注記の末尾へ連結して使う。
+// 平常時(両方に書いてある・account-guard 未導入・向こうが壊れている)は null を返すので、
+// 注記の文面は今までどおり一言一句変わらない
+function guardMismatchNote(cfg, account) {
+  // 設定を読めていないときの理由は「別アカウント専用のツリーだから」ではないので、
+  // ツリー単位の照合を持ち出しても噛み合わない(restrictionNote 側が本当の理由を出す)
+  if (cfg.configBroken) return null;
+  const mismatched = guardMismatchedTrees(blockedTrees(cfg, account), account);
+  if (!mismatched.length) return null;
+  return `この制限は worklog 側の設定によるもの: ${CONFIG_PATH} の restrictedTrees`
+    + `\n  (${mismatched.join(' / ')} は account-guard 側では保護されていない`
+    + ' — 解除するつもりなら両方から外す)';
+}
+
+// 注記に食い違いの説明を足す。2行目以降を字下げするのは、呼び出し側がどこも
+// `! ${note}` の形で1行の記号を付けて出しているため(そのままだと続きの行が行頭に付く)
+function withGuardMismatch(note, cfg, account) {
+  if (!note) return note;
+  const extra = guardMismatchNote(cfg, account);
+  return extra ? `${note}\n  ${extra}` : note;
+}
+
 // key のログファイルに現れる cwd のうち、「本来その key の記録である」と確認できる
 // ものだけを集めてキャッシュする。isKeyBlocked は制限ルールごとに keyUnderTree を呼び、
 // filterVisibleKeys は全キーに対して走り、restrictionNote は同じコマンド内でさらに
@@ -327,7 +402,9 @@ function restrictionNote(cfg, account, hiddenSessions = 0, scopeKeys = null) {
   if (hiddenSessions > 0) parts.push(`${hiddenSessions} 件のセッション`);
   // 「と 」の後ろのスペースは意図的。各パートが数字で始まるので、詰めると
   // 「プロジェクトと2 件」と不揃いになる
-  return parts.length ? `別アカウント専用のツリーのため ${parts.join('と ')}を表示していません` : null;
+  return parts.length
+    ? withGuardMismatch(`別アカウント専用のツリーのため ${parts.join('と ')}を表示していません`, cfg, account)
+    : null;
 }
 
 // フック実行中の失敗は表に出せない(出すとセッションが汚れる)ので、ここだけに残す
@@ -1566,7 +1643,10 @@ function explicitProjectRestrictionNote(flags, cfg, account) {
     const candidates = matchProjectKeys(raw, explicit).filter((k) => raw.includes(k));
     if (!candidates.length) return null;
     if (!candidates.every((k) => isKeyBlocked(k, blocked))) return null; // 一部でも見えるなら通常表示になる
-    return `「${explicit}」は別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。`;
+    return withGuardMismatch(
+      `「${explicit}」は別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。`,
+      cfg, account,
+    );
   }
   // --project 省略時(既定の cwd 解決)。--all は listProjectKeys() で既にキー単位
   // フィルタ済みで、件数ベースの restrictionNote が別途案内するのでここでは扱わない。
@@ -1574,7 +1654,10 @@ function explicitProjectRestrictionNote(flags, cfg, account) {
   if (flags.all) return null;
   const cwdKey = repoKey(one(flags, 'cwd', process.cwd()));
   if (!isKeyBlocked(cwdKey, blocked)) return null;
-  return '現在のディレクトリは別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。';
+  return withGuardMismatch(
+    '現在のディレクトリは別アカウント専用のツリーのため表示していない。許可されたアカウントに切り替えれば見られる。',
+    cfg, account,
+  );
 }
 
 function cmdList(flags) {
@@ -1875,13 +1958,19 @@ function resolveMoveKey(spec, allowNew) {
   // (「ディスク上に無い」の警告は出るが move 自体は実行されてしまう)。
   // 制限が理由だと分かっている場合はキーを捏造せず、ここで move そのものを拒否する
   const cfg = loadConfig();
-  const blocked = blockedTrees(cfg, currentAccount());
+  const account = currentAccount();
+  const blocked = blockedTrees(cfg, account);
   // 設定を読めていないときは BLOCK_ALL で全部伏せているので、理由は「別アカウント専用の
   // ツリーだから」ではない。そのまま案内するとアカウント切り替えという効かない対処へ
   // 誘導してしまうため、restrictionNote / explicitProjectRestrictionNote と同じ区別をする
   const denyReason = (what) => (cfg.configBroken
     ? `設定 ${CONFIG_PATH} を読めないため、安全側に倒して全ての記録を伏せている。設定を直してからやり直す。`
-    : `${what}は別アカウント専用のツリーのため move できない。許可されたアカウントに切り替える。`);
+    // 一覧側と同じ食い違いの説明を添える。ここは「なぜ動かせないのか」を調べる入り口の
+    // 一つで、設定を片方だけ外したまま来た利用者が最初にぶつかる場所でもある
+    : withGuardMismatch(
+      `${what}は別アカウント専用のツリーのため move できない。許可されたアカウントに切り替える。`,
+      cfg, account,
+    ));
   if (blocked.length) {
     const raw = listProjectKeysRaw();
     const rawHit = raw.includes(spec) ? [spec] : raw.filter((k) => k.toLowerCase().includes(spec.toLowerCase()));
