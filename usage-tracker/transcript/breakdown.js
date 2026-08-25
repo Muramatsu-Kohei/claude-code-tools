@@ -41,6 +41,18 @@ function bump(key, u) {
     for await (const o of records(f)) {
       // セッション単位の判定を抜けた個別レコードの保険。期間(minT/maxT)にも入れない。
       if (isNonInteractive(o)) { sdkRecords++; continue; }
+
+      // id → ツール名の対応表だけは、複製されたレコードからも作る。--resume した先では
+      // 複製された tool_use が(元と同じ uuid なので)下の重複排除で落ちる一方、続きとして
+      // 新しく書かれた tool_result は別の uuid を持つので残る。対応表を先に作らないと、
+      // その tool_result の文字数がツール名を引けず unknown に落ちる。
+      // 複製から作っても id → 名前の対応は同じなので、表が汚れることはない。
+      if (o.type === 'assistant' && o.message && Array.isArray(o.message.content)) {
+        for (const c of o.message.content) {
+          if (c.type === 'tool_use' && c.id) toolName.set(c.id, c.name || 'unknown');
+        }
+      }
+
       // 継いだセッションへ複製されたレコード。トークンにも tool_result の文字数にも入れない。
       if (isDuplicate(o)) continue;
       if (o.timestamp) {
@@ -49,13 +61,8 @@ function bump(key, u) {
       }
 
       // アシスタント応答の usage は収集器に預け、読み終えてから応答ごとに 1 回だけ足す。
-      // tool_use の対応表(下)はブロックごとに別物なので、こちらに通してはいけない。
+      // tool_use の対応表(上)はブロックごとに別物なので、こちらに通してはいけない。
       if (o.type === 'assistant') usages.add(o);
-      if (o.type === 'assistant' && o.message && Array.isArray(o.message.content)) {
-        for (const c of o.message.content) {
-          if (c.type === 'tool_use' && c.id) toolName.set(c.id, c.name || 'unknown');
-        }
-      }
 
       // ユーザー側の tool_result のサイズ = 「外から流し込まれた情報量」
       if (o.type === 'user' && o.message && Array.isArray(o.message.content)) {
@@ -67,8 +74,9 @@ function bump(key, u) {
         }
       }
     }
-    for (const { usage, model, isSub } of usages.entries()) {
-      bump(`${modelKey(model)}|${isSub ? 'subagent' : 'main'}`, usage);
+    // 層は収集器が返す値(パス または フラグ)。外側の isSub を隠さないよう名前を変える。
+    for (const { usage, model, isSub: entrySub } of usages.entries()) {
+      bump(`${modelKey(model)}|${entrySub ? 'subagent' : 'main'}`, usage);
     }
   }
 

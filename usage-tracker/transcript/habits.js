@@ -202,6 +202,12 @@ function activeMinutes(sorted, gapMin) {
       // 入ったのに委譲 0 本」になり、そこから割る「1 委譲あたり N ターン」が実態より大きく出る。
       if (isSub && !sawSubRecord) { sawSubRecord = true; stat.subAgentRuns++; }
 
+      // レコード 1 件ごとの層。ファイル単位の isSub とレコードの isSidechain の論理和で、
+      // 収集器(lib.js の makeUsageCollector)が返す値と同じ意味になる。上の subAgentRuns
+      // だけは「サブの transcript が何本あったか」というファイル単位の数え上げなので、
+      // ここではなく isSub を使う。
+      const recSub = isSub || !!o.isSidechain;
+
       stat.events.push(t);
       stat.hours[new Date(t).getHours()]++;
       if (!stat.perProject.has(project)) stat.perProject.set(project, []);
@@ -217,7 +223,7 @@ function activeMinutes(sorted, gapMin) {
       if (t < s.first) s.first = t;
       if (t > s.last) s.last = t;
 
-      if (o.type === 'user' && !isSub) {
+      if (o.type === 'user' && !recSub) {
         // isMeta はハーネスが挿入したレコードの印(スキル本文の展開、システム側の注記)。
         // content が文字列か配列かで意味が変わるものではないので、形に依らず先に落とす。
         // 配列側を見落としていたとき、スキル本文が人間の送信として数えられ、実データで
@@ -257,7 +263,7 @@ function activeMinutes(sorted, gapMin) {
         // 参照)。ターン数も usage と同じ id 単位で数える。tool_use はレコードごとに別の
         // ブロックなので、そちらは毎回数えてよい。
         const firstSeen = usages.add(o);
-        if (!isSub) {
+        if (!recSub) {
           if (firstSeen) stat.assistantTurns++;
           if (Array.isArray(o.message.content)) {
             for (const x of o.message.content) {
@@ -288,17 +294,17 @@ function activeMinutes(sorted, gapMin) {
     }
 
     // usage 由来の値(コスト・到達コンテキスト長)は読み終えてから応答ごとに 1 回だけ足す。
-    // 層はファイル単位の isSub で決める(収集器にも同じ値を渡してあるので判定は一致する)。
-    // 走査中のターン・ツールの数え分けも同じ isSub なので、ファイル内で非対称にならない。
+    // 層は収集器が返す値を使う。走査中の recSub と同じ「パス または フラグ」なので、
+    // ファイル内で非対称にならず、sessions.js / turncost.js とも同じ意味になる。
     const sess = stat.sessions.get(sid);
-    for (const { usage, model } of usages.entries()) {
+    for (const { usage, model, isSub: entrySub } of usages.entries()) {
       const c = cost(model, usage);
       stat.totalCost += c;
       bump(stat.models, String(model || 'unknown'), 1);
-      if (isSub) stat.subCost += c;
+      if (entrySub) stat.subCost += c;
       if (!sess) continue;   // 期間内のレコードが 1 件も無ければセッションは作られていない
       sess.cost += c;
-      if (!isSub) {
+      if (!entrySub) {
         sess.mainTurns++;
         sess.maxCtx = Math.max(sess.maxCtx, ctxLen(usage));
       }

@@ -874,6 +874,47 @@ const tcnf = run('turncost.js', homeNF);
 check('turncost.js: フラグを持つレコードに usage が無くてもサブと判定する',
   !/^300K〜/m.test(tcnf.out), tcnf.out);
 
+// habits.js も同じ扱いに揃える。ここだけパス単位の isSub でコストを付けていると、
+// 同じ応答を sessions.js は sub、habits.js は main と数え、maxCtx の帯まで食い違う。
+const hbis = run('habits.js', homeIS, ['--since', '2026-01-01', '--json']);
+let pis = null;
+try { pis = JSON.parse(hbis.out); } catch (e) { pis = null; }
+check('habits.js: インラインの sidechain のコストを subCost に付ける',
+  pis && pis.delegation.subCost > 0 && pis.delegation.subTurns === 1,
+  pis ? JSON.stringify(pis.delegation).slice(0, 160) : hbis.out.slice(0, 200));
+// このサンドボックスには user レコードが無いので sends は 0 に潰れ、turnsPerMsg の分母は
+// 1 になる。つまりこの値がそのままメインの assistantTurns。
+check('habits.js: インラインの sidechain をメインのターンに数えない',
+  pis && pis.input.turnsPerMsg === 1,
+  pis ? JSON.stringify(pis.input).slice(0, 160) : hbis.out.slice(0, 200));
+
+// ---- --resume した先の tool_result がツール名を引けるか ----
+// 継いだファイルでは、複製された tool_use は uuid が一致して重複排除で落ちる一方、
+// 続きとして新しく書かれた tool_result は別の uuid を持つので残る。id → ツール名の
+// 対応表を複製から作らないと、その文字数が unknown に落ちる。
+console.log('\n--resume 後の tool_result');
+const homeTR = sandbox('resume-toolname');
+const trTs = t => `2026-07-01T${t}:00.000Z`;
+const trUse = {
+  type: 'assistant', timestamp: trTs('00:00'), uuid: 'tr-a1',
+  message: {
+    id: 'msg_tr', model: 'claude-opus-5', usage: usage({ input_tokens: 10, output_tokens: 10 }),
+    content: [{ type: 'tool_use', id: 'tr1', name: 'Grep', input: {} }],
+  },
+};
+writeTranscript(homeTR, 'proj', 'dddd4444-0000-0000-0000-000000000001', [
+  trUse,
+  { type: 'user', timestamp: trTs('00:01'), uuid: 'tr-u1', message: { content: [{ type: 'tool_result', tool_use_id: 'tr1', content: 'x'.repeat(2000) }] } },
+]);
+// 継いだ先: tool_use は複製(uuid 同じ)、tool_result は続きなので新しい uuid。
+writeTranscript(homeTR, 'proj', 'dddd4444-0000-0000-0000-000000000002', [
+  trUse,
+  { type: 'user', timestamp: trTs('01:01'), uuid: 'tr-u2', message: { content: [{ type: 'tool_result', tool_use_id: 'tr1', content: 'y'.repeat(3000) }] } },
+]);
+const bdtr = run('breakdown.js', homeTR);
+check('breakdown.js: 継いだ先の tool_result もツール名で数える(unknown に落ちない)',
+  /^Grep\s+5 K chars/m.test(bdtr.out) && !/^unknown\s/m.test(bdtr.out), bdtr.out);
+
 // ---- 走査中に消えたファイル ----
 // セッションの後片付けや別の Claude Code の実行でファイルが消えることがある。
 // 1 ファイルの消失で全体の走査を捨てないよう、読み出しの ENOENT だけを飲む。
