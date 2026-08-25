@@ -145,17 +145,61 @@ function makeNonInteractiveFilter() {
     return cache.get(p);
   };
   return (file) => {
-    // サブエージェントの transcript は projects/<プロジェクト>/<親セッションID>/subagents/
-    // に置かれ、非対話の印は付かない(印は親のレコードにある)。親だけ落として子を読むと、
-    // 除外したはずの架空プロジェクトが委譲の数え上げごと復活するので、子は親を見て落とす。
-    // 走査順は保証されないため「既に見た親」ではなく親ファイルを直接引く。
-    const parts = path.relative(ROOT, file).split(path.sep);
-    const i = parts.indexOf('subagents');
-    if (i > 0) {
-      const parent = path.join(ROOT, ...parts.slice(0, i - 1), `${parts[i - 1]}.jsonl`);
-      return judge(parent) ? 'parent' : null;
-    }
+    // サブエージェントの transcript に非対話の印は付かない(印は親のレコードにある)。
+    // 親だけ落として子を読むと、除外したはずの架空プロジェクトが委譲の数え上げごと復活する
+    // ので、子は親を見て落とす。走査順は保証されないため「既に見た親」ではなく親ファイルを
+    // 直接引く。パスの解釈は fileIdentity() に集約してある。
+    const { parentFile } = fileIdentity(file);
+    if (parentFile) return judge(parentFile) ? 'parent' : null;
     return judge(file) ? 'session' : null;
+  };
+}
+
+// パスからファイルの帰属(プロジェクト・セッションID・メイン/サブ)を決める。集計 4 本が
+// ここを共有する。サブエージェントの transcript は
+// projects/<プロジェクト>/<親セッションID>/subagents/agent-*.jsonl に置かれるので、
+// dirname をそのままプロジェクト名にすると "subagents" という架空のプロジェクトができ、
+// サブエージェントへの指示が人間の送信として数えられてしまう。パスの第 1 要素を実プロジェクト
+// とし、サブ側は親セッション ID に合流させる。
+//
+// メイン/サブをレコードの isSidechain でなくパスで決めるのは、フラグがレコード単位で
+// 欠落しうるのに対し、パスはファイル単位で必ず決まるため(README の「サブエージェントの
+// transcript は親セッションの下にある」を参照)。実測ではサブ側 1048 ファイルの assistant
+// レコードすべてにフラグが付いており、逆に親ファイル側のインライン sidechain は 0 件だった
+// ので、現データでは両者は一致する。将来ずれても取りこぼさない側に倒してある。
+function fileIdentity(file) {
+  const parts = path.relative(ROOT, file).split(path.sep);
+  const i = parts.indexOf('subagents');
+  const isSub = i > 0;
+  return {
+    project: parts[0],
+    sid: isSub ? parts[i - 1] : path.basename(file, '.jsonl'),
+    isSub,
+    // 非サブでは null。呼び出し側が「サブかどうか」をこの有無で判定できるようにしている。
+    parentFile: isSub ? path.join(ROOT, ...parts.slice(0, i - 1), `${parts[i - 1]}.jsonl`) : null,
+  };
+}
+
+// --resume / fork は前の会話をそのまま次のファイルへ複製する。複製はレコードの uuid まで
+// 一致するので、全ファイルで共有する集合に通してレコードごと落とす。集計 4 本で共有する。
+//
+// message.id で落としてはいけない: 1 回の応答は複数レコードに分かれて同じ message.id を
+// 持つため、正当な分割まで消える(分割の除去は makeUsageCollector の仕事)。逆に assistant の
+// ターンだけ直すと、送信数(user レコード)とツール回数(tool_use)は複製されたまま残り、
+// 「1 送信あたりのターン数」は分母だけが水増しされて実態より小さく出る。だからレコード単位。
+//
+// どちらのセッションに計上されるかは読み順で決まるので、セッション単位の内訳は継ぎ元に寄る。
+// 総計を正しくすることを優先した扱い。実測は 30 日で 8 ファイル / 632 レコード / $19。
+// 期間を最大に取ると全 transcript 分の uuid を抱えるが、実測 1436 本 / 19.6 万レコードで
+// 15.5 万件・ヒープ 84MB。線形に増えるだけなので放置してよい。
+function makeUuidDedupe() {
+  const seen = new Set();
+  // 戻り値 true = 複製なので飛ばす。uuid を持たないレコードは判別できないので残す側に倒す。
+  return (o) => {
+    if (!o || o.uuid == null) return false;
+    if (seen.has(o.uuid)) return true;
+    seen.add(o.uuid);
+    return false;
   };
 }
 
@@ -177,8 +221,14 @@ function makeNonInteractiveFilter() {
 // 依存しない形にしておくため(実データではどちらでも同じ結果になる)。
 //
 // 跨ファイルの複製(--resume / fork)は uuid でレコードごと落とす対象で、こちらの仕事では
-// ない。message.id を跨ファイルに広げると正当な分割まで消える。
-function makeUsageCollector() {
+// ない(makeUuidDedupe)。message.id を跨ファイルに広げると正当な分割まで消える。
+//
+// fileIsSub には fileIdentity().isSub を渡す。層の判定をパス優先にしつつ、レコードの
+// isSidechain との論理和を取るのは、将来また親ファイルへインラインで書かれる形に戻っても
+// メインに数え込まないため。和を id 単位で単調に畳むので、分割された応答の一部にしか
+// フラグが無くても走査順に依存しない(先頭だけ見ると、完成形が捨てられてプレースホルダの
+// output_tokens: 2 だけが「ほぼ 0 円のメインターン」として残る形になりうる)。
+function makeUsageCollector(fileIsSub = false) {
   const byId = new Map();
   let anon = 0;
   return {
@@ -192,9 +242,10 @@ function makeUsageCollector() {
       const u = msg.usage || null;
       const prev = byId.get(key);
       if (!prev) {
-        byId.set(key, { usage: u, model: msg.model, isSub: !!o.isSidechain });
+        byId.set(key, { usage: u, model: msg.model, isSub: fileIsSub || !!o.isSidechain });
         return true;
       }
+      if (o.isSidechain) prev.isSub = true;
       if (u && (!prev.usage || (u.output_tokens || 0) > (prev.usage.output_tokens || 0))) {
         prev.usage = u;
         prev.model = msg.model;
@@ -217,5 +268,5 @@ function warnUnknownModels() {
 module.exports = {
   PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records,
   isNonInteractive, isNonInteractiveSession, makeNonInteractiveFilter, makeUsageCollector,
-  warnUnknownModels,
+  fileIdentity, makeUuidDedupe, warnUnknownModels,
 };

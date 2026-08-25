@@ -1,7 +1,7 @@
 'use strict';
 // コンテキスト長そのものが1ターンの単価をどれだけ押し上げるかを測る。
 // セッションを「どこで切るべきか」の閾値を決めるのが目的。
-const { cost, ctxLen, modelKey, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, warnUnknownModels } = require('./lib');
+const { cost, ctxLen, modelKey, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels } = require('./lib');
 
 const BUCKETS = [
   [0, 30e3, '〜30K'], [30e3, 60e3, '30〜60K'], [60e3, 100e3, '60〜100K'],
@@ -23,6 +23,9 @@ const HEAVY_FROM = 150e3;
   // 非対話実行(claude -p / SDK)は集計から外す。判定は lib.js に集約してある。
   const nonInteractiveFile = makeNonInteractiveFilter();
   let sdkSessions = 0, sdkRecords = 0;
+  // --resume / fork の複製をレコードごと落とす(規則と実測は lib.js の makeUuidDedupe)。
+  // 複製が残るとターン数が水増しされ、割って出す 1 ターンあたりの単価まで狂う。
+  const isDuplicate = makeUuidDedupe();
   // Opus 系メインスレッドのみに絞る(モデル混在による単価差を排除する)
   for (const f of transcriptFiles()) {
     const sdk = nonInteractiveFile(f);
@@ -30,16 +33,22 @@ const HEAVY_FROM = 150e3;
     // 親が非対話のサブエージェント。isSidechain で弾けているように見えるが、あれはレコード
     // 単位のフラグで欠落する行があるため、ファイル単位で落としておく。
     if (sdk) continue;
+    // メイン/サブもパスで決める(規則は lib.js の fileIdentity)。レコードの isSidechain で
+    // 弾いていた頃は、分割された応答の完成形だけにフラグが付いていると完成形が捨てられ、
+    // 残ったプレースホルダ(output_tokens: 2)が「ほぼ 0 円のメインターン」として帯に入り、
+    // 単価を押し下げうる形になっていた。層はファイル単位で決めれば取りこぼしが無い。
+    const { isSub } = fileIdentity(f);
     // 分割された同一応答の二重計上を防ぐ(規則と実測は lib.js の makeUsageCollector を参照)。
-    // ターン数が水増しされていると、割って出す 1 ターンあたりの単価まで狂う。
-    const usages = makeUsageCollector();
+    const usages = makeUsageCollector(isSub);
     for await (const o of records(f)) {
       if (isNonInteractive(o)) { sdkRecords++; continue; }
-      if (o.type !== 'assistant' || o.isSidechain || !o.message || !o.message.usage) continue;
+      if (isDuplicate(o)) continue;
+      if (o.type !== 'assistant' || !o.message || !o.message.usage) continue;
       usages.add(o);
     }
     // 応答ごとに 1 回だけ帯に入れる(ファイルを読み終えてから回す)。
-    for (const { usage, model } of usages.entries()) {
+    for (const { usage, model, isSub: entrySub } of usages.entries()) {
+      if (entrySub) continue;   // サブエージェントは対象外(メインの単価を測っている)
       if (!modelKey(model).startsWith('opus')) continue;
       const ctx = ctxLen(usage);
       const i = BUCKETS.findIndex(([lo, hi]) => ctx >= lo && ctx < hi);

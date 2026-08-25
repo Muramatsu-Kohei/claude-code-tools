@@ -7,8 +7,7 @@
 //
 // 使い方: node habits.js [--days 14] [--gap 分] [--since YYYY-MM-DD] [--json]
 const fs = require('fs');
-const path = require('path');
-const { ROOT, cost, ctxLen, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, warnUnknownModels } = require('./lib');
+const { cost, ctxLen, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels } = require('./lib');
 
 // 作業時間の既定のギャップ閾値(分)。これより長い無操作は「作業していない」とみなす。
 // 5分だと 1 回の長い実行待ちで切れ、60分だと食事や仮眠を含んでしまう。
@@ -157,16 +156,9 @@ function activeMinutes(sorted, gapMin) {
   // --resume / fork でセッションを継ぐと、前の会話のレコードが丸ごと次のファイルへ
   // 複製される。複製はレコードの uuid まで同じなので(実測 30 日で 632 件。食い違うのは
   // sessionId などの帰属メタと、書き直されている usage だけ)、レコード単位でここに落とす。
-  // message.id ではなく uuid で見る: 1 回の応答は content ブロックごとに複数レコードへ
-  // 分かれ、その全部が同じ message.id を持つので、id で落とすと正当な分割まで消える。
-  // レコードごと落とせば、ターンとコストだけでなく送信数・ツール回数・時間軸も同じ規則で
-  // 複製が外れる。assistant のターンだけ直すと、1 送信あたりの分母(送信)は水増しされた
-  // まま分子(ターン)だけが正され、継いだセッションほど値が小さく出る非対称になる。
-  // どちらのセッションに計上されるかは読み順で決まるので、セッション単位の内訳は継ぎ元に
-  // 寄る。総計を正しくすることを優先した扱い。
-  // 期間を最大(--days 3650)に取ると全 transcript 分の uuid を抱えるが、実測では
-  // 1436 本 / 19.6 万レコードで 15.5 万件・ヒープ 84MB。線形に増えるだけなので放置してよい。
-  const seenUuids = new Set();
+  // --resume / fork で継いだセッションへ複製されたレコードを落とす(規則と実測は lib.js の
+  // makeUuidDedupe を参照)。集計 4 本で共有する。
+  const isDuplicate = makeUuidDedupe();
   // 非対話実行のファイル単位の判定(親を見て子を落とす分も含めて lib.js に集約してある)。
   const nonInteractiveFile = makeNonInteractiveFilter();
 
@@ -177,14 +169,9 @@ function activeMinutes(sorted, gapMin) {
     try { mtime = fs.statSync(f).mtimeMs; } catch { continue; }
     if (mtime < since) continue;
 
-    // サブエージェントの transcript は projects/<プロジェクト>/<親セッションID>/subagents/agent-*.jsonl
-    // に置かれる。dirname をそのままプロジェクト名にすると "subagents" という架空の
-    // プロジェクトができ、しかもサブエージェントへの指示が人間の送信として数えられてしまう。
-    // パスの第1要素を実プロジェクトとし、サブ側は親セッションに合流させて別枠で数える。
-    const parts = path.relative(ROOT, f).split(path.sep);
-    const project = parts[0];
-    const isSub = parts.includes('subagents');
-    const sid = isSub ? parts[1] : path.basename(f, '.jsonl');
+    // プロジェクト・セッションID・メイン/サブはパスから決める(規則は lib.js の
+    // fileIdentity を参照)。サブ側は親セッションに合流させ、別枠で数える。
+    const { project, sid, isSub } = fileIdentity(f);
 
     // 非対話実行(claude -p / SDK)のセッションは丸ごと外す。レコード単位の判定だけだと
     // entrypoint を持たない型(queue-operation)が残り、時間軸と架空プロジェクトに現れる。
@@ -201,8 +188,8 @@ function activeMinutes(sorted, gapMin) {
     // 「1 委譲あたり 67 ターン」という実態と違う読みになる。
     let sawSubRecord = false;
     // 同じ API 応答から分割されたレコードを二重に数えないための収集器(ファイル内で閉じる)。
-    // 跨ファイルの複製は上の seenUuids がレコードごと落とすので、こちらは分割の除去に徹する。
-    const usages = makeUsageCollector();
+    // 跨ファイルの複製は上の isDuplicate がレコードごと落とすので、こちらは分割の除去に徹する。
+    const usages = makeUsageCollector(isSub);
 
     try {
       for await (const o of records(f)) {
@@ -211,12 +198,9 @@ function activeMinutes(sorted, gapMin) {
         // セッション単位の判定を抜けた個別レコードの保険(対話セッションに sdk 由来の
         // レコードが混ざる形が将来出ても、ここで落ちる)。
         if (isNonInteractive(o)) { stat.sdkSkipped++; continue; }
-        // 継いだセッションへ複製されたレコード(上の seenUuids のコメント参照)。
-        // 時間軸に入る前に落とすので、複製は送信・ターン・ツール・時間帯のどれにも残らない。
-        if (o.uuid != null) {
-          if (seenUuids.has(o.uuid)) continue;
-          seenUuids.add(o.uuid);
-        }
+        // 継いだセッションへ複製されたレコード。時間軸に入る前に落とすので、複製は
+        // 送信・ターン・ツール・時間帯のどれにも残らない。
+        if (isDuplicate(o)) continue;
         // 読み終わりでなくレコードを見た時点で数える。ENOENT で途中終了したファイルは
         // 下の catch が continue するので、後置きだと「ターンとコストは入ったのに委譲 0 本」
         // になり、そこから割る「1 委譲あたり N ターン」が実態より大きく出る。
@@ -316,8 +300,8 @@ function activeMinutes(sorted, gapMin) {
     }
 
     // usage 由来の値(コスト・到達コンテキスト長)は読み終えてから応答ごとに 1 回だけ足す。
-    // 収集器の isSub はレコードの isSidechain だが、ここではパスで決まる isSub を使う:
-    // フラグは欠落する行があり、ファイル単位で決まるパスの方が取りこぼしが無い。
+    // 層はファイル単位の isSub で決める(収集器にも同じ値を渡してあるので判定は一致する)。
+    // 走査中のターン・ツールの数え分けも同じ isSub なので、ファイル内で非対称にならない。
     const sess = stat.sessions.get(sid);
     for (const { usage, model } of usages.entries()) {
       const c = cost(model, usage);

@@ -732,6 +732,100 @@ check('breakdown.js: 分割された応答の output を二重にも過小にも
 check('breakdown.js: 非対話実行のファイルを本数からも外す',
   /^ファイル数: 1$/m.test(bdx.out), bdx.out);
 
+// ---- パスで決まる帰属(fileIdentity) ----
+// 層をレコードの isSidechain でなくパスで決める規則。ここが崩れると、サブエージェントの
+// transcript が架空プロジェクト "subagents" のセッションとして現れる/メイン層に混ざる。
+const idSub = lib.fileIdentity(path.join(lib.ROOT, 'proj', 'sid-1', 'subagents', 'agent-7.jsonl'));
+check('fileIdentity: サブは実プロジェクトと親セッションIDに合流する',
+  idSub.project === 'proj' && idSub.sid === 'sid-1' && idSub.isSub === true,
+  JSON.stringify(idSub));
+check('fileIdentity: サブの親ファイルパスを返す',
+  idSub.parentFile === path.join(lib.ROOT, 'proj', 'sid-1.jsonl'), String(idSub.parentFile));
+const idMain = lib.fileIdentity(path.join(lib.ROOT, 'proj', 'sid-2.jsonl'));
+check('fileIdentity: メインはファイル名がセッションID、親は無い',
+  idMain.project === 'proj' && idMain.sid === 'sid-2' && idMain.isSub === false && idMain.parentFile === null,
+  JSON.stringify(idMain));
+
+// ---- サブエージェントの層はフラグでなくパスで決まる(集計 3 本) ----
+// 実測ではサブ側 1048 ファイルの assistant レコードすべてに isSidechain が付いているが、
+// フラグはレコード単位なので欠落しうる。フラグを **付けない** サブの transcript を置いて、
+// パスだけで層が決まることを確かめる。合わせて、サブのコストが親セッションに合流すること
+// (合流させないと mainTurns 0 で落ち、委譲ぶんが総額から丸ごと消える)も見る。
+console.log('\nサブエージェントの層はパスで決まる');
+const homeLP = sandbox('layer-by-path');
+const LPSID = 'ffffffff-1111-0000-0000-000000000001';
+const yTs = t => `2026-03-01T${t}:00.000Z`;
+writeTranscript(homeLP, 'proj', LPSID, [
+  { type: 'user', timestamp: yTs('00:00'), uuid: 'y-u1', message: { content: '調べて' } },
+  {
+    type: 'assistant', timestamp: yTs('00:01'), uuid: 'y-a1', isSidechain: false,
+    message: {
+      id: 'msg_y_main', model: 'claude-opus-5',
+      usage: usage({ cache_read_input_tokens: 40e3, output_tokens: 10 }),
+      content: [{ type: 'tool_use', id: 'y1', name: 'Task', input: {} }],
+    },
+  },
+]);
+// isSidechain を付けない。パスで落ちなければ「メインの 300K 超のターン」として現れる。
+writeTranscript(homeLP, path.join('proj', LPSID, 'subagents'), 'agent-y1', [
+  {
+    type: 'assistant', timestamp: yTs('00:02'), uuid: 'y-a2',
+    message: {
+      id: 'msg_y_sub', model: 'claude-opus-5',
+      usage: usage({ input_tokens: 1e6, output_tokens: 100 }),
+    },
+  },
+]);
+
+const sslp = run('sessions.js', homeLP);
+check('sessions.js: サブの transcript を架空プロジェクトのセッションにしない',
+  /^セッション数: 1 /m.test(sslp.out) && !/subagents/.test(sslp.out), sslp.out);
+check('sessions.js: サブのコストとターンが親セッションに合流する($5 を落とさない)',
+  /総換算コスト: \$5$/m.test(sslp.out) && /^proj\s+ffffffff\s+1\s+1\s+40K\s+0\s+1\s/m.test(sslp.out), sslp.out);
+
+const tclp = run('turncost.js', homeLP);
+check('turncost.js: フラグの無いサブのターンが帯に現れない',
+  /^30〜60K\s+1\s/m.test(tclp.out) && !/^300K〜/m.test(tclp.out), tclp.out);
+
+const bdlp = run('breakdown.js', homeLP);
+check('breakdown.js: フラグが無くてもパスで subagent 層に入る',
+  /^opus-5\s+subagent\s+1\s+100\s/m.test(bdlp.out) && /^opus-5\s+main\s+1\s+10\s/m.test(bdlp.out), bdlp.out);
+
+// ---- 跨ファイルの複製を集計 3 本でも落とす ----
+// --resume / fork は前の会話をそのまま次のファイルへ複製し、uuid まで一致する。
+// 落とさないとセッションもターンもトークンも二重に数える(実測 30 日で 632 レコード)。
+console.log('\n跨ファイルの複製(--resume / fork)');
+const homeXD = sandbox('crossfile-dup-3');
+const zTs = t => `2026-04-01T${t}:00.000Z`;
+const zRecs = [
+  { type: 'user', timestamp: zTs('00:00'), uuid: 'z-u1', message: { content: '送信' } },
+  {
+    type: 'assistant', timestamp: zTs('00:01'), uuid: 'z-a1', isSidechain: false,
+    message: {
+      id: 'msg_z', model: 'claude-opus-5',
+      usage: usage({ input_tokens: 1e6, output_tokens: 0 }),
+      content: [{ type: 'tool_use', id: 'z1', name: 'Read', input: {} }],
+    },
+  },
+];
+writeTranscript(homeXD, 'proj', 'aaaa1111-0000-0000-0000-000000000001', zRecs);
+// 継いだ先。レコードは完全な複製(帰属メタだけが違い、uuid は書き換わらない)。
+writeTranscript(homeXD, 'proj', 'aaaa1111-0000-0000-0000-000000000002', zRecs);
+
+const ssxd = run('sessions.js', homeXD);
+check('sessions.js: 複製されたセッションを 2 本に数えない',
+  /^セッション数: 1  総換算コスト: \$5$/m.test(ssxd.out), ssxd.out);
+check('sessions.js: 複製されたツール呼び出しを二重に数えない',
+  /重いツール呼び出し: 1 回/.test(ssxd.out), ssxd.out);
+
+const tcxd = run('turncost.js', homeXD);
+check('turncost.js: 複製されたターンを帯に二重に入れない',
+  /^300K〜\s+1\s+\$5\s/m.test(tcxd.out), tcxd.out);
+
+const bdxd = run('breakdown.js', homeXD);
+check('breakdown.js: 複製されたレコードのトークンを二重に数えない',
+  /^opus-5\s+main\s+1\s+0\s+1000000\s/m.test(bdxd.out), bdxd.out);
+
 // ---- transcript が無い環境 ----
 console.log('\ntranscript が無い場合');
 const homeC = path.join(BASE, 'empty');
