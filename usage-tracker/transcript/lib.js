@@ -113,17 +113,19 @@ function isNonInteractiveSession(file, bytes = 65536) {
     // 末尾は次の読み出し位置で切れている可能性があるので捨てる(ファイル全体を読み切った
     // ときは最終行が空になるだけなので、同じ扱いでよい)。
     lines.pop();
-    let parsed = 0;
     for (const line of lines) {
       if (!line.trim()) continue;
       let o;
       try { o = JSON.parse(line); } catch { continue; }
-      parsed++;
       if (isNonInteractive(o)) return true;
     }
     // 1 行も解せなかった場合(1 レコードが 64KB を超える、壊れたファイル)は判定材料が
-    // 無いので、従来どおり文字列一致に落とす。取りこぼすより誤検知する側に倒す。
-    return parsed === 0 && /"entrypoint"\s*:\s*"sdk-cli"/.test(head);
+    // 無いので false に倒す。ここで文字列一致に落とすと、上で消したはずの誤検知が
+    // いちばん危ない条件で戻ってくる: 先頭レコードが 64KB を超えるのは巨大な貼り付けや
+    // tool_result を含むレコードで、印の文字列が本文に混ざりやすいのはまさにその型。
+    // 実測でも該当ファイルは 15 本あり、すべて対話セッションだった。非対話実行の
+    // transcript は短いので、この分岐に落ちること自体がほぼない。
+    return false;
   } catch {
     return false;   // 読めないファイルはここで判定せず、本処理側の例外処理に任せる
   } finally {

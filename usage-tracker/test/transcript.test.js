@@ -376,6 +376,25 @@ fs.writeFileSync(fieldFile, JSON.stringify({
 }) + '\n', 'utf8');
 check('entrypoint がレコードのフィールドにあるセッションは従来どおり非対話と判定する',
   lib.isNonInteractiveSession(fieldFile) === true);
+// 先頭レコードが 64KB を超えると読んだ範囲に改行が1つも収まらず、1行も JSON として
+// 解せない(parsed === 0)。この分岐は以前「文字列一致にフォールバック」しており、
+// 巨大な貼り付けやツール結果を含むレコードほど誤検知しやすい最悪のケースだった。
+// 今は false に倒す実装なので、ネストした entrypoint 文字列があっても非対話と判定しない。
+const hugeFile = path.join(libDir, 'huge.jsonl');
+fs.writeFileSync(hugeFile, JSON.stringify({
+  type: 'user', timestamp: at('00:00'),
+  message: {
+    content: [
+      {
+        type: 'tool_result', tool_use_id: 't1',
+        content: { note: '貼り付けた transcript レコードの例', entrypoint: 'sdk-cli', other: 'x' },
+      },
+      { type: 'text', text: 'y'.repeat(70000) }, // レコード全体を 64KB 超に押し上げるパディング
+    ],
+  },
+}) + '\n', 'utf8');
+check('先頭レコードが64KBを超えるとき、本文中の entrypoint 文字列があっても非対話と判定しない',
+  lib.isNonInteractiveSession(hugeFile) === false);
 
 // ---- 非対話セッションのサブエージェント transcript もファイルごと外す ----
 // 親セッション(entrypoint: sdk-cli)を落としても、配下の subagents/agent-*.jsonl を
@@ -437,23 +456,32 @@ check('二重計上を防いでもツール回数は全ブロックを数える'
   pu && pu.tools.total === 2, pu ? `tools=${pu.tools.total}` : '');
 
 // ---- セッションをまたぐ同一 message.id を二重に数えない ----
-// --resume や fork でセッションを継ぐと、前の会話のレコードが message.id・usage ごと
-// 新しいファイルへ複製される。既出 id の Set をファイル内で閉じると、複製先の
-// ファイルで同じ id がまた「初出」として数えられ、ターンもコストも二重になる。
-console.log('\nhabits.js (跨ファイルの message.id 重複)');
+// --resume や fork でセッションを継ぐと、前の会話のレコードが丸ごと次のファイルへ
+// 複製される。複製はレコードの uuid まで同一なので(message.id では分割レコードの
+// 判定にしか使えず、送信数やツール回数は直らない非対称になっていた)、uuid の Set を
+// ファイルループの外に置いてレコード単位で落とす。user・tool_use を含む assistant の
+// 両方を複製し、ターン・コストだけでなく送信数・ツール回数からも外れることを確かめる。
+console.log('\nhabits.js (跨ファイルの uuid 重複)');
 const homeV = sandbox('habits-dup-crossfile');
 const crossUsage = usage({ input_tokens: 1e6, output_tokens: 0 }); // opus-5 の in 単価どおり $5 になる値
-const crossRec = (time) => ({
-  type: 'assistant', timestamp: at(time), isSidechain: false,
-  message: { id: 'msg_resume_1', model: 'claude-opus-5', usage: crossUsage },
+// 同一ファイル内では uuid は重複しない(実測 0 件)ので、user と assistant で別の uuid を振る。
+const crossUTurn = (time) => ({ type: 'user', timestamp: at(time), uuid: 'uuid-cross-u1', message: { content: '送信' } });
+const crossATurn = (time) => ({
+  type: 'assistant', timestamp: at(time), isSidechain: false, uuid: 'uuid-cross-a1',
+  message: {
+    id: 'msg_resume_1', model: 'claude-opus-5', usage: crossUsage,
+    content: [{ type: 'tool_use', id: 'cx1', name: 'Bash', input: {} }],
+  },
 });
 writeTranscript(homeV, 'proj', 'eeeeeeee-0000-0000-0000-000000000001', [
-  uTurn('00:00', '送信'),
-  crossRec('00:01'),
+  crossUTurn('00:00'),
+  crossATurn('00:01'),
 ]);
-// --resume / fork で継いだ先の別ファイル。同じ message.id・同じ usage を持つ複製レコード。
+// --resume / fork で継いだ先の別ファイル。user・assistant とも同じ uuid を持つ完全な複製
+// (sessionId などの帰属メタは変わるが、レコードの uuid 自体は書き換わらない)。
 writeTranscript(homeV, 'proj', 'eeeeeeee-0000-0000-0000-000000000002', [
-  crossRec('01:00'),
+  crossUTurn('01:00'),
+  crossATurn('01:01'),
 ]);
 const hbv = run('habits.js', homeV, ['--since', '2026-01-01', '--json']);
 let pv = null;
@@ -464,6 +492,12 @@ check('跨ファイルの複製ターンを assistantTurns で二重に数えな
 check('跨ファイルの複製ターンをコストで二重に数えない',
   pv && Math.abs(pv.cost - 5) < 1e-9,
   pv ? `cost=${pv.cost}` : hbv.out.slice(0, 200));
+check('跨ファイルの複製が送信数からも外れる(送信1回)',
+  pv && pv.input.sends === 1 && pv.input.userMsgs === 1,
+  pv ? JSON.stringify(pv.input) : hbv.out.slice(0, 200));
+check('跨ファイルの複製がツール回数からも外れる(ツール1回)',
+  pv && pv.tools.total === 1,
+  pv ? JSON.stringify(pv.tools) : hbv.out.slice(0, 200));
 
 // ---- スキル起動のサブエージェントも本数として数える ----
 // Agent/Task の tool_use は親の transcript にしか現れないので、スキルやワークフローが
@@ -490,6 +524,11 @@ const bothArgs = run('habits.js', homeH, ['--days', '2', '--since', '2026-01-01'
 check('--days と --since の併用を弾く', bothArgs.code === 2, `code=${bothArgs.code} err=${bothArgs.err.slice(0, 120)}`);
 const fracDays = run('habits.js', homeH, ['--days', '2.5']);
 check('小数の --days を弾く', fracDays.code === 2, `code=${fracDays.code} err=${fracDays.err.slice(0, 120)}`);
+// --days は 1〜DAYS_MAX(3650)に制限されているのに --since に下限が無いと、
+// --since 1970-01-01 のような指定で日別テーブルが数万行に膨らむ。DAYS_MAX より
+// 明らかに古い日付(西暦2000年、26年前 > 3650日)で弾かれることを確かめる。
+const tooOldSince = run('habits.js', homeH, ['--since', '2000-01-01']);
+check('古すぎる --since を弾く', tooOldSince.code === 2, `code=${tooOldSince.code} err=${tooOldSince.err.slice(0, 160)}`);
 
 // ---- 指定した --gap が振れ幅の表に現れる ----
 const hbg = run('habits.js', homeH, ['--since', '2026-01-01', '--gap', '12', '--json']);

@@ -83,6 +83,13 @@ function parseArgs(argv) {
       die(`--since に存在しない日付が指定されています: ${o.since}`);
     }
     if (dt.getTime() > Date.now()) die(`--since が未来の日付です: ${o.since}`);
+    // --days と同じ上限を --since にも掛ける。掛けないと --days 側で防いだ「期間の指定
+    // ミスが巨大な出力と巨大な配列確保になる」経路が素通りする(--since 1970-01-01 で
+    // 日別テーブルが 2 万行を超え、そのほぼ全部が無操作日になる実例)。
+    const oldest = startOfDay(Date.now()) - (DAYS_MAX - 1) * 86400000;
+    if (dt.getTime() < oldest) {
+      die(`--since が古すぎます(${DAYS_MAX} 日以内を指定してください): ${o.since}`);
+    }
   }
   return o;
 }
@@ -141,14 +148,17 @@ function activeMinutes(sorted, gapMin) {
   };
   const bump = (m, k, n = 1) => m.set(k, (m.get(k) || 0) + n);
 
-  // 同じ API 応答から分割されたレコードを二重に数えないための既出 id。ファイル内で閉じず
-  // 全ファイルで共有する: --resume や fork でセッションを継いだとき、前の会話のレコードが
-  // message.id・usage・timestamp ごと新しいファイルへ複製される(実測: あるセッションは
-  // 118 件すべてが継ぎ先に完全一致で入っていた)。跨ファイルの重複は 30 日で 167/39746 =
-  // 0.42% と小さいが、放置するとターン数もコストもそのぶん水増しされる。
+  // --resume / fork でセッションを継ぐと、前の会話のレコードが丸ごと次のファイルへ
+  // 複製される。複製はレコードの uuid まで同じなので(実測 30 日で 632 件。食い違うのは
+  // sessionId などの帰属メタと、書き直されている usage だけ)、レコード単位でここに落とす。
+  // message.id ではなく uuid で見る: 1 回の応答は content ブロックごとに複数レコードへ
+  // 分かれ、その全部が同じ message.id を持つので、id で落とすと正当な分割まで消える。
+  // レコードごと落とせば、ターンとコストだけでなく送信数・ツール回数・時間軸も同じ規則で
+  // 複製が外れる。assistant のターンだけ直すと、1 送信あたりの分母(送信)は水増しされた
+  // まま分子(ターン)だけが正され、継いだセッションほど値が小さく出る非対称になる。
   // どちらのセッションに計上されるかは読み順で決まるので、セッション単位の内訳は継ぎ元に
   // 寄る。総計を正しくすることを優先した扱い。
-  const seenMsgIds = new Set();
+  const seenUuids = new Set();
   // 親セッションが非対話かの判定結果(同じ親の下に子が何本もあるので覚えておく)。
   const sdkParent = new Map();
   const isSdkParent = (p) => {
@@ -190,6 +200,9 @@ function activeMinutes(sorted, gapMin) {
     // 実際のサブエージェントは 1014 本あり、subTurns はそちらを含むので、両方出さないと
     // 「1 委譲あたり 67 ターン」という実態と違う読みになる。
     let sawSubRecord = false;
+    // 同じ API 応答から分割されたレコードを二重に数えないための既出 id(ファイル内で閉じる)。
+    // 跨ファイルの複製は上の seenUuids がレコードごと落とすので、こちらは分割の除去に徹する。
+    const seenMsgIds = new Set();
 
     try {
       for await (const o of records(f)) {
@@ -198,6 +211,12 @@ function activeMinutes(sorted, gapMin) {
         // セッション単位の判定を抜けた個別レコードの保険(対話セッションに sdk 由来の
         // レコードが混ざる形が将来出ても、ここで落ちる)。
         if (isNonInteractive(o)) { stat.sdkSkipped++; continue; }
+        // 継いだセッションへ複製されたレコード(上の seenUuids のコメント参照)。
+        // 時間軸に入る前に落とすので、複製は送信・ターン・ツール・時間帯のどれにも残らない。
+        if (o.uuid != null) {
+          if (seenUuids.has(o.uuid)) continue;
+          seenUuids.add(o.uuid);
+        }
         // 読み終わりでなくレコードを見た時点で数える。ENOENT で途中終了したファイルは
         // 下の catch が continue するので、後置きだと「ターンとコストは入ったのに委譲 0 本」
         // になり、そこから割る「1 委譲あたり N ターン」が実態より大きく出る。
