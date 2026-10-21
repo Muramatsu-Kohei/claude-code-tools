@@ -33,15 +33,16 @@ function modelKey(model) {
   return String(model || 'unknown').replace('claude-', '').replace(/-\d{8}$/, '');
 }
 
-// 単価表に無いモデルは 0 円として扱うしかないが、黙って落とすと集計漏れに気づけない。
-// 見かけた名前を控えておき、呼び出し側が最後に warnUnknownModels() で報告する。
 // 単価表に無い課金対象のモデルか。cost() の $0 扱いと model-watch.js の通知は同じ判定を使う
-// (別々に持つと、片方だけ NOT_BILLED や modelKey の規則が変わって食い違う)。
+// (別々に持つと、片方だけ NOT_BILLED や modelKey の規則が変わって食い違う)。副作用は持たない。
 function isUnknownModel(model) {
   const key = modelKey(model);
   return !PRICE[key] && !NOT_BILLED.has(key);
 }
 
+// 単価表に無いモデルは 0 円として扱うしかないが、黙って落とすと集計漏れに気づけない。
+// 見かけた名前を控えておき、呼び出し側が最後に warnUnknownModels() で報告する。
+// 記録するかどうかは isUnknownModel() に任せる(課金対象外の <synthetic> などは記録しない)。
 function cost(model, u) {
   const key = modelKey(model);
   const p = PRICE[key];
@@ -52,7 +53,7 @@ function cost(model, u) {
   // 段階料金のモデルは prompt 長で単価表ごと切り替える(超えた分だけでなく全体が高い側になる)
   const r = p.long && ctxLen(u) > p.long.over ? p.long : p;
   // TTL 別の内訳(cache_creation.ephemeral_1h_*)があれば 1 時間 TTL 分を 2x で数える。Claude Code の
-  // 書き込みは大半(実測で約 8 割)が 1 時間 TTL なので、合計を一律 1.25x にすると書き込みを過少に
+  // 書き込みは大半が 1 時間 TTL なので、合計を一律 1.25x にすると書き込みを過少に
   // 見積もる。ただし 5 分 TTL も混ざるので「全部 1h」とみなしてもいけない。
   // 合計(cache_creation_input_tokens)を正とし、5 分 TTL 分は合計から 1h 分を引いて出す。内訳が
   // 空・一部欠け・合計と不一致でも、書き込み量は ctxLen() と同じ合計に揃う(欠けた分は安い 5m 側)。

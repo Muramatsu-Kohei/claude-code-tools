@@ -202,9 +202,12 @@ node test/transcript.test.js   # 1 ファイルだけ実行したいとき
 上の警告は集計を回さないと出ない。5.5 世代の追加漏れでは、Opus / Sonnet 5.5 のコストが数週間 $0 のまま気づかれなかった。`model-watch.js` は SessionStart フックとして毎セッションの入口で transcript を見て、単価表に無いモデルがあれば `systemMessage`(ユーザー向け)と `additionalContext`(Claude 向け)で知らせる。
 
 - 判定は `lib.js` の `isUnknownModel()` で、`cost()` が $0 にする条件と同じ。見るのは assistant レコードの `message.model` だけ(Agent ツールの入力にある `"model":"sonnet"` のようなエイリアスは拾わない)。
-- ファイルごとに前回読み終えたバイト位置を `~/.claude/usage-tracker/model-watch.json` に持ち、差分だけを読む。普段は 0.2 秒以内。初回と状態ファイルが壊れたときだけ全量を読む(30 日分の約 380MB で約 1.2 秒)。書き込み途中で改行が来ていない行は、次回に読む。
+- ファイルごとに前回読み終えたバイト位置・サイズ・更新時刻・先頭のハッシュを `~/.claude/usage-tracker/model-watch.json` に持つ。サイズも更新時刻も変わっていないファイルは開かず、伸びたファイルは差分だけを読む。前回の位置より短くなったか先頭が変わったファイルは、作り直されたとみなして最初から読む。初回と状態ファイルが壊れたときだけ全量を読む。書き込み途中で改行が来ていない行は、次回に読む。
+- 件数は「何本の transcript に出たか」で数える。レコード数で数えると、作り直しの読み直しや `--resume` / fork で複製された履歴で、同じ応答を二重に数えるため。
 - 見つけたモデルは、単価表に足されるまで毎セッション通知し続ける。足せば次のセッションで消える。
-- 登録は `guard-hooks-snippet.json` の `SessionStart` を `~/.claude/settings.json` にマージする(下の guard.js と同じ手順)。自分の不具合でセッション開始を妨げないよう、例外は stderr に出して終了コード 0 で抜ける。
+- `matcher` は付けず、`startup` 以外(`resume` / `clear` / `compact`)でも走らせる。`clear` と `compact` の後はコンテキストが作り直されて前の警告が消えているので、入れ直すのが正しい。差分読みなので、何度走っても軽い。
+- 登録は `guard-hooks-snippet.json` の `SessionStart` を `~/.claude/settings.json` にマージする(下の guard.js と同じ手順)。自分の不具合でセッション開始を妨げないよう、例外は stderr に出して終了コード 1 で抜ける(SessionStart フックは 2 以外の終了コードではブロックしない。0 にすると不具合が誰にも見えない)。
+- 環境変数 `USAGE_TRACKER_MODEL_WATCH_STATS=1` を付けると、開いたファイル数と読んだバイト数を stderr に出す(差分読みが効いているかの確認用)。
 
 コスト換算は API 定価で、キャッシュは input 単価に倍率を掛けて数える(`lib.js` の `cost()`)。
 
