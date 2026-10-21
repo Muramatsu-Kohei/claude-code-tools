@@ -1039,7 +1039,7 @@ console.log('\nmodel-watch.js');
 
   // 単価表に足された(= 既知になった)ものは通知から消える。既知のキーを状態に仕込んで確かめる
   const s = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-  s.unknown['opus-5'] = { files: ['x.jsonl'], firstSeen: '2026-01-01T00:00:00.000Z' };
+  s.unknown['opus-5'] = { files: [path.join(proj, `${id1}.jsonl`)] };
   fs.writeFileSync(stateFile, JSON.stringify(s));
   const fourth = watch(home);
   check('単価表にあるモデルは通知と状態から消える',
@@ -1065,11 +1065,13 @@ console.log('\nmodel-watch.js');
   check('初回の後に作られたファイルは先頭から読む', /madeup-3\(transcript 1 本\)/.test(seventh), seventh);
   check('同じモデルが別の transcript にも出たら本数が増える', /madeup-2\(transcript 2 本\)/.test(seventh), seventh);
 
-  // 前回の位置より短く作り直されたファイルは、先頭から読み直す。同じファイルの読み直しで本数は増えない
+  // 前回の位置より短く作り直されたファイルは、先頭から読み直す。作り直しで含まなくなったモデルは
+  // そのファイルの分だけ数から外れる(madeup-1 は id1 にしか無かったので消え、madeup-2 は proj2 の 1 本が残る)
   writeTranscript(home, proj, id1, [{ type: 'assistant', message: { model: 'claude-rewritten-1', usage: usage() } }]);
   const shrunk = warnOf(watch(home));
   check('前回より短く作り直されたファイルは先頭から読む', /rewritten-1\(transcript 1 本\)/.test(shrunk), shrunk);
-  check('同じファイルを読み直しても本数は増えない', /madeup-1\(transcript 1 本\)/.test(shrunk), shrunk);
+  check('作り直しで含まなくなったモデルは、そのファイルの分だけ数から外れる',
+    !/madeup-1/.test(shrunk) && /madeup-2\(transcript 1 本\)/.test(shrunk), shrunk);
   // 同じ長さ以上で作り直された場合はサイズでは分からないので、先頭の内容で見分ける
   writeTranscript(home, proj, id1, [
     { type: 'assistant', message: { model: 'claude-rewritten-2', usage: usage() } },
@@ -1117,6 +1119,38 @@ console.log('\nmodel-watch.js');
   check('時間切れなら残りを次回に回し、その旨を stats に出す',
     late.code === 0 && !/budget-1/.test(warnOf(late)) && /時間切れで \d+ 本を次回に回した/.test(late.err), JSON.stringify(late));
   check('時間切れで回したファイルは次回に読む', /budget-1\(transcript 1 本\)/.test(warnOf(next)), next.out);
+  const idleLate = watch(home, { USAGE_TRACKER_MODEL_WATCH_BUDGET_MS: '0', USAGE_TRACKER_MODEL_WATCH_STATS: '1' });
+  check('時間切れでも、変わっていないファイルは次回に回した数に入れない', idleLate.code === 0 && !/時間切れ/.test(idleLate.err), idleLate.err);
+
+  // 巨大な 1 本の途中で期限が来たら、そこで打ち切って読めた行までの位置を残し、次回に続きを読む。
+  // 時刻を差し替える preload で、huge の最初の区切りを読んだ直後に期限切れにする
+  const stubLate = path.join(BASE, 'model-watch-late.js');
+  fs.writeFileSync(stubLate, [
+    "const fs = require('fs');",
+    "let fd = -1; let late = false;",
+    "const open = fs.openSync;",
+    "fs.openSync = function (p, ...a) { const r = open.call(this, p, ...a); if (String(p).includes('huge')) fd = r; return r; };",
+    "const read = fs.readSync;",
+    "fs.readSync = function (f, ...a) { const r = read.call(this, f, ...a); if (f === fd) late = true; return r; };",
+    "const now = Date.now;",
+    "Date.now = () => now() + (late ? 1e9 : 0);",
+  ].join('\n'));
+  const fileH = path.join(home, '.claude', 'projects', 'proj5', 'huge-bbbbbbbb-0000-0000-0000-00000000000b.jsonl');
+  fs.mkdirSync(path.dirname(fileH), { recursive: true });
+  fs.writeFileSync(fileH, rec('claude-huge-1')
+    + JSON.stringify({ type: 'assistant', pad: 'z'.repeat(9 * 1024 * 1024), message: { model: 'claude-opus-5-5', usage: usage() } }) + '\n'
+    + rec('claude-huge-2'));
+  const cut = watch(home, { USAGE_TRACKER_MODEL_WATCH_STATS: '1' }, ['-r', stubLate]);
+  const resumed = warnOf(watch(home));
+  check('1 本の途中で期限が来たら打ち切り、読めた分だけ通知して次回に回す',
+    cut.code === 0 && /huge-1\(transcript 1 本\)/.test(warnOf(cut)) && !/huge-2/.test(warnOf(cut)) && /時間切れで 1 本/.test(cut.err),
+    JSON.stringify({ ...cut, out: warnOf(cut) }));
+  check('途中で打ち切ったファイルは次回に続きから読み、前半の分も数え続ける',
+    /huge-1\(transcript 1 本\)/.test(resumed) && /huge-2\(transcript 1 本\)/.test(resumed), resumed);
+  // 消えた transcript は数から外れ、どこにも残っていないモデルは通知が止まる
+  fs.rmSync(fileH);
+  const gone = warnOf(watch(home));
+  check('消えた transcript にしか無かったモデルは通知から消える', !/huge-/.test(gone) && /budget-1/.test(gone), gone);
 
   // 障害の注入。fs を差し替える preload を -r で読ませる
   const stub = path.join(BASE, 'model-watch-stub.js');
@@ -1144,10 +1178,30 @@ console.log('\nmodel-watch.js');
   const recovered = warnOf(watch(home));
   check('読めなかったファイルは次回に読む', /locked-1\(transcript 1 本\)/.test(recovered) && /vanish-1\(transcript 1 本\)/.test(recovered), recovered);
 
+  // ENOENT 以外で読めないディレクトリ(削除待ち・ロック中の EPERM)があっても止めない。配下の記録は
+  // 前回のまま残す(落とすと通知の本数から外れ、次回に全部を先頭から読み直す)
+  const stubDenied = path.join(BASE, 'model-watch-denied.js');
+  fs.writeFileSync(stubDenied, [
+    "const fs = require('fs');",
+    "const rd = fs.readdirSync;",
+    "fs.readdirSync = function (p, ...a) { if (String(p).includes('proj-denied')) { const e = new Error('EPERM'); e.code = 'EPERM'; throw e; } return rd.call(this, p, ...a); };",
+  ].join('\n'));
+  writeTranscript(home, 'proj-denied', 'bbbbbbbb-0000-0000-0000-00000000000c', [
+    { type: 'assistant', message: { model: 'claude-denied-1', usage: usage() } },
+  ]);
+  watch(home);
+  const denied = watch(home, {}, ['-r', stubDenied]);
+  check('読めないディレクトリがあっても止めず、配下で見つけていたモデルの通知を続ける',
+    denied.code === 0 && /denied-1\(transcript 1 本\)/.test(warnOf(denied)) && /locked-1/.test(warnOf(denied)), JSON.stringify(denied));
+  check('読めなかったディレクトリを stderr に出す', /読めなかった transcript: .*proj-denied.*EPERM/.test(denied.err), denied.err);
+  const afterDenied = stats(home);
+  check('読めなかったディレクトリ配下は、読めるようになっても先頭から読み直さない',
+    afterDenied && afterDenied.opened === 0, JSON.stringify(afterDenied));
+
   // 引き継いだキーは modelKey() 済み。もう一度 modelKey() に通すと日付が落ちて単価表のキーに化け、
   // まだ $0 で数えられているモデルの通知が消える(opus-5-20260101 → opus-5)
   const sk = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-  sk.unknown['opus-5-20260101'] = { files: ['y.jsonl'], firstSeen: '2026-01-01T00:00:00.000Z' };
+  sk.unknown['opus-5-20260101'] = { files: [path.join(proj, `${id1}.jsonl`)] };
   fs.writeFileSync(stateFile, JSON.stringify(sk));
   const carried = warnOf(watch(home));
   check('引き継いだキーを正規化し直さない', /opus-5-20260101\(transcript 1 本\)/.test(carried), carried);
@@ -1183,6 +1237,19 @@ console.log('\nmodel-watch.js');
   const quiet = watch(homeQ);
   check('通知が無いときの保存失敗は終了コード 1 と stderr で見せる',
     quiet.code === 1 && quiet.out === '' && /^model-watch: 状態を保存できなかった/m.test(quiet.err), JSON.stringify(quiet));
+  // 一時的な rename の失敗(同時起動の競合やウイルス対策ソフトのロック)はやり直して保存し、エラーにしない
+  const stubRename = path.join(BASE, 'model-watch-rename.js');
+  fs.writeFileSync(stubRename, [
+    "const fs = require('fs');",
+    "let n = 0;",
+    "const rn = fs.renameSync;",
+    "fs.renameSync = function (...a) { if (n++ === 0) { const e = new Error('EPERM'); e.code = 'EPERM'; throw e; } return rn.apply(this, a); };",
+  ].join('\n'));
+  const stateQ = path.join(homeQ, '.claude', 'usage-tracker', 'model-watch.json');
+  fs.rmSync(stateQ, { recursive: true });
+  const retried = watch(homeQ, {}, ['-r', stubRename]);
+  check('一時的な rename の失敗はやり直して保存し、エラーにしない',
+    clean(retried) && fs.statSync(stateQ).isFile(), JSON.stringify(retried));
 
   const none = path.join(BASE, 'model-watch-none');
   fs.mkdirSync(none, { recursive: true });

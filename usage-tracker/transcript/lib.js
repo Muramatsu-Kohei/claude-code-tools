@@ -85,11 +85,17 @@ function ctxLen(u) {
 
 // 走査中に消えたサブディレクトリ(別セッションの後片付けや cleanupPeriodDays の削除)は飛ばす。
 // 1 つの消失で全体を落とさないため。起点の dir が無いのは呼び出し側の誤りなので投げる。
-function walk(dir, out = []) {
+// onError を渡すと、それ以外の理由(ロック中・削除待ちの EPERM など)で読めないサブディレクトリも
+// 飛ばして onError(dir, err) で知らせる。集計スクリプトは渡さない(黙って取りこぼすと集計が小さく出る)。
+function walk(dir, out = [], onError) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, e.name);
     if (e.isDirectory()) {
-      try { walk(p, out); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+      try { walk(p, out, onError); } catch (err) {
+        if (err.code === 'ENOENT') continue;
+        if (!onError) throw err;
+        onError(p, err);
+      }
     }
     else if (e.name.endsWith('.jsonl')) out.push(p);
   }

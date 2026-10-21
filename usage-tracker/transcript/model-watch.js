@@ -27,10 +27,13 @@ const CHUNK = 8 * 1024 * 1024;
 // 超えて書き足された場合は、先頭もサイズも手がかりにならないので、前回の位置の直前で見分ける。
 const EDGE = 256;
 // 走査に使ってよい時間。フックの timeout(guard-hooks-snippet.json の 30 秒)で殺されると状態が
-// 保存されず、次のセッションも同じ全量走査からやり直して永久に進まない。超えたら残りは次回に回し、
-// 読めた分の位置を保存する。実測では 400MB・250 本の初回走査が約 2 秒。環境変数はテスト用。
+// 保存されず、次のセッションも同じ全量走査からやり直して永久に進まない。超えたら 1 本の途中でも
+// 打ち切り、読めた分の位置を保存して残りは次回に回す。環境変数はテスト用。
 const BUDGET_ENV = process.env.USAGE_TRACKER_MODEL_WATCH_BUDGET_MS;
 const BUDGET_MS = BUDGET_ENV && Number(BUDGET_ENV) >= 0 ? Number(BUDGET_ENV) : 20000;
+// 途中で打ち切ったファイルのサイズとして記録する値。実際のサイズと一致しないので、次回は
+// 「変わっていない」と見なされず、記録した位置から続きを読む
+const UNFINISHED = -1;
 
 // 前回の状態。無い・壊れている・形が違うときは初回として全量を読む
 function loadState() {
@@ -46,12 +49,20 @@ function loadState() {
 // 途中まで書かれた JSON を次回読んで初回扱いになるよりは、どちらか一方が勝つ方がよい
 // (負けた側の位置が古くても、次回に同じ範囲を読み直すだけ。件数は transcript の本数で
 // 数えているので、読み直しで増えることはない)。
+// Windows では相手の rename やウイルス対策ソフトが掴んでいる間、rename が EPERM などで失敗する。
+// 一時的なものなので少し待って数回やり直し、それでも駄目なときだけ失敗として扱う。
+const TRANSIENT = new Set(['EPERM', 'EBUSY', 'EACCES']);
 function saveState(s) {
   fs.mkdirSync(path.dirname(STATE), { recursive: true });
   const tmp = `${STATE}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(s), 'utf8');
-    fs.renameSync(tmp, STATE);
+    for (let i = 0; ; i++) {
+      try { fs.renameSync(tmp, STATE); break; } catch (e) {
+        if (i >= 2 || !TRANSIENT.has(e.code)) throw e;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      }
+    }
   } finally {
     fs.rmSync(tmp, { force: true });
   }
@@ -66,23 +77,28 @@ function rangeHash(fd, from, to) {
 const headOf = (fd, pos) => rangeHash(fd, 0, Math.min(EDGE, pos));
 const tailOf = (fd, pos) => rangeHash(fd, Math.max(0, pos - EDGE), pos);
 
-// prev(前回の記録)から先の、完結した行だけを処理して新しい記録を返す。末尾の改行で
-// 終わっていない行は書き込み中のセッションのものなので読まずに残し、次回そこから読み直す。
-function scan(file, st, prev, onModel, stats) {
+// prev(前回の記録)から先の、完結した行だけを読み、新しい記録・出てきたモデル・先頭から読んだかを返す。
+// 末尾の改行で終わっていない行は書き込み中のセッションのものなので読まずに残し、次回そこから読み直す。
+function scan(file, st, prev, deadline, stats) {
   const fd = fs.openSync(file, 'r');
   try {
     const size = st.size;
+    const models = new Set();
     let pos = 0;
     // 前回の位置より短い、または読み終えた範囲の先頭か末尾が変わった = 作り直された。最初から読み直す。
     // 末尾のハッシュを持たない古い状態も一度だけ読み直しになる(本数で数えるので件数は増えない)
     if (prev && prev.pos <= size && headOf(fd, prev.pos) === prev.head && tailOf(fd, prev.pos) === prev.tail) {
       pos = prev.pos;
     }
+    const start = pos;
+    let unfinished = false;
     // 改行が来るまでの断片。改行が来たときに 1 回だけ連結する(1 行が何チャンクにも
     // またがるときに、チャンクごとにつなぎ直すと長さの 2 乗でコピーが増える)
     let carry = [];
     let carryLen = 0;
     while (pos < size) {
+      // 期限は区切りごとに見る(巨大な 1 本で timeout を超えないため)。1 区切りは必ず読んで前に進める
+      if (pos > start && Date.now() >= deadline) { unfinished = true; break; }
       const buf = Buffer.alloc(Math.min(CHUNK, size - pos));
       const n = fs.readSync(fd, buf, 0, buf.length, pos);
       if (n <= 0) break;
@@ -100,11 +116,13 @@ function scan(file, st, prev, onModel, stats) {
         if (!line.includes('"assistant"')) continue;
         let o;
         try { o = JSON.parse(line); } catch (e) { continue; }
-        if (o.type === 'assistant' && o.message && o.message.model) onModel(o.message.model);
+        if (o.type === 'assistant' && o.message && o.message.model) models.add(o.message.model);
       }
     }
+    if (unfinished) stats.deferred++;
     const end = pos - carryLen;
-    return { pos: end, size, mtime: st.mtimeMs, head: headOf(fd, end), tail: tailOf(fd, end) };
+    const rec = { pos: end, size: unfinished ? UNFINISHED : size, mtime: st.mtimeMs, head: headOf(fd, end), tail: tailOf(fd, end) };
+    return { rec, models, fromStart: start === 0 };
   } finally {
     fs.closeSync(fd);
   }
@@ -116,6 +134,8 @@ function main() {
   if (!fs.existsSync(ROOT)) return;
   const deadline = Date.now() + BUDGET_MS;
   const prev = loadState();
+  // files のキーは ROOT からの相対パスで、unknown の各モデルが持つ transcript の ID と同じもの。
+  // 揃えておくと、最後に「まだ記録に残っている transcript」だけを数える処理が突き合わせ 1 回で済む
   const state = { files: {}, unknown: {} };
   const stats = { bytes: 0, opened: 0, deferred: 0, failed: [] };
   // モデルごとの出現 transcript。走査中は Set で持ち(重複判定を線形探索にしない)、保存時に配列へ戻す
@@ -124,48 +144,65 @@ function main() {
   // 前回までに見つけたものは単価表に足されていれば消し、残りは引き継ぐ。キーは modelKey() 済みなので
   // isUnknownKey() で見る(isUnknownModel() に通すと modelKey() がもう一度掛かって別のキーになりうる)
   for (const [key, v] of Object.entries(prev.unknown)) {
-    if (isUnknownKey(key) && v && Array.isArray(v.files)) {
-      state.unknown[key] = v;
-      seen.set(key, new Set(v.files));
-    }
+    if (isUnknownKey(key) && v && Array.isArray(v.files)) seen.set(key, new Set(v.files));
   }
-  const now = new Date().toISOString();
-  for (const f of walk(ROOT)) {
+  // 読めなかったディレクトリ。配下のファイルは walk に出てこないが、消えたわけではないので
+  // 前回の記録をそのまま引き継ぐ(落とすと、次回に全部を先頭から読み直し、件数からも外れる)
+  const failedDirs = [];
+  // walk は readdir だけでファイルを開かないので予算の対象にしない。時間を食うのは中身の読み込み
+  const files = walk(ROOT, [], (dir, e) => {
+    const id = path.relative(ROOT, dir);
+    failedDirs.push(id + path.sep);
+    stats.failed.push(`${id}${path.sep}(${e.code || e.message})`);
+  });
+  for (const [id, rec] of Object.entries(prev.files)) {
+    if (failedDirs.some(d => id.startsWith(d))) state.files[id] = rec;
+  }
+  for (const f of files) {
     // 件数は「何本の transcript に出たか」で数える。レコード数だと、作り直しや状態の破損で同じ
     // ファイルを読み直したときに増えてしまう。ただし --resume / fork は履歴を複製した新しい
     // transcript を作るので、同じ応答が 2 本として数えられる(本数は規模の目安で、利用回数ではない)
     const id = path.relative(ROOT, f);
-    const p = prev.files[f];
+    const p = prev.files[id];
     const known = p && typeof p === 'object' ? p : null;
-    // 時間切れ。前回の記録は残し(次回そこから読む)、記録の無いファイルは次回に先頭から読む
-    if (Date.now() >= deadline) {
-      if (known) state.files[f] = known;
-      stats.deferred++;
-      continue;
-    }
     try {
       const st = fs.statSync(f);
-      if (known && known.size === st.size && known.mtime === st.mtimeMs) { state.files[f] = known; continue; }
+      if (known && known.size === st.size && known.mtime === st.mtimeMs) { state.files[id] = known; continue; }
+      // 時間切れ。前回の記録は残し(次回そこから読む)、記録の無いファイルは次回に先頭から読む。
+      // 変わっていないファイルは上で済んでいるので、ここで数えるのは実際に読み残したものだけ
+      if (Date.now() >= deadline) {
+        if (known) state.files[id] = known;
+        stats.deferred++;
+        continue;
+      }
       stats.opened++;
-      state.files[f] = scan(f, st, known, model => {
-        if (!isUnknownModel(model)) return;
+      const r = scan(f, st, known, deadline, stats);
+      state.files[id] = r.rec;
+      // 先頭から読み直したファイルは、作り直されて前回のモデルを含まなくなっているかもしれないので、
+      // 前回までの所属をいったん外してから今回読んだ分で入れ直す
+      if (r.fromStart) for (const ids of seen.values()) ids.delete(id);
+      for (const model of r.models) {
+        if (!isUnknownModel(model)) continue;
         const key = modelKey(model);
-        if (!state.unknown[key]) state.unknown[key] = { files: [], firstSeen: now };
         if (!seen.has(key)) seen.set(key, new Set());
         seen.get(key).add(id);
-      }, stats);
+      }
     } catch (e) {
       // 走査の途中で消えた transcript(別セッションの後片付けや cleanupPeriodDays の削除)は記録ごと落とす。
       // それ以外(ウイルス対策ソフトのロックによる EBUSY など)は、その 1 本だけ前回の記録のまま残して
       // 続ける。1 本の不調で全体を止めると、そのあいだ毎セッション通知が出なくなる
       if (e.code !== 'ENOENT') {
-        if (known) state.files[f] = known;
+        if (known) state.files[id] = known;
         stats.failed.push(`${id}(${e.code || e.message})`);
       }
     }
   }
-  // 消えた transcript の位置は、files を作り直すことで落ちる
-  for (const [key, ids] of seen) state.unknown[key].files = [...ids];
+  // 記録に残っていない transcript(消えたもの)は数から外す。どの transcript にも残っていない
+  // モデルは、集計でももう $0 として数えられないので通知をやめる
+  for (const [key, ids] of seen) {
+    const alive = [...ids].filter(id => id in state.files);
+    if (alive.length) state.unknown[key] = { files: alive };
+  }
 
   if (process.env.USAGE_TRACKER_MODEL_WATCH_STATS) {
     console.error(`model-watch: ${stats.opened} 本を開き ${stats.bytes} バイト読んだ`
@@ -187,7 +224,7 @@ function main() {
   try {
     saveState(state);
   } catch (e) {
-    // 同時起動の rename 競合など。Claude Code は終了コード 0 のときしか stdout の JSON を読まないので、
+    // 再試行しても保存できなかった。Claude Code は終了コード 0 のときしか stdout の JSON を読まないので、
     // 通知を出したなら 0 のまま終える(通知を捨ててまで不具合を見せない)。出していなければ 1 で見せる
     console.error(`model-watch: 状態を保存できなかった: ${e && e.message}`);
     if (!keys.length) process.exitCode = 1;
