@@ -207,6 +207,10 @@ node test/transcript.test.js   # 1 ファイルだけ実行したいとき
 
 - TTL の内訳はレコードの `cache_creation.ephemeral_1h_input_tokens` から取り、合計との差を 5 分 TTL とみなす。内訳を持たない古いレコードは全量を 5 分 TTL として扱う。
 - Haiku 5.5 は prompt(input + キャッシュ書き込み + キャッシュ読み)が 10 万トークンを超えたリクエストで、全トークンが高い側の単価になる(`pricing.js` の `long`)。4.6 以降の他モデルは 1M まで標準単価。
+- fast mode(レコードの `usage.speed` が `"fast"`)は `pricing.js` の `fast` の単価で数える。Opus 5.5 は $8/$40、Opus 5 / 4.8 は $10/$50 で、prompt 長によらず一律。キャッシュ倍率は通常どおりその上に掛かる。fast の単価が無いモデルで fast のレコードが来たら、標準単価で数えて警告する。
+  - `turncost.js` は fast mode のターンを**除外**し、件数だけ出す。単価が一律 2 倍のターンが混ざると、コンテキスト長による倍率が歪むため(`claude -p` の除外と同じ扱い)。
+  - `sessions.js` は合計に**含めたうえで**、`うち fast mode $X` を別の行で出す。サブスクでは fast mode はプラン枠(5h / 7d)を消費せず、usage credits から実費で払われる。換算コストの中でも意味が違うので分けて見せる。使っていなければ行を出さない。
+  - `usage.jsonl`(statusline 由来の 5h / 7d 使用率)はプラン枠の記録なので、fast mode とは関係しない。
 - 単価表のキーは日付なしの形で書く(`claude-haiku-4-5-20251001` は `haiku-4-5` で引く)。
 - 2026-10 に 5.5 世代の単価を足すまで、Opus / Sonnet 5.5 のターンは $0 で数えられていた。また、それ以前の集計は書き込みを一律 1.25x で数えていた。そのため前後の `sessions.js` / `turncost.js` のコストは比べられない。
 

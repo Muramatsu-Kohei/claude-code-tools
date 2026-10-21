@@ -1,7 +1,7 @@
 'use strict';
 // コンテキスト長そのものが1ターンの単価をどれだけ押し上げるかを測る。
 // セッションを「どこで切るべきか」の閾値を決めるのが目的。
-const { cost, ctxLen, modelKey, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels } = require('./lib');
+const { cost, ctxLen, modelKey, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels, isFast } = require('./lib');
 
 const BUCKETS = [
   [0, 30e3, '〜30K'], [30e3, 60e3, '30〜60K'], [60e3, 100e3, '60〜100K'],
@@ -22,7 +22,7 @@ const HEAVY_FROM = 150e3;
   const b = BUCKETS.map(() => ({ n: 0, cost: 0 }));
   // 非対話実行(claude -p / SDK)は集計から外す。判定は lib.js に集約してある。
   const nonInteractiveFile = makeNonInteractiveFilter();
-  let sdkSessions = 0, sdkRecords = 0;
+  let sdkSessions = 0, sdkRecords = 0, fastTurns = 0;
   // --resume / fork の複製をレコードごと落とす(規則と実測は lib.js の makeUuidDedupe)。
   // 複製が残るとターン数が水増しされ、割って出す 1 ターンあたりの単価まで狂う。
   const isDuplicate = makeUuidDedupe();
@@ -54,6 +54,9 @@ const HEAVY_FROM = 150e3;
     for (const { usage, model, isSub: entrySub } of usages.entries()) {
       if (entrySub) continue;   // サブエージェントは対象外(メインの単価を測っている)
       if (!modelKey(model).startsWith('opus')) continue;
+      // fast mode は単価が一律 2 倍なので、混ざると「コンテキスト長による倍率」が歪む
+      // (fast を使った時期の帯だけ高く出る)。件数だけ数えて帯からは外す。
+      if (isFast(usage)) { fastTurns++; continue; }
       const ctx = ctxLen(usage);
       const i = BUCKETS.findIndex(([lo, hi]) => ctx >= lo && ctx < hi);
       if (i < 0) continue;
@@ -67,6 +70,7 @@ const HEAVY_FROM = 150e3;
     if (sdkRecords) excluded.push(`単独レコード ${sdkRecords} 件`);
     console.log(`(非対話実行 claude -p の${excluded.join(' / ')}は集計から除外)\n`);
   }
+  if (fastTurns) console.log(`(fast mode のターン ${fastTurns} 件は単価が違うので集計から除外)\n`);
   console.log(`コンテキスト長      ターン数    合計$    $/ターン  ${BASE_LABEL}比`);
   const baseIdx = BUCKETS.findIndex(([, , label]) => label === BASE_LABEL);
   const base = b[baseIdx].n ? b[baseIdx].cost / b[baseIdx].n : 0;

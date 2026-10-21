@@ -18,6 +18,8 @@ const ROOT = path.join(HOME, '.claude', 'projects');
 const NOT_BILLED = new Set(['<synthetic>', 'unknown', '']);
 
 const unknownModels = new Map();
+// fast mode のレコードなのに pricing.js に fast の単価が無かったモデル(標準単価で数えている)
+const missingFast = new Map();
 
 // キャッシュの倍率(input 単価に掛ける)。値の置き場所はここだけにし、pricing.js には
 // 既定と違うモデルの read だけを書く。書き込みは 5 分 TTL / 1 時間 TTL ともに全モデル共通。
@@ -33,6 +35,12 @@ function modelKey(model) {
   return String(model || 'unknown').replace('claude-', '').replace(/-\d{8}$/, '');
 }
 
+// fast mode のリクエストか。単価が標準の 2 倍で、サブスクではプラン枠の外(usage credits)から
+// 払われるので、cost() の単価切り替えのほか turncost.js は除外、sessions.js は内訳を分ける。
+function isFast(u) {
+  return !!u && u.speed === 'fast';
+}
+
 // 単価表に無いモデルは 0 円として扱うしかないが、黙って落とすと集計漏れに気づけない。
 // 見かけた名前を控えておき、呼び出し側が最後に warnUnknownModels() で報告する。
 function cost(model, u) {
@@ -42,8 +50,13 @@ function cost(model, u) {
     if (!NOT_BILLED.has(key)) unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
     return 0;
   }
-  // 段階料金のモデルは prompt 長で単価表ごと切り替える(超えた分だけでなく全体が高い側になる)
-  const r = p.long && ctxLen(u) > p.long.over ? p.long : p;
+  // fast mode は単価表ごと差し替える(prompt 長によらず一律)。fast の単価が無いモデルで fast の
+  // レコードが来たら、標準単価で数えたうえで warnUnknownModels() で知らせる($0 よりは近い)。
+  // 段階料金のモデルは prompt 長で単価表ごと切り替える(超えた分だけでなく全体が高い側になる)。
+  const fast = isFast(u);
+  if (fast && !p.fast) missingFast.set(key, (missingFast.get(key) || 0) + 1);
+  const r = fast && p.fast ? p.fast
+    : p.long && ctxLen(u) > p.long.over ? p.long : p;
   // TTL 別の内訳(cache_creation.ephemeral_1h_*)があれば 1 時間 TTL 分を 2x で数える。Claude Code の
   // 書き込みは大半(実測で約 8 割)が 1 時間 TTL なので、合計を一律 1.25x にすると書き込みを過少に
   // 見積もる。ただし 5 分 TTL も混ざるので「全部 1h」とみなしてもいけない。
@@ -309,13 +322,15 @@ function makeUsageCollector(fileIsSub = false) {
 }
 
 function warnUnknownModels() {
-  if (!unknownModels.size) return;
-  const list = [...unknownModels.entries()].map(([m, n]) => `${m}(${n}件)`).join(', ');
-  console.error(`\n警告: pricing.js に単価が無いモデルを $0 として集計した: ${list}`);
+  const fmt = m => [...m.entries()].map(([k, n]) => `${k}(${n}件)`).join(', ');
+  if (unknownModels.size) console.error(`\n警告: pricing.js に単価が無いモデルを $0 として集計した: ${fmt(unknownModels)}`);
+  if (missingFast.size) {
+    console.error(`\n警告: pricing.js に fast mode の単価が無いモデルを標準単価で集計した: ${fmt(missingFast)}`);
+  }
 }
 
 module.exports = {
   PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records,
   isNonInteractive, isNonInteractiveSession, makeNonInteractiveFilter, makeUsageCollector,
-  fileIdentity, makeUuidDedupe, warnUnknownModels,
+  fileIdentity, makeUuidDedupe, warnUnknownModels, isFast,
 };
