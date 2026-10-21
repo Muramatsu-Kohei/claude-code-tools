@@ -33,19 +33,29 @@ function modelKey(model) {
   return String(model || 'unknown').replace('claude-', '').replace(/-\d{8}$/, '');
 }
 
+// 単価表に無い課金対象のモデルか。cost() の $0 扱いと model-watch.js の通知は同じ判定を使う
+// (別々に持つと、片方だけ NOT_BILLED や modelKey の規則が変わって食い違う)。副作用は持たない。
+// modelKey() 済みのキーで受ける。modelKey() は冪等でない(末尾の日付を 1 つずつ落とす)ので、
+// 呼び出し側は modelKey() を 1 回だけ掛けたキーを渡すこと。
+// PRICE は素のオブジェクトなので hasOwn で引く('claude-constructor' が Object.prototype の関数に当たらないように)。
+function isUnknownKey(key) {
+  return !Object.hasOwn(PRICE, key) && !NOT_BILLED.has(key);
+}
+
 // 単価表に無いモデルは 0 円として扱うしかないが、黙って落とすと集計漏れに気づけない。
 // 見かけた名前を控えておき、呼び出し側が最後に warnUnknownModels() で報告する。
+// 記録するかどうかは isUnknownKey() に任せる(課金対象外の <synthetic> などは記録しない)。
 function cost(model, u) {
   const key = modelKey(model);
-  const p = PRICE[key];
+  const p = Object.hasOwn(PRICE, key) ? PRICE[key] : null;
   if (!p) {
-    if (!NOT_BILLED.has(key)) unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
+    if (isUnknownKey(key)) unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
     return 0;
   }
   // 段階料金のモデルは prompt 長で単価表ごと切り替える(超えた分だけでなく全体が高い側になる)
   const r = p.long && ctxLen(u) > p.long.over ? p.long : p;
   // TTL 別の内訳(cache_creation.ephemeral_1h_*)があれば 1 時間 TTL 分を 2x で数える。Claude Code の
-  // 書き込みは大半(実測で約 8 割)が 1 時間 TTL なので、合計を一律 1.25x にすると書き込みを過少に
+  // 書き込みは大半が 1 時間 TTL なので、合計を一律 1.25x にすると書き込みを過少に
   // 見積もる。ただし 5 分 TTL も混ざるので「全部 1h」とみなしてもいけない。
   // 合計(cache_creation_input_tokens)を正とし、5 分 TTL 分は合計から 1h 分を引いて出す。内訳が
   // 空・一部欠け・合計と不一致でも、書き込み量は ctxLen() と同じ合計に揃う(欠けた分は安い 5m 側)。
@@ -71,10 +81,20 @@ function ctxLen(u) {
     + (u.input_tokens || 0);
 }
 
-function walk(dir, out = []) {
+// 走査中に消えたサブディレクトリ(別セッションの後片付けや cleanupPeriodDays の削除)は飛ばす。
+// 1 つの消失で全体を落とさないため。起点の dir が無いのは呼び出し側の誤りなので投げる。
+// onError を渡すと、それ以外の理由(ロック中・削除待ちの EPERM など)で読めないサブディレクトリも
+// 飛ばして onError(dir, err) で知らせる。集計スクリプトは渡さない(黙って取りこぼすと集計が小さく出る)。
+function walk(dir, out = [], onError) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, e.name);
-    if (e.isDirectory()) walk(p, out);
+    if (e.isDirectory()) {
+      try { walk(p, out, onError); } catch (err) {
+        if (err.code === 'ENOENT') continue;
+        if (!onError) throw err;
+        onError(p, err);
+      }
+    }
     else if (e.name.endsWith('.jsonl')) out.push(p);
   }
   return out;
@@ -315,7 +335,7 @@ function warnUnknownModels() {
 }
 
 module.exports = {
-  PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records,
+  PRICE, ROOT, modelKey, isUnknownKey, cost, ctxLen, walk, transcriptFiles, records,
   isNonInteractive, isNonInteractiveSession, makeNonInteractiveFilter, makeUsageCollector,
   fileIdentity, makeUuidDedupe, warnUnknownModels,
 };
