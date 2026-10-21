@@ -33,10 +33,19 @@ function cost(model, u) {
     if (!NOT_BILLED.has(key)) unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
     return 0;
   }
-  return ((u.input_tokens || 0) * p.in
-    + (u.cache_creation_input_tokens || 0) * p.in * 1.25
-    + (u.cache_read_input_tokens || 0) * p.in * 0.1
-    + (u.output_tokens || 0) * p.out) / 1e6;
+  // 段階料金のモデルは prompt 長で単価表ごと切り替える(超えた分だけでなく全体が高い側になる)
+  const r = p.long && ctxLen(u) > p.long.over ? p.long : p;
+  // TTL 別の内訳(cache_creation.ephemeral_*)があればそれで重み付けする。Claude Code は 1 時間
+  // TTL で書くので、合計だけ見て一律 1.25x にすると書き込みを 4 割近く安く見積もる。
+  // 内訳を持たない古いレコードは従来どおり全量を 5 分 TTL として扱う。
+  const cc = u.cache_creation;
+  const w1h = (cc && cc.ephemeral_1h_input_tokens) || 0;
+  const w5m = cc ? (cc.ephemeral_5m_input_tokens || 0) : (u.cache_creation_input_tokens || 0);
+  return ((u.input_tokens || 0) * r.in
+    + w5m * r.in * 1.25
+    + w1h * r.in * 2
+    + (u.cache_read_input_tokens || 0) * r.in * (p.read ?? 0.1)
+    + (u.output_tokens || 0) * r.out) / 1e6;
 }
 
 // そのターンが実際に読ませたプロンプト長。cache_read だけでは足りない点が重要:

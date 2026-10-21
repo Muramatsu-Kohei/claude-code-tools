@@ -92,6 +92,21 @@ check('output は定価どおり', lib.cost('claude-opus-5', usage({ output_toke
 check('cache_creation は 1.25 倍', lib.cost('claude-opus-5', usage({ cache_creation_input_tokens: 1e6 })) === 6.25);
 check('cache_read は 0.1 倍', lib.cost('claude-opus-5', usage({ cache_read_input_tokens: 1e6 })) === 0.5);
 check('欠損フィールドは 0 扱い', lib.cost('claude-opus-5', {}) === 0);
+// TTL 別の内訳があれば 1 時間 TTL は 2 倍。内訳が合計より優先される
+check('cache_creation の 1h 内訳は 2 倍、5m 内訳は 1.25 倍',
+  lib.cost('claude-opus-5', usage({ cache_creation_input_tokens: 2e6,
+    cache_creation: { ephemeral_1h_input_tokens: 1e6, ephemeral_5m_input_tokens: 1e6 } })) === 10 + 6.25);
+// 5.5 世代: Opus は in=$4, out=$20、キャッシュ読みは 0.05 倍。Fable 5.1 は 0.025 倍
+check('opus-5.5 の単価とキャッシュ読み 0.05 倍',
+  lib.cost('claude-opus-5-5', usage({ input_tokens: 1e6, output_tokens: 1e6, cache_read_input_tokens: 1e6 })) === 4 + 20 + 0.2);
+check('fable-5.1 のキャッシュ読みは 0.025 倍',
+  lib.cost('claude-fable-5-1', usage({ cache_read_input_tokens: 1e6 })) === 0.25);
+// Haiku 5.5 は prompt が 10 万を超えると全体が高い単価になる(境界ちょうどは安い側)
+check('haiku-5.5 は prompt 10 万以下なら安い単価',
+  Math.abs(lib.cost('claude-haiku-5-5', usage({ input_tokens: 100e3, output_tokens: 1e6 })) - (0.01 + 0.5)) < 1e-9);
+check('haiku-5.5 は prompt 10 万超なら全体が高い単価',
+  Math.abs(lib.cost('claude-haiku-5-5', usage({ input_tokens: 1e3, cache_read_input_tokens: 100e3, output_tokens: 1e6 }))
+    - (0.0005 + 0.005 + 2.5)) < 1e-9);
 
 // 単価表に無いモデルは $0 になるが、課金対象でないものと新モデルは区別する
 function captureWarn() {
