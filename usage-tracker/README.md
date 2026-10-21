@@ -210,7 +210,7 @@ node test/transcript.test.js   # 1 ファイルだけ実行したいとき
 - fast mode(レコードの `usage.speed` が `"fast"`)は `pricing.js` の `fast` の単価で数える。Opus 5.5 は $8/$40、Opus 5 / 4.8 は $10/$50 で、prompt 長によらず一律。キャッシュ倍率は通常どおりその上に掛かる。fast の単価は標準より高い(Opus 5.5 / 5 / 4.8 は標準の 2 倍)。公式の料金表に fast の単価が無いモデル(提供が終わった旧モデルの fast mode など)は、標準単価で数えたうえで警告する。
   - `turncost.js` は fast mode のターンを**除外**し、件数だけ出す。単価の高いターンが混ざると、コンテキスト長による倍率が歪むため(`claude -p` の除外と同じ扱い)。
   - `sessions.js` は合計に**含めたうえで**、`うち fast mode $X` を別の行で出す。サブスクでは fast mode はプラン枠(5h / 7d)を消費せず、usage credits から実費で払われる。換算コストの中でも意味が違うので分けて見せる。使っていなければ行を出さない。額は 0.5 未満なら「$1 未満」と出す(総額と桁を揃えるため)。fast の単価が無いモデルの分が含まれるときは、標準単価で概算である旨を行の末尾に添える。`habits.js` も同じ行を総額の直後に出し、`--json` には `fastCost` を入れる。
-  - `usage.jsonl`の 5h / 7d の使用率(statusline 由来)には fast mode の分が含まれない(usage credits から払われるため)。`cost` 列(セッションの `total_cost_usd`)には fast の分も含まれ、`fast` 列でそのときの fast モードか分かる。
+  - `usage.jsonl`の 5h / 7d の使用率(statusline 由来)には fast mode の分が含まれない(usage credits から払われるため)。`cost` 列は Claude Code が算出したセッションの `total_cost_usd` をそのまま記録したもので、fast mode をどう数えるかは Claude Code 側の計算に従う(このツールでは確かめていない)。そのときに fast モードだったかは `fast` 列で分かる。
 - 単価表のキーは日付なしの形で書く(`claude-haiku-4-5-20251001` は `haiku-4-5` で引く)。
 - 2026-10 に 5.5 世代の単価を足すまで、Opus / Sonnet 5.5 のターンは $0 で数えられていた。また、それ以前の集計は書き込みを一律 1.25x で数えていた。そのため前後の `sessions.js` / `turncost.js` のコストは比べられない。
 
