@@ -25,7 +25,9 @@ module.exports = {
   'opus-5':             { in: 5,   out: 25,              fast: { in: 10, out: 50 } },
   'opus-4-8':           { in: 5,   out: 25,              fast: { in: 10, out: 50 } },
   'opus-4-7':           { in: 5,   out: 25 },
-  'opus-4-6':           { in: 5,   out: 25,              fast: { in: 30, out: 150 } },
+  // fast は提供時に公表された $30/$150。当時あった 200k 超の割増と 2026-02-16 までの半額は扱わないので、
+  // approx を付けて集計の出力に「概算」と出す
+  'opus-4-6':           { in: 5,   out: 25,              fast: { in: 30, out: 150, approx: true } },
   'sonnet-5-5':         { in: 2,   out: 10,  read: 0.05 },
   // 発売時の導入価格 $2/$10 がそのまま定価になった(9/1 の $3/$15 への値上げは中止)
   'sonnet-5':           { in: 2,   out: 10 },

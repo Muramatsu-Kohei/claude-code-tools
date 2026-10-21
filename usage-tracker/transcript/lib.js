@@ -35,16 +35,24 @@ function modelKey(model) {
   return String(model || 'unknown').replace('claude-', '').replace(/-\d{8}$/, '');
 }
 
-// fast mode のリクエストか。単価が標準の 2 倍で、サブスクではプラン枠の外(usage credits)から
+// fast mode のリクエストか。単価が標準より高く(モデルにより 2〜6 倍)、サブスクではプラン枠の外(usage credits)から
 // 払われるので、cost() の単価切り替えのほか turncost.js は除外、sessions.js は内訳を分ける。
 function isFast(u) {
   return !!u && u.speed === 'fast';
 }
 
-// fast mode のレコードなのに fast の単価が無く、標準単価で数えることになるか。額が概算になる。
+// fast mode のレコードなのに fast の単価が無く、標準単価で数えることになるか。単価表に足すべき欠落で、
+// noteModel() が警告に回す。p は単価表の行(無ければ undefined)。
+function lacksFast(p, u) {
+  return !!p && isFast(u) && !p.fast;
+}
+
+// fast mode の額が概算になるか。fast の単価が無い(標準単価で数える)か、単価はあるが時期や prompt 長に
+// よる差を扱っていない(pricing.js で approx を付けた行)とき。集計の出力に「概算」と添えるのに使う。
+// 欠落の判定は lacksFast() と同じものを使う(別々に書くと、警告と注記の条件が食い違う)。
 function isApproxFast(model, u) {
   const p = PRICE[modelKey(model)];
-  return !!p && isFast(u) && !p.fast;
+  return lacksFast(p, u) || (!!p && isFast(u) && !!p.fast.approx);
 }
 
 // 単価表に無いモデルは 0 円として扱うしかないが、黙って落とすと集計漏れに気づけない。
@@ -56,7 +64,7 @@ function noteModel(model, u) {
   const p = PRICE[key];
   if (!p) {
     if (!NOT_BILLED.has(key)) unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
-  } else if (isFast(u) && !p.fast) {
+  } else if (lacksFast(p, u)) {
     missingFast.set(key, (missingFast.get(key) || 0) + 1);
   }
 }
@@ -71,6 +79,8 @@ function cost(model, u) {
   // fast を long より先に評価するのは仕様どおり。公式の料金ページに「Fast mode pricing applies across
   // the full context window, including requests over 200k input tokens」とあり、fast の単価は
   // prompt 長で変わらない。long の判定に回すと fast の単価が長いリクエストで上書きされてしまう。
+  // 例外は Opus 4.6 で、当時は 200k 超の割増と期間限定の半額があった。そこは扱わず、pricing.js で
+  // approx を付けて出力に「概算」と添える(isApproxFast())。
   const fast = isFast(u);
   const r = fast && p.fast ? p.fast
     : p.long && ctxLen(u) > p.long.over ? p.long : p;
@@ -346,14 +356,14 @@ function fastCostLine(fast, approx) {
   if (!(fast > 0)) return null;
   const label = fast < 0.5 ? '$0.5 未満' : `$${fast.toFixed(0)}`;
   return `(うち fast mode ${label}。サブスクではプラン枠の外の usage credits から実費で払われる)`
-    + (approx ? '(fast の単価が無いモデルの分は標準単価で概算)' : '');
+    + (approx ? '(一部は概算: fast の単価が無いモデルは標準単価で、時期や prompt 長による差を扱わないモデルはその差を除いて数えた)' : '');
 }
 
 function warnUnknownModels() {
   const fmt = m => [...m.entries()].map(([k, n]) => `${k}(${n}件)`).join(', ');
   if (unknownModels.size) console.error(`\n警告: pricing.js に単価が無いモデルを $0 として集計した: ${fmt(unknownModels)}`);
   if (missingFast.size) {
-    console.error(`\n警告: pricing.js に fast mode の単価が無いモデルを標準単価で集計した: ${fmt(missingFast)}`);
+    console.error(`\n警告: pricing.js に fast mode の単価が無いモデルのレコードがあった(集計に入る分は標準単価で数える。集計外のセッションの分も含む): ${fmt(missingFast)}`);
   }
 }
 

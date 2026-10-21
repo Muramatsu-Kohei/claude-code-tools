@@ -165,7 +165,18 @@ check('fast の単価が無いモデルは標準単価で数える($0 にしな�
   near(lib.cost('claude-sonnet-5-5', usage({ input_tokens: 1e6, speed: 'fast' })), 2));
 const warnedFast = captureWarn();
 check('fast の単価が無いモデルは名前と件数を別の文面で警告する',
-  /fast mode の単価が無いモデルを標準単価で集計した: sonnet-5-5\(1件\)/.test(warnedFast), warnedFast);
+  /fast mode の単価が無いモデルのレコードがあった\(.*\): sonnet-5-5\(1件\)/.test(warnedFast), warnedFast);
+// 概算かどうかは「fast の単価が無い」か「単価に approx が付いている(Opus 4.6)」で決まる
+check('isApproxFast: fast の単価が無いモデルは概算',
+  lib.isApproxFast('claude-sonnet-5-5', usage({ speed: 'fast' })) === true);
+check('isApproxFast: 時期や prompt 長の差を扱わない Opus 4.6 の fast は概算',
+  lib.isApproxFast('claude-opus-4-6', usage({ speed: 'fast' })) === true);
+check('isApproxFast: 単価が揃っている fast と、fast でないレコードは概算でない',
+  lib.isApproxFast('claude-opus-5-5', usage({ speed: 'fast' })) === false
+    && lib.isApproxFast('claude-sonnet-5-5', usage({ speed: 'standard' })) === false);
+lib.cost('claude-opus-4-6', usage({ input_tokens: 1e6, speed: 'fast' }));
+const warned46 = captureWarn();
+check('Opus 4.6 の fast は単価があるので、欠落としては警告しない', !/opus-4-6/.test(warned46), warned46);
 
 // ---- コンテキスト長の帯域分類(指摘の本体) ----
 console.log('\nturncost.js');
@@ -195,13 +206,24 @@ console.log('\nfast mode');
   const tcf = run('turncost.js', home);
   check('turncost.js: fast mode のターンは帯に入れない', /^30〜60K\s+1\s/m.test(tcf.out), tcf.out);
   check('turncost.js: 外した件数を出力に添える', /fast mode のターン 1 件/.test(tcf.out), tcf.out);
+  // fast の直後の標準ターンは、切り替えでキャッシュを書き直して高く出るので外す。その次からは戻す
+  const homeSw = sandbox('fast-switch');
+  writeTranscript(homeSw, 'proj', 'cccccccc-0000-0000-0000-000000000008', [
+    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 100 })),
+    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 100, speed: 'fast' })),
+    assistant(usage({ input_tokens: 10, cache_creation_input_tokens: 40e3, output_tokens: 100 })),
+    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 100 })),
+  ]);
+  const tcs = run('turncost.js', homeSw);
+  check('turncost.js: fast の直後の標準ターンも帯から外し、件数を添える',
+    /^30〜60K\s+2\s/m.test(tcs.out) && /fast mode のターン 1 件と、その直後の標準ターン 1 件/.test(tcs.out), tcs.out);
 
   const ssf = run('sessions.js', home);
   // opus-5: 標準 = (10*5 + 40e3*5*0.1 + 1e6*25)/1e6 = 25.02、fast = (10*10 + 40e3*10*0.1 + 1e6*50)/1e6 = 50.04
   // 含めれば 75.06 → $75、外せば $25
   check('sessions.js: fast mode も合計に含める', /^セッション数: 1  総換算コスト: \$75$/m.test(ssf.out), ssf.out);
   check('sessions.js: fast mode の分を別に示す(総額と同じ桁)', /うち fast mode \$50。/.test(ssf.out), ssf.out);
-  check('sessions.js: fast の単価が揃っていれば概算の注記を付けない', !/標準単価で概算/.test(ssf.out), ssf.out);
+  check('sessions.js: fast の単価が揃っていれば概算の注記を付けない', !/概算/.test(ssf.out), ssf.out);
 
   const hbf = run('habits.js', home, ['--since', '2026-01-01']);
   check('habits.js: 換算コストに fast mode を含める', /換算コスト \$75$/m.test(hbf.out), hbf.out);
@@ -246,9 +268,17 @@ console.log('\nfast mode');
   const ssm = run('sessions.js', homeMiss);
   const hbm = run('habits.js', homeMiss, ['--since', '2026-01-01']);
   check('sessions.js: fast の単価が無いモデルの分は概算と注記する',
-    /うち fast mode \$10。.*\(fast の単価が無いモデルの分は標準単価で概算\)$/m.test(ssm.out), ssm.out);
+    /うち fast mode \$10。.*\(一部は概算: .*\)$/m.test(ssm.out), ssm.out);
   check('habits.js: fast の単価が無いモデルの分は概算と注記する',
-    /うち fast mode \$10。.*\(fast の単価が無いモデルの分は標準単価で概算\)$/m.test(hbm.out), hbm.out);
+    /うち fast mode \$10。.*\(一部は概算: .*\)$/m.test(hbm.out), hbm.out);
+  // Opus 4.6 の fast は単価があっても当時の割増・割引を扱わないので、出力にも概算と添える
+  const home46 = sandbox('fast-46');
+  writeTranscript(home46, 'proj', 'cccccccc-0000-0000-0000-000000000009', [
+    { ...assistant(usage({ output_tokens: 1e6, speed: 'fast' })),
+      message: { model: 'claude-opus-4-6', usage: usage({ output_tokens: 1e6, speed: 'fast' }) } },
+  ]);
+  const ss46 = run('sessions.js', home46);
+  check('sessions.js: Opus 4.6 の fast は概算と注記する', /うち fast mode \$150。.*\(一部は概算: .*\)$/m.test(ss46.out), ss46.out);
   const hbmj = run('habits.js', homeMiss, ['--since', '2026-01-01', '--json']);
   let pmj = null; try { pmj = JSON.parse(hbmj.out); } catch (e) { pmj = null; }
   check('habits.js --json: 概算が混ざれば fastApprox が true', pmj && pmj.fastApprox === true, hbmj.out.slice(0, 200));
@@ -266,7 +296,7 @@ console.log('\nfast mode');
   ]);
   const sso = run('sessions.js', homeOrphan);
   check('sessions.js: 除外した孤児サブエージェントの概算で注記を付けない',
-    /うち fast mode \$50。/.test(sso.out) && /親 transcript の無いサブエージェント/.test(sso.out) && !/標準単価で概算/.test(sso.out), sso.out);
+    /うち fast mode \$50。/.test(sso.out) && /親 transcript の無いサブエージェント/.test(sso.out) && !/概算/.test(sso.out), sso.out);
 
   // turncost は fast のターンを cost() の前に外していた。警告まで落ちないこと
   // (opus-4-7 は表にあるが fast の単価が無い。opus-9-9 は表に無い)
@@ -278,7 +308,7 @@ console.log('\nfast mode');
   writeTranscript(homeWarn, 'proj', 'cccccccc-0000-0000-0000-000000000005', [modelRec('claude-opus-4-7'), modelRec('claude-opus-9-9')]);
   const tcw = run('turncost.js', homeWarn);
   check('turncost.js: fast のターンでも fast の単価が無いモデルを警告する',
-    /fast mode の単価が無いモデルを標準単価で集計した: opus-4-7\(1件\)/.test(tcw.err), tcw.err);
+    /fast mode の単価が無いモデルのレコードがあった\(.*\): opus-4-7\(1件\)/.test(tcw.err), tcw.err);
   check('turncost.js: fast のターンでも単価表に無いモデルを警告する',
     /単価が無いモデルを \$0 として集計した: opus-9-9\(1件\)/.test(tcw.err), tcw.err);
 })();
