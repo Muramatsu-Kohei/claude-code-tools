@@ -3,11 +3,13 @@
 // (breakdown.js はトークン内訳のみでコスト換算をしないため参照しない)。
 // 出典: https://platform.claude.com/docs/en/about-claude/pricing(2026-10-21 確認)。
 //
-// 重み付けは呼び出し側の cost() 関数が行う。キャッシュ書き込みはどのモデルも 5 分 TTL が 1.25x、
-// 1 時間 TTL が 2x で共通なので表に持たない。キャッシュ読みは世代で倍率が違う
-// (標準は 0.1x、Opus 5.5 / Sonnet 5.5 は 0.05x、Fable 5.1 は 0.025x)ので read に持つ。
+// 重み付けは lib.js の cost() が行い、キャッシュ倍率の既定値も lib.js の CACHE_* 定数にある。
+// この表に書くのは既定と違うものだけ: read はキャッシュ読みの倍率(input 単価に掛ける)で、
+// 既定の 0.1x と違うモデル(Opus/Sonnet 5.5 は 0.05x、Fable 5.1 は 0.025x)にだけ持たせる。
 // long は prompt 長で単価が切り替わるモデル用。prompt(input + cache 書き込み + cache 読み)が
-// over を超えたリクエストは、全トークンを long 側の in/out で数える。
+// over を超えたリクエストは、全トークンを long 側の in/out(と read があればそれ)で数える。
+// 4.6 以降で長コンテキストの割増があるのは Haiku 5.5 だけ(他は 1M まで標準単価)。
+// キーは日付なしの形で書く。lib.js の modelKey() が ID 末尾の -YYYYMMDD を落とす。
 //
 // 表に無いモデルは $0 で数えられ、warnUnknownModels() が報告する。5.5 世代の追加漏れで
 // 全コストが $0 になっていた実例があるので、警告が出たら表を足すこと。
@@ -24,5 +26,5 @@ module.exports = {
   'sonnet-5':           { in: 2,   out: 10 },
   'sonnet-4-6':         { in: 3,   out: 15 },
   'haiku-5-5':          { in: 0.1, out: 0.5, long: { over: 100e3, in: 0.5, out: 2.5 } },
-  'haiku-4-5-20251001': { in: 1,   out: 5  },
+  'haiku-4-5':          { in: 1,   out: 5  },
 };

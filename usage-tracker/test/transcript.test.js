@@ -96,17 +96,47 @@ check('欠損フィールドは 0 扱い', lib.cost('claude-opus-5', {}) === 0);
 check('cache_creation の 1h 内訳は 2 倍、5m 内訳は 1.25 倍',
   lib.cost('claude-opus-5', usage({ cache_creation_input_tokens: 2e6,
     cache_creation: { ephemeral_1h_input_tokens: 1e6, ephemeral_5m_input_tokens: 1e6 } })) === 10 + 6.25);
+// 内訳が合計とずれていても、書き込み量は合計(ctxLen と同じ値)に揃え、欠けた分は 5m 扱いにする
+check('cache_creation の内訳が空なら合計を 5m として数える',
+  lib.cost('claude-opus-5', usage({ cache_creation_input_tokens: 1e6, cache_creation: {} })) === 6.25);
+check('cache_creation の 5m 内訳が欠けていたら合計から 1h を引いた分を 5m とする',
+  lib.cost('claude-opus-5', usage({ cache_creation_input_tokens: 2e6,
+    cache_creation: { ephemeral_1h_input_tokens: 1e6 } })) === 10 + 6.25);
+check('cache_creation の 1h 内訳が合計を超えても合計で頭打ち',
+  lib.cost('claude-opus-5', usage({ cache_creation_input_tokens: 1e6,
+    cache_creation: { ephemeral_1h_input_tokens: 3e6 } })) === 10);
+
+// 0.05 や 0.025 は 2 進で正確に表せず、項の順序次第で末尾がずれるので近似で比べる
+const near = (a, b) => Math.abs(a - b) < 1e-9;
 // 5.5 世代: Opus は in=$4, out=$20、キャッシュ読みは 0.05 倍。Fable 5.1 は 0.025 倍
 check('opus-5.5 の単価とキャッシュ読み 0.05 倍',
-  lib.cost('claude-opus-5-5', usage({ input_tokens: 1e6, output_tokens: 1e6, cache_read_input_tokens: 1e6 })) === 4 + 20 + 0.2);
+  near(lib.cost('claude-opus-5-5', usage({ input_tokens: 1e6, output_tokens: 1e6, cache_read_input_tokens: 1e6 })), 4 + 20 + 0.2));
 check('fable-5.1 のキャッシュ読みは 0.025 倍',
-  lib.cost('claude-fable-5-1', usage({ cache_read_input_tokens: 1e6 })) === 0.25);
+  near(lib.cost('claude-fable-5-1', usage({ cache_read_input_tokens: 1e6 })), 0.25));
 // Haiku 5.5 は prompt が 10 万を超えると全体が高い単価になる(境界ちょうどは安い側)
 check('haiku-5.5 は prompt 10 万以下なら安い単価',
-  Math.abs(lib.cost('claude-haiku-5-5', usage({ input_tokens: 100e3, output_tokens: 1e6 })) - (0.01 + 0.5)) < 1e-9);
+  near(lib.cost('claude-haiku-5-5', usage({ input_tokens: 100e3, output_tokens: 1e6 })), 0.01 + 0.5));
 check('haiku-5.5 は prompt 10 万超なら全体が高い単価',
-  Math.abs(lib.cost('claude-haiku-5-5', usage({ input_tokens: 1e3, cache_read_input_tokens: 100e3, output_tokens: 1e6 }))
-    - (0.0005 + 0.005 + 2.5)) < 1e-9);
+  near(lib.cost('claude-haiku-5-5', usage({ input_tokens: 1e3, cache_read_input_tokens: 100e3, output_tokens: 1e6 })),
+    0.0005 + 0.005 + 2.5));
+// 高い側の単価はキャッシュ書き込み(5m/1h とも)にも掛かる。prompt = 50K(1h) + 60K(5m) = 110K
+check('haiku-5.5 の高い単価はキャッシュ書き込みにも掛かる',
+  near(lib.cost('claude-haiku-5-5', usage({ cache_creation_input_tokens: 110e3,
+    cache_creation: { ephemeral_1h_input_tokens: 50e3, ephemeral_5m_input_tokens: 60e3 } })),
+    (50e3 * 0.5 * 2 + 60e3 * 0.5 * 1.25) / 1e6));
+
+// long 側に read があれば高い側ではそれを使う(今の表に該当モデルは無いので仮のエントリで確かめる)
+const PRICE = require('../transcript/pricing');
+PRICE['test-long-read'] = { in: 1, out: 1, read: 0.1, long: { over: 10, in: 2, out: 2, read: 0.5 } };
+check('long 側の read は高い側のキャッシュ読みに使われる',
+  near(lib.cost('claude-test-long-read', usage({ cache_read_input_tokens: 1e6 })), 2 * 0.5));
+delete PRICE['test-long-read'];
+
+// 日付付きの ID も日付なしのキーで引ける(実データには両方の形が現れる)
+check('modelKey は ID 末尾の日付を落とす',
+  lib.modelKey('claude-haiku-4-5-20251001') === 'haiku-4-5' && lib.modelKey('claude-opus-5-5') === 'opus-5-5');
+check('日付付きの ID も単価表で引ける',
+  lib.cost('claude-haiku-4-5-20251001', usage({ input_tokens: 1e6 })) === 1);
 
 // 単価表に無いモデルは $0 になるが、課金対象でないものと新モデルは区別する
 function captureWarn() {
