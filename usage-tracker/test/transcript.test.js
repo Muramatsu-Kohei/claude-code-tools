@@ -975,6 +975,88 @@ const asyncChecks = (async () => {
     !goneThrew && goneCount === 0, `threw=${goneThrew} count=${goneCount}`);
 })();
 
+// ---- 単価表に無いモデルの通知(SessionStart フック) ----
+console.log('\nmodel-watch.js');
+(() => {
+  const home = sandbox('model-watch');
+  const proj = 'proj';
+  const file = path.join(home, '.claude', 'projects', proj, 'bbbbbbbb-0000-0000-0000-000000000001.jsonl');
+  const stateFile = path.join(home, '.claude', 'usage-tracker', 'model-watch.json');
+  const rec = model => JSON.stringify({ type: 'assistant', message: { model, usage: usage() } }) + '\n';
+  const warnOf = r => { try { return JSON.parse(r.out).systemMessage || ''; } catch (e) { return ''; } };
+
+  writeTranscript(home, proj, 'bbbbbbbb-0000-0000-0000-000000000001', [
+    { type: 'assistant', message: { model: 'claude-madeup-1', usage: usage() } },
+  ]);
+  const first = run('model-watch.js', home);
+  check('初回は既存分も先頭から読んで通知する',
+    first.code === 0 && /madeup-1\(1件\)/.test(warnOf(first)) && fs.existsSync(stateFile), `out=${first.out} err=${first.err}`);
+
+  // 新しい未知モデルと、拾ってはいけないもの(課金対象外・ツール入力のモデル名)を足す
+  // user レコードは本文に "assistant" を含めて、文字列での前絞りを素通りさせる
+  fs.appendFileSync(file, rec('claude-madeup-2') + rec('<synthetic>') + rec('claude-opus-5-5')
+    + JSON.stringify({ type: 'user', message: { model: 'claude-madeup-user', content: 'assistant' } }) + '\n'
+    + JSON.stringify({ type: 'assistant', message: { model: 'claude-opus-5-5', usage: usage(),
+      content: [{ type: 'tool_use', name: 'Agent', input: { model: 'sonnet' } }] } }) + '\n');
+  const second = run('model-watch.js', home);
+  const w2 = warnOf(second);
+  check('前回以降に現れた未知モデルを件数つきで通知する', /madeup-2\(1件\)/.test(w2), second.out);
+  check('前回読んだ分は読み直さない(件数が増えない)', /madeup-1\(1件\)/.test(w2), w2);
+  check('課金対象外・ツール入力・assistant 以外のモデル名は通知しない',
+    !/madeup-user|synthetic|sonnet|opus-5-5/.test(w2), w2);
+  check('Claude 向けにも同じ内容を additionalContext で渡す',
+    (() => { try { return JSON.parse(second.out).hookSpecificOutput.additionalContext === w2; } catch (e) { return false; } })(),
+    second.out);
+
+  const third = run('model-watch.js', home);
+  check('新しい行が無くても、単価表に足されるまで通知を続ける', /madeup-2\(1件\)/.test(warnOf(third)), third.out);
+
+  // 単価表に足された(= 既知になった)ものは通知から消える。既知のキーを状態に仕込んで確かめる
+  const s = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  s.unknown['opus-5'] = { count: 3, firstSeen: '2026-01-01T00:00:00.000Z' };
+  fs.writeFileSync(stateFile, JSON.stringify(s));
+  const fourth = run('model-watch.js', home);
+  check('単価表にあるモデルは通知と状態から消える',
+    !/opus-5\(/.test(warnOf(fourth)) && !('opus-5' in JSON.parse(fs.readFileSync(stateFile, 'utf8')).unknown),
+    fourth.out);
+
+  // 書き込み途中(改行で終わっていない)の行は読まず、完結してから数える
+  const half = rec('claude-partial-1');
+  fs.appendFileSync(file, half.slice(0, 20));
+  const fifth = run('model-watch.js', home);
+  fs.appendFileSync(file, half.slice(20));
+  const sixth = run('model-watch.js', home);
+  check('書き込み途中の行は読まず、完結した次の回に 1 件として数える',
+    !/partial-1/.test(warnOf(fifth)) && /partial-1\(1件\)/.test(warnOf(sixth)), `${fifth.out}\n${sixth.out}`);
+
+  // 初回の後に作られたファイルは先頭から読む
+  writeTranscript(home, 'proj2', 'bbbbbbbb-0000-0000-0000-000000000002', [
+    { type: 'assistant', message: { model: 'claude-madeup-3', usage: usage() } },
+  ]);
+  check('初回の後に作られたファイルは先頭から読む', /madeup-3\(1件\)/.test(warnOf(run('model-watch.js', home))));
+
+  // 前回の位置より短く作り直されたファイルは、先頭から読み直す
+  writeTranscript(home, proj, 'bbbbbbbb-0000-0000-0000-000000000001', [
+    { type: 'assistant', message: { model: 'claude-rewritten-1', usage: usage() } },
+  ]);
+  check('前回より短く作り直されたファイルは先頭から読む',
+    /rewritten-1\(1件\)/.test(warnOf(run('model-watch.js', home))));
+
+  fs.writeFileSync(stateFile, '{壊れた');
+  const broken = run('model-watch.js', home);
+  check('状態ファイルが壊れていたら初回として全量を読み直し、失敗しない',
+    // 件数は引き継がずに数え直す(作り直し後のファイルには madeup-1 はもう無い)
+    broken.code === 0 && broken.err === '' && /rewritten-1\(1件\), madeup-3\(1件\)/.test(warnOf(broken))
+      && !/madeup-1/.test(warnOf(broken)),
+    `code=${broken.code} out=${broken.out} err=${broken.err}`);
+
+  const none = path.join(BASE, 'model-watch-none');
+  fs.mkdirSync(none, { recursive: true });
+  const noRoot = run('model-watch.js', none);
+  check('transcript が無い環境では黙って抜ける(セッション開始を妨げない)',
+    noRoot.code === 0 && noRoot.out === '' && noRoot.err === '', `code=${noRoot.code} err=${noRoot.err}`);
+})();
+
 // ---- transcript が無い環境 ----
 console.log('\ntranscript が無い場合');
 const homeC = path.join(BASE, 'empty');

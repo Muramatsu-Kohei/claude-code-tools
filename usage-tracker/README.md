@@ -132,7 +132,7 @@ Stop        ─> guard.js ─> exit 2 でターン終了を差し止め、stderr
 
 `guard-hooks-snippet.json` の内容を `~/.claude/settings.json` の `hooks` にマージする。`install.ps1` は statusline.js への注入専用で、settings.json には触らない(共有ファイルを機械的に書き換えると整形が壊れやすいため)。
 
-スニペット中の `guard.js` のパスは**このリポジトリを `C:/claude/ClaudeCode` に置いた場合の絶対パス**なので、別の場所に配置したなら書き換える。フックは任意のディレクトリから起動されるため相対パスにはできない。
+スニペットには単価表に無いモデルの通知(`SessionStart` の `transcript/model-watch.js`)も入っている。スニペット中の `guard.js` / `model-watch.js` のパスは**このリポジトリを `C:/claude/ClaudeCode` に置いた場合の絶対パス**なので、別の場所に配置したなら書き換える。フックは任意のディレクトリから起動されるため相対パスにはできない。
 
 ```powershell
 node guard.js status [session_id]   # 使用率・全セッションのフラグ・発火判定を表示する
@@ -196,6 +196,15 @@ node test/transcript.test.js   # 1 ファイルだけ実行したいとき
 `test/run.js` は起動時に `test/.tmp/` を丸ごと消して、前回実行の孤児(ハングしたまま残ったプロセスが握っていたファイル)を一掃する。ただし名前で絞った実行では全削除をスキップする(別スイートを並列に流しているとき、そのサンドボックスを巻き添えで消さないため)。掃除したいときは引数なしで全実行すること。
 
 共通処理は `transcript/lib.js`(走査・コスト換算・コンテキスト長)、モデル別単価テーブルは `transcript/pricing.js` にある。単価表に無いモデルは $0 として集計した上で、実行の最後に名前と件数を警告する(新モデルが黙って集計から漏れるのを防ぐため)。
+
+### 単価表に無いモデルの通知(transcript/model-watch.js)
+
+上の警告は集計を回さないと出ない。5.5 世代の追加漏れでは、Opus / Sonnet 5.5 のコストが数週間 $0 のまま気づかれなかった。`model-watch.js` は SessionStart フックとして毎セッションの入口で transcript を見て、単価表に無いモデルがあれば `systemMessage`(ユーザー向け)と `additionalContext`(Claude 向け)で知らせる。
+
+- 判定は `lib.js` の `isUnknownModel()` で、`cost()` が $0 にする条件と同じ。見るのは assistant レコードの `message.model` だけ(Agent ツールの入力にある `"model":"sonnet"` のようなエイリアスは拾わない)。
+- ファイルごとに前回読み終えたバイト位置を `~/.claude/usage-tracker/model-watch.json` に持ち、差分だけを読む。普段は 0.2 秒以内。初回と状態ファイルが壊れたときだけ全量を読む(30 日分の約 380MB で約 1.2 秒)。書き込み途中で改行が来ていない行は、次回に読む。
+- 見つけたモデルは、単価表に足されるまで毎セッション通知し続ける。足せば次のセッションで消える。
+- 登録は `guard-hooks-snippet.json` の `SessionStart` を `~/.claude/settings.json` にマージする(下の guard.js と同じ手順)。自分の不具合でセッション開始を妨げないよう、例外は stderr に出して終了コード 0 で抜ける。
 
 コスト換算は API 定価で、キャッシュは input 単価に倍率を掛けて数える(`lib.js` の `cost()`)。
 

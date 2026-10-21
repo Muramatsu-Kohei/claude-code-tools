@@ -35,11 +35,18 @@ function modelKey(model) {
 
 // 単価表に無いモデルは 0 円として扱うしかないが、黙って落とすと集計漏れに気づけない。
 // 見かけた名前を控えておき、呼び出し側が最後に warnUnknownModels() で報告する。
+// 単価表に無い課金対象のモデルか。cost() の $0 扱いと model-watch.js の通知は同じ判定を使う
+// (別々に持つと、片方だけ NOT_BILLED や modelKey の規則が変わって食い違う)。
+function isUnknownModel(model) {
+  const key = modelKey(model);
+  return !PRICE[key] && !NOT_BILLED.has(key);
+}
+
 function cost(model, u) {
   const key = modelKey(model);
   const p = PRICE[key];
   if (!p) {
-    if (!NOT_BILLED.has(key)) unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
+    if (isUnknownModel(model)) unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
     return 0;
   }
   // 段階料金のモデルは prompt 長で単価表ごと切り替える(超えた分だけでなく全体が高い側になる)
@@ -315,7 +322,7 @@ function warnUnknownModels() {
 }
 
 module.exports = {
-  PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records,
+  PRICE, ROOT, modelKey, isUnknownModel, cost, ctxLen, walk, transcriptFiles, records,
   isNonInteractive, isNonInteractiveSession, makeNonInteractiveFilter, makeUsageCollector,
   fileIdentity, makeUuidDedupe, warnUnknownModels,
 };
