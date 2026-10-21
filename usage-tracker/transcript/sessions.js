@@ -1,7 +1,7 @@
 'use strict';
 // セッション単位で「コンテキストがどこまで膨らんだか」「委譲したか自分で読んだか」を集計する。
 // 目的は運用ルール(委譲率を上げる/セッションを短く保つ)を実データで裏付けること。
-const { cost, ctxLen, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels, isFast } = require('./lib');
+const { cost, ctxLen, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels, isFast, hasMissingFast, fastCostLabel, FAST_MISSING_NOTE } = require('./lib');
 
 // メインスレッドで直接使うと文脈を太らせるツール群(委譲候補)
 const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch', 'WebSearch']);
@@ -100,7 +100,8 @@ const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch',
   // 払われるので、換算コストの中でも意味が違う。使っていなければ行ごと出さない。
   const fastCost = sessions.reduce((a, s) => a + s.costFast, 0);
   if (fastCost > 0) {
-    console.log(`(うち fast mode $${fastCost.toFixed(fastCost < 1 ? 2 : 0)}。サブスクではプラン枠の外の usage credits から実費で払われる)`);
+    console.log(`(うち fast mode ${fastCostLabel(fastCost)}。サブスクではプラン枠の外の usage credits から実費で払われる)`
+      + (hasMissingFast() ? FAST_MISSING_NOTE : ''));
   }
   // 親が消えていて合流先が無かった委譲ぶん。黙って落とすと総額が理由なく小さく出る。
   if (orphanCost >= 1) {

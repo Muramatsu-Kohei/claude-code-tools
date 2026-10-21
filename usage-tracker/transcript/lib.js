@@ -53,6 +53,9 @@ function cost(model, u) {
   // fast mode は単価表ごと差し替える(prompt 長によらず一律)。fast の単価が無いモデルで fast の
   // レコードが来たら、標準単価で数えたうえで warnUnknownModels() で知らせる($0 よりは近い)。
   // 段階料金のモデルは prompt 長で単価表ごと切り替える(超えた分だけでなく全体が高い側になる)。
+  // fast を long より先に評価するのは仕様どおり。公式の料金ページに「Fast mode pricing applies across
+  // the full context window, including requests over 200k input tokens」とあり、fast の単価は
+  // prompt 長で変わらない。long の判定に回すと fast の単価が長いリクエストで上書きされてしまう。
   const fast = isFast(u);
   if (fast && !p.fast) missingFast.set(key, (missingFast.get(key) || 0) + 1);
   const r = fast && p.fast ? p.fast
@@ -321,6 +324,21 @@ function makeUsageCollector(fileIsSub = false) {
   };
 }
 
+// fast の単価が無いモデルを標準単価で数えたレコードがあったか。fast の内訳を出す側が
+// 「その額は概算」と注記するために使う(warnUnknownModels() は stderr なので表示と切り離される)。
+function hasMissingFast() {
+  return missingFast.size > 0;
+}
+
+// 「うち fast mode」の額の表示。内数なので総額(toFixed(0))と桁を揃え、四捨五入で $0 になる
+// 額は「$1 未満」と出す(総額より大きく見える/0 に見える、のどちらも避ける)。
+function fastCostLabel(x) {
+  return x < 0.5 ? '$1 未満' : `$${x.toFixed(0)}`;
+}
+
+// hasMissingFast() が真のとき「うち fast mode」の行に足す注記。額に標準単価のままの分が混ざる。
+const FAST_MISSING_NOTE = '(fast の単価が無いモデルの分は標準単価で概算)';
+
 function warnUnknownModels() {
   const fmt = m => [...m.entries()].map(([k, n]) => `${k}(${n}件)`).join(', ');
   if (unknownModels.size) console.error(`\n警告: pricing.js に単価が無いモデルを $0 として集計した: ${fmt(unknownModels)}`);
@@ -332,5 +350,5 @@ function warnUnknownModels() {
 module.exports = {
   PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records,
   isNonInteractive, isNonInteractiveSession, makeNonInteractiveFilter, makeUsageCollector,
-  fileIdentity, makeUuidDedupe, warnUnknownModels, isFast,
+  fileIdentity, makeUuidDedupe, warnUnknownModels, isFast, hasMissingFast, fastCostLabel, FAST_MISSING_NOTE,
 };

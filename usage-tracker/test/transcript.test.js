@@ -7,7 +7,7 @@
 // 偽 HOME を作って USERPROFILE を差し替えるので、実際の ~/.claude/projects は読まない。
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 const lib = require('../transcript/lib');
 
 // .tmp 直下ではなく自分専用のサブディレクトリを使う(account-guard / claude-worklog と同じ規約)。
@@ -68,6 +68,15 @@ function run(script, home, args = [], extraEnv = {}) {
     }
     return { code: e.status, out: e.stdout || '', err: e.stderr || '' };
   }
+}
+
+// 終了コード 0 でも stderr が欲しいとき用(run() は成功時に stderr を捨てる)
+function runStderr(script, home, args = []) {
+  const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+  const r = spawnSync(process.execPath, [path.join(TRANSCRIPT, script), ...args], {
+    encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 30000,
+  });
+  return { code: r.status, out: r.stdout || '', err: r.stderr || '' };
 }
 
 const usage = (o = {}) => ({
@@ -186,18 +195,31 @@ console.log('\nfast mode');
 (() => {
   const home = sandbox('fast');
   writeTranscript(home, 'proj', 'cccccccc-0000-0000-0000-000000000001', [
-    // 標準: 40K 読み + 出力 → 30〜60K 帯。fast: 同じ量で単価だけ 2 倍
-    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1000 })),
-    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1000, speed: 'fast' })),
+    // 標準: 40K 読み + 出力 → 30〜60K 帯。fast: 同じ量で単価だけ高い
+    // 出力を 1e6 にするのは、総額が整数ドルで区別できるようにするため(小さいと $0 に丸まって、
+    // fast を合計から外しても通ってしまう)。
+    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1e6 })),
+    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1e6, speed: 'fast' })),
   ]);
   const tcf = run('turncost.js', home);
   check('turncost.js: fast mode のターンは帯に入れない', /^30〜60K\s+1\s/m.test(tcf.out), tcf.out);
   check('turncost.js: 外した件数を出力に添える', /fast mode のターン 1 件/.test(tcf.out), tcf.out);
 
   const ssf = run('sessions.js', home);
-  // opus-5: 標準 = (10*5 + 40e3*5*0.1 + 1000*25)/1e6 = 0.04505、fast = (10*10 + 40e3*10*0.1 + 1000*50)/1e6 = 0.0901
-  check('sessions.js: fast mode も合計に含める', /^セッション数: 1  総換算コスト: \$0$/m.test(ssf.out), ssf.out);
-  check('sessions.js: fast mode の分を別に示す', /うち fast mode \$0\.09。/.test(ssf.out), ssf.out);
+  // opus-5: 標準 = (10*5 + 40e3*5*0.1 + 1e6*25)/1e6 = 25.02、fast = (10*10 + 40e3*10*0.1 + 1e6*50)/1e6 = 50.04
+  // 含めれば 75.06 → $75、外せば $25
+  check('sessions.js: fast mode も合計に含める', /^セッション数: 1  総換算コスト: \$75$/m.test(ssf.out), ssf.out);
+  check('sessions.js: fast mode の分を別に示す(総額と同じ桁)', /うち fast mode \$50。/.test(ssf.out), ssf.out);
+  check('sessions.js: fast の単価が揃っていれば概算の注記を付けない', !/標準単価で概算/.test(ssf.out), ssf.out);
+
+  const hbf = run('habits.js', home, ['--since', '2026-01-01']);
+  check('habits.js: 換算コストに fast mode を含める', /換算コスト \$75$/m.test(hbf.out), hbf.out);
+  check('habits.js: 総額の直後に fast mode の行を出す',
+    /換算コスト \$75\n\(うち fast mode \$50。/.test(hbf.out), hbf.out);
+  const hbfj = run('habits.js', home, ['--since', '2026-01-01', '--json']);
+  let pj = null; try { pj = JSON.parse(hbfj.out); } catch (e) { pj = null; }
+  check('habits.js --json: fastCost を出し、cost は fast を含んだまま',
+    pj && Math.abs(pj.fastCost - 50.04) < 0.01 && Math.abs(pj.cost - 75.06) < 0.01, hbfj.out.slice(0, 200));
 
   const homeStd = sandbox('fast-none');
   writeTranscript(homeStd, 'proj', 'cccccccc-0000-0000-0000-000000000002', [
@@ -205,7 +227,46 @@ console.log('\nfast mode');
   ]);
   const ssn = run('sessions.js', homeStd);
   const tcn = run('turncost.js', homeStd);
-  check('使っていなければ fast mode の行を出さない', !/fast mode/.test(ssn.out + tcn.out), ssn.out + tcn.out);
+  const hbn = run('habits.js', homeStd, ['--since', '2026-01-01']);
+  check('使っていなければ fast mode の行を出さない', !/fast mode/.test(ssn.out + tcn.out + hbn.out), ssn.out + tcn.out + hbn.out);
+
+  // 端数: 0.5 未満の fast は $0 に丸まらず「$1 未満」と出す(内数が総額より大きく見えないように)
+  const homeTiny = sandbox('fast-tiny');
+  writeTranscript(homeTiny, 'proj', 'cccccccc-0000-0000-0000-000000000003', [
+    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1000, speed: 'fast' })),
+  ]);
+  const sst = run('sessions.js', homeTiny);
+  const hbt = run('habits.js', homeTiny, ['--since', '2026-01-01']);
+  check('sessions.js: 0.5 未満の fast は「$1 未満」', /うち fast mode \$1 未満。/.test(sst.out), sst.out);
+  check('habits.js: 0.5 未満の fast は「$1 未満」', /うち fast mode \$1 未満。/.test(hbt.out), hbt.out);
+
+  // fast の単価が無いモデル(sonnet-5-5)の fast は標準単価で入るので、額が概算である旨を添える
+  // 標準単価: (10*2 + 40e3*2*0.05 + 1e6*10)/1e6 = 10.02 → $10
+  const homeMiss = sandbox('fast-missing');
+  writeTranscript(homeMiss, 'proj', 'cccccccc-0000-0000-0000-000000000004', [
+    { ...assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1e6, speed: 'fast' })),
+      message: { model: 'claude-sonnet-5-5', usage: usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1e6, speed: 'fast' }) } },
+  ]);
+  const ssm = run('sessions.js', homeMiss);
+  const hbm = run('habits.js', homeMiss, ['--since', '2026-01-01']);
+  check('sessions.js: fast の単価が無いモデルの分は概算と注記する',
+    /うち fast mode \$10。.*\(fast の単価が無いモデルの分は標準単価で概算\)$/m.test(ssm.out), ssm.out);
+  check('habits.js: fast の単価が無いモデルの分は概算と注記する',
+    /うち fast mode \$10。.*\(fast の単価が無いモデルの分は標準単価で概算\)$/m.test(hbm.out), hbm.out);
+
+  // turncost は fast のターンを cost() の前に外していた。警告まで落ちないこと
+  // (opus-4-7 は表にあるが fast の単価が無い。opus-9-9 は表に無い)
+  const homeWarn = sandbox('fast-warn');
+  const modelRec = (model) => ({
+    type: 'assistant', timestamp: '2026-01-01T00:00:00.000Z', isSidechain: false,
+    message: { model, usage: usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1000, speed: 'fast' }) },
+  });
+  writeTranscript(homeWarn, 'proj', 'cccccccc-0000-0000-0000-000000000005', [modelRec('claude-opus-4-7'), modelRec('claude-opus-9-9')]);
+  const tcw = runStderr('turncost.js', homeWarn);
+  check('turncost.js: fast のターンでも fast の単価が無いモデルを警告する',
+    /fast mode の単価が無いモデルを標準単価で集計した: opus-4-7\(1件\)/.test(tcw.err), tcw.err);
+  check('turncost.js: fast のターンでも単価表に無いモデルを警告する',
+    /単価が無いモデルを \$0 として集計した: opus-9-9\(1件\)/.test(tcw.err), tcw.err);
 })();
 
 // ---- tool_result をツール名で集計できているか ----

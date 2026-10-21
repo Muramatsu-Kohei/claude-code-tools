@@ -54,9 +54,14 @@ const HEAVY_FROM = 150e3;
     for (const { usage, model, isSub: entrySub } of usages.entries()) {
       if (entrySub) continue;   // サブエージェントは対象外(メインの単価を測っている)
       if (!modelKey(model).startsWith('opus')) continue;
-      // fast mode は単価が一律 2 倍なので、混ざると「コンテキスト長による倍率」が歪む
+      // fast mode は単価が標準より高いので、混ざると「コンテキスト長による倍率」が歪む
       // (fast を使った時期の帯だけ高く出る)。件数だけ数えて帯からは外す。
-      if (isFast(usage)) { fastTurns++; continue; }
+      if (isFast(usage)) {
+        // 額は使わないが cost() を通す。continue で飛ばすと単価表に無いモデルや fast の単価の
+        // 欠落が記録されず、warnUnknownModels() の警告がこのスクリプトでだけ出なくなる。
+        cost(model, usage);
+        fastTurns++; continue;
+      }
       const ctx = ctxLen(usage);
       const i = BUCKETS.findIndex(([lo, hi]) => ctx >= lo && ctx < hi);
       if (i < 0) continue;
