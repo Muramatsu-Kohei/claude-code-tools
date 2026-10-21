@@ -18,6 +18,8 @@ const ROOT = path.join(HOME, '.claude', 'projects');
 const NOT_BILLED = new Set(['<synthetic>', 'unknown', '']);
 
 const unknownModels = new Map();
+// fast mode のレコードなのに pricing.js に fast の単価が無かったモデル(標準単価で数えている)
+const missingFast = new Map();
 
 // キャッシュの倍率(input 単価に掛ける)。値の置き場所はここだけにし、pricing.js には
 // 既定と違うモデルの read だけを書く。書き込みは 5 分 TTL / 1 時間 TTL ともに全モデル共通。
@@ -33,27 +35,70 @@ function modelKey(model) {
   return String(model || 'unknown').replace('claude-', '').replace(/-\d{8}$/, '');
 }
 
+// 単価表の行を引く(無ければ undefined)。PRICE は素のオブジェクトなので hasOwn で引く
+// ('claude-constructor' が Object.prototype の関数に当たらないように)。素の PRICE[key] を書かず必ずここを通す。
+function priceOf(key) {
+  return Object.hasOwn(PRICE, key) ? PRICE[key] : undefined;
+}
+
 // 単価表に無い課金対象のモデルか。cost() の $0 扱いと model-watch.js の通知は同じ判定を使う
 // (別々に持つと、片方だけ NOT_BILLED や modelKey の規則が変わって食い違う)。副作用は持たない。
 // modelKey() 済みのキーで受ける。modelKey() は冪等でない(末尾の日付を 1 つずつ落とす)ので、
 // 呼び出し側は modelKey() を 1 回だけ掛けたキーを渡すこと。
-// PRICE は素のオブジェクトなので hasOwn で引く('claude-constructor' が Object.prototype の関数に当たらないように)。
 function isUnknownKey(key) {
-  return !Object.hasOwn(PRICE, key) && !NOT_BILLED.has(key);
+  return !priceOf(key) && !NOT_BILLED.has(key);
+}
+
+// fast mode のリクエストか。単価が標準より高く(モデルにより 2〜6 倍)、サブスクではプラン枠の外(usage credits)から
+// 払われるので、cost() の単価切り替えのほか turncost.js は除外、sessions.js は内訳を分ける。
+function isFast(u) {
+  return !!u && u.speed === 'fast';
+}
+
+// fast mode のレコードなのに fast の単価が無く、標準単価で数えることになるか。単価表に足すべき欠落で、
+// noteModel() が警告に回す。p は単価表の行(無ければ undefined)。
+function lacksFast(p, u) {
+  return !!p && isFast(u) && !p.fast;
+}
+
+// fast mode の額が概算になるか。fast の単価が無い(標準単価で数える)か、単価はあるが時期や prompt 長に
+// よる差を扱っていない(pricing.js で approx を付けた行)とき。集計の出力に「概算」と添えるのに使う。
+// 欠落の判定は lacksFast() と同じものを使う(別々に書くと、警告と注記の条件が食い違う)。
+function isApproxFast(model, u) {
+  const p = priceOf(modelKey(model));
+  return lacksFast(p, u) || (!!p && isFast(u) && !!p.fast.approx);
 }
 
 // 単価表に無いモデルは 0 円として扱うしかないが、黙って落とすと集計漏れに気づけない。
 // 見かけた名前を控えておき、呼び出し側が最後に warnUnknownModels() で報告する。
 // 記録するかどうかは isUnknownKey() に任せる(課金対象外の <synthetic> などは記録しない)。
-function cost(model, u) {
+// cost() から切り離してあるのは、額を使わずに外すレコード(turncost.js の fast)でも
+// 欠落に気づけるようにするため。
+function noteModel(model, u) {
   const key = modelKey(model);
-  const p = Object.hasOwn(PRICE, key) ? PRICE[key] : null;
-  if (!p) {
-    if (isUnknownKey(key)) unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
-    return 0;
+  const p = priceOf(key);
+  if (isUnknownKey(key)) {
+    unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
+  } else if (lacksFast(p, u)) {
+    missingFast.set(key, (missingFast.get(key) || 0) + 1);
   }
-  // 段階料金のモデルは prompt 長で単価表ごと切り替える(超えた分だけでなく全体が高い側になる)
-  const r = p.long && ctxLen(u) > p.long.over ? p.long : p;
+}
+
+function cost(model, u) {
+  noteModel(model, u);
+  const p = priceOf(modelKey(model));
+  if (!p) return 0;
+  // fast mode は単価表ごと差し替える(prompt 長によらず一律)。fast の単価が無いモデルで fast の
+  // レコードが来たら、標準単価で数えたうえで warnUnknownModels() で知らせる($0 よりは近い)。
+  // 段階料金のモデルは prompt 長で単価表ごと切り替える(超えた分だけでなく全体が高い側になる)。
+  // fast を long より先に評価するのは仕様どおり。公式の料金ページに「Fast mode pricing applies across
+  // the full context window, including requests over 200k input tokens」とあり、fast の単価は
+  // prompt 長で変わらない。long の判定に回すと fast の単価が長いリクエストで上書きされてしまう。
+  // 例外は Opus 4.6 で、当時は 200k 超の割増と期間限定の半額があった。そこは扱わず、pricing.js で
+  // approx を付けて出力に「概算」と添える(isApproxFast())。
+  const fast = isFast(u);
+  const r = fast && p.fast ? p.fast
+    : p.long && ctxLen(u) > p.long.over ? p.long : p;
   // TTL 別の内訳(cache_creation.ephemeral_1h_*)があれば 1 時間 TTL 分を 2x で数える。Claude Code の
   // 書き込みは大半が 1 時間 TTL なので、合計を一律 1.25x にすると書き込みを過少に
   // 見積もる。ただし 5 分 TTL も混ざるので「全部 1h」とみなしてもいけない。
@@ -328,14 +373,27 @@ function makeUsageCollector(fileIsSub = false) {
   };
 }
 
+// 総額の直後に出す「うち fast mode」の行。sessions.js と habits.js で文面を揃えるためここに置く。
+// 使っていなければ null(行ごと出さない)。approx は集計対象に isApproxFast() のレコードがあったか。
+// 額は総額(toFixed(0))と桁を揃える。四捨五入で $0 になる額は「$0.5 未満」と出す。「$1 未満」だと
+// 総額が $0 のときに内数の方が大きく見え、「$0」だと使っていないように見えるため。
+function fastCostLine(fast, approx) {
+  if (!(fast > 0)) return null;
+  const label = fast < 0.5 ? '$0.5 未満' : `$${fast.toFixed(0)}`;
+  return `(うち fast mode ${label}。サブスクではプラン枠の外の usage credits から実費で払われる)`
+    + (approx ? '(一部は概算: fast の単価が無いモデルは標準単価で、時期や prompt 長による差を扱わないモデルはその差を除いて数えた)' : '');
+}
+
 function warnUnknownModels() {
-  if (!unknownModels.size) return;
-  const list = [...unknownModels.entries()].map(([m, n]) => `${m}(${n}件)`).join(', ');
-  console.error(`\n警告: pricing.js に単価が無いモデルを $0 として集計した: ${list}`);
+  const fmt = m => [...m.entries()].map(([k, n]) => `${k}(${n}件)`).join(', ');
+  if (unknownModels.size) console.error(`\n警告: pricing.js に単価が無いモデルを $0 として集計した: ${fmt(unknownModels)}`);
+  if (missingFast.size) {
+    console.error(`\n警告: pricing.js に fast mode の単価が無いモデルのレコードがあった(額に入れる集計では標準単価で数える。集計から外したレコードも件数に含む): ${fmt(missingFast)}`);
+  }
 }
 
 module.exports = {
   PRICE, ROOT, modelKey, isUnknownKey, cost, ctxLen, walk, transcriptFiles, records,
   isNonInteractive, isNonInteractiveSession, makeNonInteractiveFilter, makeUsageCollector,
-  fileIdentity, makeUuidDedupe, warnUnknownModels,
+  fileIdentity, makeUuidDedupe, warnUnknownModels, noteModel, isFast, isApproxFast, fastCostLine,
 };

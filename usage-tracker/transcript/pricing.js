@@ -9,6 +9,11 @@
 // long は prompt 長で単価が切り替わるモデル用。prompt(input + cache 書き込み + cache 読み)が
 // over を超えたリクエストは、全トークンを long 側の in/out(と read があればそれ)で数える。
 // 4.6 以降で長コンテキストの割増があるのは Haiku 5.5 だけ(他は 1M まで標準単価)。
+// fast は fast mode(usage.speed === 'fast')の in/out。prompt 長によらず一律で、キャッシュ倍率は
+// その上に通常どおり掛かる(read も標準と同じ値を使う)。現行の料金表にあるのは Opus 5.5 / 5 / 4.8。
+// Opus 4.6 は提供時(2026-02)に公表された $30/$150 を入れてある。当時は 200k 超が $60/$225、
+// 2/16 までは半額だったが、どちらも扱わない(この時期の fast は過少/過大に出る)。
+// Opus 4.7 は fast の単価を確かめられていないので持たせない(標準単価で数えて警告する)。
 // キーは日付なしの形で書く。lib.js の modelKey() が ID 末尾の -YYYYMMDD を落とす。
 //
 // 表に無いモデルは $0 で数えられ、warnUnknownModels() が報告する。5.5 世代の追加漏れで
@@ -16,11 +21,13 @@
 module.exports = {
   'fable-5-1':          { in: 10,  out: 50,  read: 0.025 },
   'fable-5':            { in: 10,  out: 50 },
-  'opus-5-5':           { in: 4,   out: 20,  read: 0.05 },
-  'opus-5':             { in: 5,   out: 25 },
-  'opus-4-8':           { in: 5,   out: 25 },
+  'opus-5-5':           { in: 4,   out: 20,  read: 0.05, fast: { in: 8,  out: 40 } },
+  'opus-5':             { in: 5,   out: 25,              fast: { in: 10, out: 50 } },
+  'opus-4-8':           { in: 5,   out: 25,              fast: { in: 10, out: 50 } },
   'opus-4-7':           { in: 5,   out: 25 },
-  'opus-4-6':           { in: 5,   out: 25 },
+  // fast は提供時に公表された $30/$150。当時あった 200k 超の割増と 2026-02-16 までの半額は扱わないので、
+  // approx を付けて集計の出力に「概算」と出す
+  'opus-4-6':           { in: 5,   out: 25,              fast: { in: 30, out: 150, approx: true } },
   'sonnet-5-5':         { in: 2,   out: 10,  read: 0.05 },
   // 発売時の導入価格 $2/$10 がそのまま定価になった(9/1 の $3/$15 への値上げは中止)
   'sonnet-5':           { in: 2,   out: 10 },

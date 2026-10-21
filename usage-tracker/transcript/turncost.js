@@ -1,7 +1,7 @@
 'use strict';
 // コンテキスト長そのものが1ターンの単価をどれだけ押し上げるかを測る。
 // セッションを「どこで切るべきか」の閾値を決めるのが目的。
-const { cost, ctxLen, modelKey, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels } = require('./lib');
+const { cost, ctxLen, modelKey, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels, noteModel, isFast } = require('./lib');
 
 const BUCKETS = [
   [0, 30e3, '〜30K'], [30e3, 60e3, '30〜60K'], [60e3, 100e3, '60〜100K'],
@@ -22,7 +22,7 @@ const HEAVY_FROM = 150e3;
   const b = BUCKETS.map(() => ({ n: 0, cost: 0 }));
   // 非対話実行(claude -p / SDK)は集計から外す。判定は lib.js に集約してある。
   const nonInteractiveFile = makeNonInteractiveFilter();
-  let sdkSessions = 0, sdkRecords = 0;
+  let sdkSessions = 0, sdkRecords = 0, fastTurns = 0, afterFastTurns = 0;
   // --resume / fork の複製をレコードごと落とす(規則と実測は lib.js の makeUuidDedupe)。
   // 複製が残るとターン数が水増しされ、割って出す 1 ターンあたりの単価まで狂う。
   const isDuplicate = makeUuidDedupe();
@@ -51,9 +51,25 @@ const HEAVY_FROM = 150e3;
       usages.add(o);
     }
     // 応答ごとに 1 回だけ帯に入れる(ファイルを読み終えてから回す)。
+    // 直前のメインのターンが fast だったか。fast と標準を切り替えるとプロンプトキャッシュが効かなく
+    // なるので、fast の直後の標準ターンはキャッシュを書き直して、同じ長さの他のターンより高く出る
+    let prevFast = false;
     for (const { usage, model, isSub: entrySub } of usages.entries()) {
       if (entrySub) continue;   // サブエージェントは対象外(メインの単価を測っている)
+      // 判定は Opus に絞る前に、モデルを問わず直前のメインのターンで見る
+      const afterFast = prevFast && !isFast(usage);
+      prevFast = isFast(usage);
       if (!modelKey(model).startsWith('opus')) continue;
+      // fast mode は単価が標準より高いので、混ざると「コンテキスト長による倍率」が歪む
+      // (fast を使った時期の帯だけ高く出る)。件数だけ数えて帯からは外す。
+      if (isFast(usage)) {
+        // 額は使わないがモデルは控える。飛ばすと単価表に無いモデルや fast の単価の欠落が
+        // 記録されず、warnUnknownModels() の警告がこのスクリプトでだけ出なくなる。
+        noteModel(model, usage);
+        fastTurns++; continue;
+      }
+      // 切り替え直後の標準ターンも、キャッシュの書き直しで倍率が歪むので外す。モデルは fast と同じく控える
+      if (afterFast) { noteModel(model, usage); afterFastTurns++; continue; }
       const ctx = ctxLen(usage);
       const i = BUCKETS.findIndex(([lo, hi]) => ctx >= lo && ctx < hi);
       if (i < 0) continue;
@@ -66,6 +82,11 @@ const HEAVY_FROM = 150e3;
     const excluded = [`セッション ${sdkSessions} 本`];
     if (sdkRecords) excluded.push(`単独レコード ${sdkRecords} 件`);
     console.log(`(非対話実行 claude -p の${excluded.join(' / ')}は集計から除外)\n`);
+  }
+  // 直後のターンだけが外れることもある(Opus 以外の fast の後に Opus の標準ターンが来たとき)。
+  // そのときも件数を出さないと、帯のターン数が説明なく減る
+  if (fastTurns || afterFastTurns) {
+    console.log(`(fast mode のターン ${fastTurns} 件と、その直後の標準ターン ${afterFastTurns} 件は単価が違うので集計から除外)\n`);
   }
   console.log(`コンテキスト長      ターン数    合計$    $/ターン  ${BASE_LABEL}比`);
   const baseIdx = BUCKETS.findIndex(([, , label]) => label === BASE_LABEL);
