@@ -7,7 +7,7 @@
 //
 // 使い方: node habits.js [--days 14] [--gap 分] [--since YYYY-MM-DD] [--json]
 const fs = require('fs');
-const { cost, ctxLen, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels, isFast, hasMissingFast, fastCostLabel, FAST_MISSING_NOTE } = require('./lib');
+const { cost, ctxLen, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels, isFast, isApproxFast, fastCostLine } = require('./lib');
 
 // 作業時間の既定のギャップ閾値(分)。これより長い無操作は「作業していない」とみなす。
 // 5分だと 1 回の長い実行待ちで切れ、60分だと食事や仮眠を含んでしまう。
@@ -146,7 +146,7 @@ function activeMinutes(sorted, gapMin) {
     perProject: new Map(),         // project -> 時刻配列
     hours: new Array(24).fill(0),
     userMsgs: 0, userChars: 0, msgLens: [], commands: 0, interrupts: 0, sdkSkipped: 0, sdkSessions: 0,
-    assistantTurns: 0, toolUses: 0, totalCost: 0, fastCost: 0,
+    assistantTurns: 0, toolUses: 0, totalCost: 0, fastCost: 0, fastApprox: false,
     subTurns: 0, subToolUses: 0, subCost: 0, subAgentRuns: 0, subTools: new Map(),
     tools: new Map(), skills: new Map(), agents: new Map(), cmds: new Map(),
     models: new Map(),
@@ -301,6 +301,7 @@ function activeMinutes(sorted, gapMin) {
       const c = cost(model, usage);
       stat.totalCost += c;
       if (isFast(usage)) stat.fastCost += c;   // 合計の内数(fast mode の分)
+      if (isApproxFast(model, usage)) stat.fastApprox = true;
       bump(stat.models, String(model || 'unknown'), 1);
       if (entrySub) stat.subCost += c;
       if (!sess) continue;   // 期間内のレコードが 1 件も無ければセッションは作られていない
@@ -457,6 +458,9 @@ function activeMinutes(sorted, gapMin) {
     },
     cost: stat.totalCost,
     fastCost: stat.fastCost,
+    // fastCost に fast の単価が無いモデルの分が標準単価で入っている(下限の概算)。stderr の警告は
+    // JSON の利用側に届かないことが多いので、値の横に持たせる。
+    fastApprox: stat.fastApprox,
   };
 
   if (opt.json) {
@@ -482,11 +486,9 @@ function activeMinutes(sorted, gapMin) {
   }
   console.log(`作業時間 ${f1(totalHours)}h  稼働日 ${result.period.activeDays}/${nDays}日  `
     + `1稼働日あたり ${f1(result.time.perActiveDay)}h  換算コスト $${stat.totalCost.toFixed(0)}`);
-  // fast mode は合計に含めたうえで別に示す(usage credits から実費で払われる。sessions.js と同じ扱い)。
-  if (stat.fastCost > 0) {
-    console.log(`(うち fast mode ${fastCostLabel(stat.fastCost)}。プラン枠の外の usage credits から実費で払われる)`
-      + (hasMissingFast() ? FAST_MISSING_NOTE : ''));
-  }
+  // fast mode は合計に含めたうえで別に示す(文面は sessions.js と共通で lib.js の fastCostLine)。
+  const fastLine = fastCostLine(stat.fastCost, stat.fastApprox);
+  if (fastLine) console.log(fastLine);
 
   console.log('\n--- ギャップ閾値ごとの作業時間(推定の振れ幅) ---');
   for (const s of sweep) console.log(`gap=${String(s.gap).padStart(2)}分  ${f1(s.hours).padStart(6)}h  ブロック ${s.blocks}`);

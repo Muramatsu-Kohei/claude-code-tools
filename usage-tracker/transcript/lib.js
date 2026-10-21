@@ -41,15 +41,30 @@ function isFast(u) {
   return !!u && u.speed === 'fast';
 }
 
+// fast mode のレコードなのに fast の単価が無く、標準単価で数えることになるか。額が概算になる。
+function isApproxFast(model, u) {
+  const p = PRICE[modelKey(model)];
+  return !!p && isFast(u) && !p.fast;
+}
+
 // 単価表に無いモデルは 0 円として扱うしかないが、黙って落とすと集計漏れに気づけない。
 // 見かけた名前を控えておき、呼び出し側が最後に warnUnknownModels() で報告する。
-function cost(model, u) {
+// cost() から切り離してあるのは、額を使わずに外すレコード(turncost.js の fast)でも
+// 欠落に気づけるようにするため。
+function noteModel(model, u) {
   const key = modelKey(model);
   const p = PRICE[key];
   if (!p) {
     if (!NOT_BILLED.has(key)) unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
-    return 0;
+  } else if (isFast(u) && !p.fast) {
+    missingFast.set(key, (missingFast.get(key) || 0) + 1);
   }
+}
+
+function cost(model, u) {
+  noteModel(model, u);
+  const p = PRICE[modelKey(model)];
+  if (!p) return 0;
   // fast mode は単価表ごと差し替える(prompt 長によらず一律)。fast の単価が無いモデルで fast の
   // レコードが来たら、標準単価で数えたうえで warnUnknownModels() で知らせる($0 よりは近い)。
   // 段階料金のモデルは prompt 長で単価表ごと切り替える(超えた分だけでなく全体が高い側になる)。
@@ -57,7 +72,6 @@ function cost(model, u) {
   // the full context window, including requests over 200k input tokens」とあり、fast の単価は
   // prompt 長で変わらない。long の判定に回すと fast の単価が長いリクエストで上書きされてしまう。
   const fast = isFast(u);
-  if (fast && !p.fast) missingFast.set(key, (missingFast.get(key) || 0) + 1);
   const r = fast && p.fast ? p.fast
     : p.long && ctxLen(u) > p.long.over ? p.long : p;
   // TTL 別の内訳(cache_creation.ephemeral_1h_*)があれば 1 時間 TTL 分を 2x で数える。Claude Code の
@@ -324,20 +338,16 @@ function makeUsageCollector(fileIsSub = false) {
   };
 }
 
-// fast の単価が無いモデルを標準単価で数えたレコードがあったか。fast の内訳を出す側が
-// 「その額は概算」と注記するために使う(warnUnknownModels() は stderr なので表示と切り離される)。
-function hasMissingFast() {
-  return missingFast.size > 0;
+// 総額の直後に出す「うち fast mode」の行。sessions.js と habits.js で文面を揃えるためここに置く。
+// 使っていなければ null(行ごと出さない)。approx は集計対象に isApproxFast() のレコードがあったか。
+// 額は総額(toFixed(0))と桁を揃える。四捨五入で $0 になる額は「$0.5 未満」と出す。「$1 未満」だと
+// 総額が $0 のときに内数の方が大きく見え、「$0」だと使っていないように見えるため。
+function fastCostLine(fast, approx) {
+  if (!(fast > 0)) return null;
+  const label = fast < 0.5 ? '$0.5 未満' : `$${fast.toFixed(0)}`;
+  return `(うち fast mode ${label}。サブスクではプラン枠の外の usage credits から実費で払われる)`
+    + (approx ? '(fast の単価が無いモデルの分は標準単価で概算)' : '');
 }
-
-// 「うち fast mode」の額の表示。内数なので総額(toFixed(0))と桁を揃え、四捨五入で $0 になる
-// 額は「$1 未満」と出す(総額より大きく見える/0 に見える、のどちらも避ける)。
-function fastCostLabel(x) {
-  return x < 0.5 ? '$1 未満' : `$${x.toFixed(0)}`;
-}
-
-// hasMissingFast() が真のとき「うち fast mode」の行に足す注記。額に標準単価のままの分が混ざる。
-const FAST_MISSING_NOTE = '(fast の単価が無いモデルの分は標準単価で概算)';
 
 function warnUnknownModels() {
   const fmt = m => [...m.entries()].map(([k, n]) => `${k}(${n}件)`).join(', ');
@@ -350,5 +360,5 @@ function warnUnknownModels() {
 module.exports = {
   PRICE, ROOT, modelKey, cost, ctxLen, walk, transcriptFiles, records,
   isNonInteractive, isNonInteractiveSession, makeNonInteractiveFilter, makeUsageCollector,
-  fileIdentity, makeUuidDedupe, warnUnknownModels, isFast, hasMissingFast, fastCostLabel, FAST_MISSING_NOTE,
+  fileIdentity, makeUuidDedupe, warnUnknownModels, noteModel, isFast, isApproxFast, fastCostLine,
 };

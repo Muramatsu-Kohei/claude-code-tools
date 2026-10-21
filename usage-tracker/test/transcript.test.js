@@ -7,7 +7,7 @@
 // 偽 HOME を作って USERPROFILE を差し替えるので、実際の ~/.claude/projects は読まない。
 const fs = require('fs');
 const path = require('path');
-const { execFileSync, spawnSync } = require('child_process');
+const { spawnSync } = require('child_process');
 const lib = require('../transcript/lib');
 
 // .tmp 直下ではなく自分専用のサブディレクトリを使う(account-guard / claude-worklog と同じ規約)。
@@ -44,38 +44,27 @@ function run(script, home, args = [], extraEnv = {}) {
   // 'ignore' で閉じているのでこのスクリプト自体がハングする経路は無いはずだが、
   // 念のための保険。
   const timeout = 30000;
-  try {
-    const out = execFileSync(process.execPath, [path.join(TRANSCRIPT, script), ...args], {
-      encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
-      timeout, killSignal: 'SIGKILL',
-    });
-    return { code: 0, out, err: '' };
-  } catch (e) {
-    // 終了ステータスが無いまま死んだ場合(e.status が null / undefined)は、呼び出し側の
-    // 「非ゼロ終了 = 想定どおり失敗した」という判定に混ぜてはいけない。timeout(ETIMEDOUT)
-    // のほかに maxBuffer 超過(ENOBUFS)・外部や OOM による kill も同じ形で来るので、
-    // code ではなく status の有無で判別する。ここで -1 に潰すと基盤の異常が
-    // PASS として集計される。
-    if (e.status == null) {
-      const why = e.code === 'ETIMEDOUT'
-        ? `timeout(${timeout}ms)で強制終了された`
-        : `終了コードを残さずに落ちた(code=${e.code || '不明'} signal=${e.signal || 'なし'})`;
-      // stderr は末尾 3 行だけ添える(全部出すと ENOBUFS で ~1MB がログに流れる)。
-      // cause で stdout を含む元の例外を残す(issue #8 の原因究明の材料にするため)。
-      const tail = (e.stderr || '').trim().split('\n').slice(-3).join('\n');
-      const msg = `子プロセスが${why}: ${script}`;
-      throw new Error(tail ? `${msg}\n  stderr(末尾): ${tail}` : msg, { cause: e });
-    }
-    return { code: e.status, out: e.stdout || '', err: e.stderr || '' };
-  }
-}
-
-// 終了コード 0 でも stderr が欲しいとき用(run() は成功時に stderr を捨てる)
-function runStderr(script, home, args = []) {
-  const env = { ...process.env, USERPROFILE: home, HOME: home, NO_COLOR: '1' };
+  // 成功時も stderr を返す(警告の文面を検証するテストがある)ので spawnSync を使う。
   const r = spawnSync(process.execPath, [path.join(TRANSCRIPT, script), ...args], {
-    encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 30000,
+    encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+    timeout, killSignal: 'SIGKILL',
   });
+  // 終了ステータスが無いまま死んだ場合(r.status が null)は、呼び出し側の
+  // 「非ゼロ終了 = 想定どおり失敗した」という判定に混ぜてはいけない。timeout(ETIMEDOUT)
+  // のほかに maxBuffer 超過(ENOBUFS)・外部や OOM による kill も同じ形で来るので、
+  // code ではなく status の有無で判別する。ここで -1 に潰すと基盤の異常が
+  // PASS として集計される。
+  if (r.status == null) {
+    const code = r.error && r.error.code;
+    const why = code === 'ETIMEDOUT'
+      ? `timeout(${timeout}ms)で強制終了された`
+      : `終了コードを残さずに落ちた(code=${code || '不明'} signal=${r.signal || 'なし'})`;
+    // stderr は末尾 3 行だけ添える(全部出すと ENOBUFS で ~1MB がログに流れる)。
+    // cause で stdout を含む結果を残す(issue #8 の原因究明の材料にするため)。
+    const tail = (r.stderr || '').trim().split('\n').slice(-3).join('\n');
+    const msg = `子プロセスが${why}: ${script}`;
+    throw new Error(tail ? `${msg}\n  stderr(末尾): ${tail}` : msg, { cause: r.error || r });
+  }
   return { code: r.status, out: r.stdout || '', err: r.stderr || '' };
 }
 
@@ -168,6 +157,8 @@ check('fast mode の Opus 5.5 は $8/$40、キャッシュ読みは 0.05 倍の�
 check('fast mode の Opus 5 は $10/$50、キャッシュ書き込みも fast の単価に掛かる',
   near(lib.cost('claude-opus-5', usage({ input_tokens: 1e6, output_tokens: 1e6, cache_creation_input_tokens: 1e6, speed: 'fast' })),
     10 + 50 + 12.5));
+check('fast mode の Opus 4.6 は提供時の $30/$150',
+  near(lib.cost('claude-opus-4-6', usage({ input_tokens: 1e6, output_tokens: 1e6, speed: 'fast' })), 30 + 150));
 check('speed が standard なら通常の単価',
   near(lib.cost('claude-opus-5-5', usage({ input_tokens: 1e6, speed: 'standard' })), 4));
 check('fast の単価が無いモデルは標準単価で数える($0 にしない)',
@@ -230,15 +221,20 @@ console.log('\nfast mode');
   const hbn = run('habits.js', homeStd, ['--since', '2026-01-01']);
   check('使っていなければ fast mode の行を出さない', !/fast mode/.test(ssn.out + tcn.out + hbn.out), ssn.out + tcn.out + hbn.out);
 
-  // 端数: 0.5 未満の fast は $0 に丸まらず「$1 未満」と出す(内数が総額より大きく見えないように)
+  // 端数: 0.5 未満の fast は $0 に丸めず「$0.5 未満」と出す。総額も $0 に丸まる場合に
+  // 内数の方が大きく読めないこと(「$1 未満」だと総額 $0 と食い違う)
   const homeTiny = sandbox('fast-tiny');
   writeTranscript(homeTiny, 'proj', 'cccccccc-0000-0000-0000-000000000003', [
     assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1000, speed: 'fast' })),
   ]);
   const sst = run('sessions.js', homeTiny);
   const hbt = run('habits.js', homeTiny, ['--since', '2026-01-01']);
-  check('sessions.js: 0.5 未満の fast は「$1 未満」', /うち fast mode \$1 未満。/.test(sst.out), sst.out);
-  check('habits.js: 0.5 未満の fast は「$1 未満」', /うち fast mode \$1 未満。/.test(hbt.out), hbt.out);
+  check('sessions.js: 0.5 未満の fast は「$0.5 未満」(総額 $0 と矛盾しない)',
+    /総換算コスト: \$0\n\(うち fast mode \$0\.5 未満。/.test(sst.out), sst.out);
+  check('habits.js: 0.5 未満の fast は「$0.5 未満」', /うち fast mode \$0\.5 未満。/.test(hbt.out), hbt.out);
+  check('sessions.js と habits.js の fast の行は同じ文面',
+    (sst.out.match(/^\(うち fast mode .*$/m) || [])[0] === (hbt.out.match(/^\(うち fast mode .*$/m) || [])[0],
+    sst.out + hbt.out);
 
   // fast の単価が無いモデル(sonnet-5-5)の fast は標準単価で入るので、額が概算である旨を添える
   // 標準単価: (10*2 + 40e3*2*0.05 + 1e6*10)/1e6 = 10.02 → $10
@@ -253,6 +249,24 @@ console.log('\nfast mode');
     /うち fast mode \$10。.*\(fast の単価が無いモデルの分は標準単価で概算\)$/m.test(ssm.out), ssm.out);
   check('habits.js: fast の単価が無いモデルの分は概算と注記する',
     /うち fast mode \$10。.*\(fast の単価が無いモデルの分は標準単価で概算\)$/m.test(hbm.out), hbm.out);
+  const hbmj = run('habits.js', homeMiss, ['--since', '2026-01-01', '--json']);
+  let pmj = null; try { pmj = JSON.parse(hbmj.out); } catch (e) { pmj = null; }
+  check('habits.js --json: 概算が混ざれば fastApprox が true', pmj && pmj.fastApprox === true, hbmj.out.slice(0, 200));
+  check('habits.js --json: fast の単価が揃っていれば fastApprox は false', pj && pj.fastApprox === false, hbfj.out.slice(0, 200));
+
+  // 概算の注記は集計に入ったセッションだけで決める。親の消えたサブエージェント(集計から除外)に
+  // fast の単価が無いモデルがあっても、正しい単価だけの fast の額に注記を付けない
+  const homeOrphan = sandbox('fast-orphan');
+  writeTranscript(homeOrphan, 'proj', 'cccccccc-0000-0000-0000-000000000006', [
+    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1e6, speed: 'fast' })),
+  ]);
+  writeTranscript(homeOrphan, path.join('proj', 'cccccccc-0000-0000-0000-000000000007', 'subagents'), 'agent-orphan', [
+    { ...assistant(usage({ output_tokens: 1e6, speed: 'fast' })), isSidechain: true,
+      message: { model: 'claude-opus-4-7', usage: usage({ output_tokens: 1e6, speed: 'fast' }) } },
+  ]);
+  const sso = run('sessions.js', homeOrphan);
+  check('sessions.js: 除外した孤児サブエージェントの概算で注記を付けない',
+    /うち fast mode \$50。/.test(sso.out) && /親 transcript の無いサブエージェント/.test(sso.out) && !/標準単価で概算/.test(sso.out), sso.out);
 
   // turncost は fast のターンを cost() の前に外していた。警告まで落ちないこと
   // (opus-4-7 は表にあるが fast の単価が無い。opus-9-9 は表に無い)
@@ -262,7 +276,7 @@ console.log('\nfast mode');
     message: { model, usage: usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1000, speed: 'fast' }) },
   });
   writeTranscript(homeWarn, 'proj', 'cccccccc-0000-0000-0000-000000000005', [modelRec('claude-opus-4-7'), modelRec('claude-opus-9-9')]);
-  const tcw = runStderr('turncost.js', homeWarn);
+  const tcw = run('turncost.js', homeWarn);
   check('turncost.js: fast のターンでも fast の単価が無いモデルを警告する',
     /fast mode の単価が無いモデルを標準単価で集計した: opus-4-7\(1件\)/.test(tcw.err), tcw.err);
   check('turncost.js: fast のターンでも単価表に無いモデルを警告する',

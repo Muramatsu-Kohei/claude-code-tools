@@ -1,7 +1,7 @@
 'use strict';
 // コンテキスト長そのものが1ターンの単価をどれだけ押し上げるかを測る。
 // セッションを「どこで切るべきか」の閾値を決めるのが目的。
-const { cost, ctxLen, modelKey, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels, isFast } = require('./lib');
+const { cost, ctxLen, modelKey, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels, noteModel, isFast } = require('./lib');
 
 const BUCKETS = [
   [0, 30e3, '〜30K'], [30e3, 60e3, '30〜60K'], [60e3, 100e3, '60〜100K'],
@@ -57,9 +57,9 @@ const HEAVY_FROM = 150e3;
       // fast mode は単価が標準より高いので、混ざると「コンテキスト長による倍率」が歪む
       // (fast を使った時期の帯だけ高く出る)。件数だけ数えて帯からは外す。
       if (isFast(usage)) {
-        // 額は使わないが cost() を通す。continue で飛ばすと単価表に無いモデルや fast の単価の
-        // 欠落が記録されず、warnUnknownModels() の警告がこのスクリプトでだけ出なくなる。
-        cost(model, usage);
+        // 額は使わないがモデルは控える。飛ばすと単価表に無いモデルや fast の単価の欠落が
+        // 記録されず、warnUnknownModels() の警告がこのスクリプトでだけ出なくなる。
+        noteModel(model, usage);
         fastTurns++; continue;
       }
       const ctx = ctxLen(usage);

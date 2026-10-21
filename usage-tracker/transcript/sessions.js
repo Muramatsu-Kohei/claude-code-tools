@@ -1,7 +1,7 @@
 'use strict';
 // セッション単位で「コンテキストがどこまで膨らんだか」「委譲したか自分で読んだか」を集計する。
 // 目的は運用ルール(委譲率を上げる/セッションを短く保つ)を実データで裏付けること。
-const { cost, ctxLen, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels, isFast, hasMissingFast, fastCostLabel, FAST_MISSING_NOTE } = require('./lib');
+const { cost, ctxLen, transcriptFiles, records, isNonInteractive, makeNonInteractiveFilter, makeUsageCollector, fileIdentity, makeUuidDedupe, warnUnknownModels, isFast, isApproxFast, fastCostLine } = require('./lib');
 
 // メインスレッドで直接使うと文脈を太らせるツール群(委譲候補)
 const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch', 'WebSearch']);
@@ -41,6 +41,7 @@ const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch',
         heavy: 0, task: 0,  // メインでの重いツール呼び出し数 / サブエージェント委譲回数
         costMain: 0, costSub: 0,
         costFast: 0,        // うち fast mode の分(main/sub の内数)
+        fastApprox: false,  // costFast に fast の単価が無いモデルの分(標準単価の概算)が入ったか
         start: null, end: null,
       };
       byId.set(sid, s);
@@ -78,6 +79,7 @@ const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch',
     for (const { usage, model, isSub: entrySub } of usages.entries()) {
       const c = cost(model, usage);
       if (isFast(usage)) s.costFast += c;
+      if (isApproxFast(model, usage)) s.fastApprox = true;
       if (entrySub) { s.subTurns++; s.costSub += c; }
       else {
         s.mainTurns++; s.costMain += c;
@@ -98,11 +100,9 @@ const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch',
   console.log(`セッション数: ${sessions.length}  総換算コスト: $${totalCost.toFixed(0)}`);
   // fast mode は合計に含めたうえで別に示す。サブスクではプラン枠でなく usage credits から実費で
   // 払われるので、換算コストの中でも意味が違う。使っていなければ行ごと出さない。
-  const fastCost = sessions.reduce((a, s) => a + s.costFast, 0);
-  if (fastCost > 0) {
-    console.log(`(うち fast mode ${fastCostLabel(fastCost)}。サブスクではプラン枠の外の usage credits から実費で払われる)`
-      + (hasMissingFast() ? FAST_MISSING_NOTE : ''));
-  }
+  // 概算の注記も集計に入ったセッションだけで判定する(除外した孤児サブエージェントの分で付けない)。
+  const fastLine = fastCostLine(sessions.reduce((a, s) => a + s.costFast, 0), sessions.some(s => s.fastApprox));
+  if (fastLine) console.log(fastLine);
   // 親が消えていて合流先が無かった委譲ぶん。黙って落とすと総額が理由なく小さく出る。
   if (orphanCost >= 1) {
     console.log(`(親 transcript の無いサブエージェント $${orphanCost.toFixed(0)} は集計から除外)`);
