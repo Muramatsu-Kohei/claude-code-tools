@@ -37,8 +37,9 @@ function modelKey(model) {
 // (別々に持つと、片方だけ NOT_BILLED や modelKey の規則が変わって食い違う)。副作用は持たない。
 // 判定の本体は modelKey() 済みのキーで受ける isUnknownKey()。modelKey() は冪等でない
 // (末尾の日付を 1 つずつ落とす)ので、正規化済みのキーを isUnknownModel() に通し直してはいけない。
+// PRICE は素のオブジェクトなので hasOwn で引く('claude-constructor' が Object.prototype の関数に当たらないように)。
 function isUnknownKey(key) {
-  return !PRICE[key] && !NOT_BILLED.has(key);
+  return !Object.hasOwn(PRICE, key) && !NOT_BILLED.has(key);
 }
 function isUnknownModel(model) {
   return isUnknownKey(modelKey(model));
@@ -49,7 +50,7 @@ function isUnknownModel(model) {
 // 記録するかどうかは isUnknownKey() に任せる(課金対象外の <synthetic> などは記録しない)。
 function cost(model, u) {
   const key = modelKey(model);
-  const p = PRICE[key];
+  const p = Object.hasOwn(PRICE, key) ? PRICE[key] : null;
   if (!p) {
     if (isUnknownKey(key)) unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
     return 0;

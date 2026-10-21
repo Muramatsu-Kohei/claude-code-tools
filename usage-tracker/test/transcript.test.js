@@ -151,6 +151,11 @@ check('<synthetic> は $0 かつ警告しない',
 lib.cost('claude-madeup-9', usage({ input_tokens: 1e6 }));
 const warned = captureWarn();
 check('単価表に無いモデルは名前と件数を警告する', /madeup-9\(1件\)/.test(warned), warned);
+// 単価表は素のオブジェクトなので、Object.prototype の名前に当たるキーを既知と取り違えない
+const ctorCost = lib.cost('claude-constructor', usage({ input_tokens: 1e6 }));
+const ctorWarn = captureWarn();
+check('Object.prototype の名前と同じモデルも単価表に無いものとして $0 にし、警告する',
+  lib.isUnknownModel('claude-constructor') && ctorCost === 0 && /constructor\(1件\)/.test(ctorWarn), ctorWarn);
 
 // ---- コンテキスト長の帯域分類(指摘の本体) ----
 console.log('\nturncost.js');
@@ -1009,7 +1014,7 @@ console.log('\nmodel-watch.js');
   ]);
   const first = watch(home);
   check('初回は既存分も先頭から読んで通知し、同じ transcript 内の重複は 1 本と数える',
-    clean(first) && /madeup-1\(transcript 1 本\)/.test(warnOf(first)) && fs.existsSync(stateFile), JSON.stringify(first));
+    clean(first) && /madeup-1\(1 セッション\)/.test(warnOf(first)) && fs.existsSync(stateFile), JSON.stringify(first));
 
   // 新しい未知モデルと、拾ってはいけないもの(課金対象外・ツール入力のモデル名・assistant 以外)を足す。
   // user レコードは本文に "assistant" を含めて、文字列での前絞りを素通りさせる
@@ -1019,7 +1024,7 @@ console.log('\nmodel-watch.js');
       content: [{ type: 'tool_use', name: 'Agent', input: { model: 'sonnet' } }] } }) + '\n');
   const second = watch(home);
   const w2 = warnOf(second);
-  check('前回以降に現れた未知モデルを transcript の本数つきで通知する', clean(second) && /madeup-2\(transcript 1 本\)/.test(w2), JSON.stringify(second));
+  check('前回以降に現れた未知モデルを transcript の本数つきで通知する', clean(second) && /madeup-2\(1 セッション\)/.test(w2), JSON.stringify(second));
   check('課金対象外・ツール入力・assistant 以外のモデル名は通知しない',
     !/madeup-user|synthetic|sonnet|opus-5-5/.test(w2), w2);
   check('Claude 向けにも同じ内容を additionalContext で渡す',
@@ -1028,7 +1033,7 @@ console.log('\nmodel-watch.js');
 
   // 変わっていないファイルは開かず、それでも通知は続ける
   const third = watch(home);
-  check('新しい行が無くても、単価表に足されるまで通知を続ける', /madeup-2\(transcript 1 本\)/.test(warnOf(third)), third.out);
+  check('新しい行が無くても、単価表に足されるまで通知を続ける', /madeup-2\(1 セッション\)/.test(warnOf(third)), third.out);
   const idle = stats(home);
   check('サイズも更新時刻も変わっていないファイルは開かない', idle && idle.opened === 0 && idle.bytes === 0, JSON.stringify(idle));
   const line = rec('claude-opus-5-5');
@@ -1053,7 +1058,7 @@ console.log('\nmodel-watch.js');
   fs.appendFileSync(file, half.slice(20));
   const sixth = watch(home);
   check('書き込み途中の行は読まず、完結した次の回に数える',
-    !/partial-1/.test(warnOf(fifth)) && /partial-1\(transcript 1 本\)/.test(warnOf(sixth)), `${fifth.out}\n${sixth.out}`);
+    !/partial-1/.test(warnOf(fifth)) && /partial-1\(1 セッション\)/.test(warnOf(sixth)), `${fifth.out}\n${sixth.out}`);
 
   // 初回の後に作られたファイルは先頭から読む。同じモデルが別の transcript に出たら 2 本と数える
   // (同じファイルの読み直しでは増えない。--resume / fork の複製も別の 1 本になるのは仕様)
@@ -1062,23 +1067,23 @@ console.log('\nmodel-watch.js');
     { type: 'assistant', message: { model: 'claude-madeup-2', usage: usage() } },
   ]);
   const seventh = warnOf(watch(home));
-  check('初回の後に作られたファイルは先頭から読む', /madeup-3\(transcript 1 本\)/.test(seventh), seventh);
-  check('同じモデルが別の transcript にも出たら本数が増える', /madeup-2\(transcript 2 本\)/.test(seventh), seventh);
+  check('初回の後に作られたファイルは先頭から読む', /madeup-3\(1 セッション\)/.test(seventh), seventh);
+  check('同じモデルが別の transcript にも出たら本数が増える', /madeup-2\(2 セッション\)/.test(seventh), seventh);
 
   // 前回の位置より短く作り直されたファイルは、先頭から読み直す。作り直しで含まなくなったモデルは
   // そのファイルの分だけ数から外れる(madeup-1 は id1 にしか無かったので消え、madeup-2 は proj2 の 1 本が残る)
   writeTranscript(home, proj, id1, [{ type: 'assistant', message: { model: 'claude-rewritten-1', usage: usage() } }]);
   const shrunk = warnOf(watch(home));
-  check('前回より短く作り直されたファイルは先頭から読む', /rewritten-1\(transcript 1 本\)/.test(shrunk), shrunk);
+  check('前回より短く作り直されたファイルは先頭から読む', /rewritten-1\(1 セッション\)/.test(shrunk), shrunk);
   check('作り直しで含まなくなったモデルは、そのファイルの分だけ数から外れる',
-    !/madeup-1/.test(shrunk) && /madeup-2\(transcript 1 本\)/.test(shrunk), shrunk);
+    !/madeup-1/.test(shrunk) && /madeup-2\(1 セッション\)/.test(shrunk), shrunk);
   // 同じ長さ以上で作り直された場合はサイズでは分からないので、先頭の内容で見分ける
   writeTranscript(home, proj, id1, [
     { type: 'assistant', message: { model: 'claude-rewritten-2', usage: usage() } },
     { type: 'assistant', message: { model: 'claude-opus-5-5', usage: usage() } },
   ]);
   const regrown = warnOf(watch(home));
-  check('前回以上の長さで作り直されたファイルも、先頭が変わっていれば先頭から読む', /rewritten-2\(transcript 1 本\)/.test(regrown), regrown);
+  check('前回以上の長さで作り直されたファイルも、先頭が変わっていれば先頭から読む', /rewritten-2\(1 セッション\)/.test(regrown), regrown);
 
   // 先頭はそのままで短く切り詰められた場合は、先頭の内容では分からないのでサイズで見分ける。
   // 1 行目を先頭ハッシュの範囲より長くし、2 行目を切り詰めて短い行に置き換える
@@ -1090,7 +1095,7 @@ console.log('\nmodel-watch.js');
   watch(home);
   fs.writeFileSync(fileT, longFirst + rec('claude-trunc-1'));
   const truncated = warnOf(watch(home));
-  check('先頭を保ったまま前回より短くなったファイルも先頭から読む', /trunc-1\(transcript 1 本\)/.test(truncated), truncated);
+  check('先頭を保ったまま前回より短くなったファイルも先頭から読む', /trunc-1\(1 セッション\)/.test(truncated), truncated);
 
   // 先頭を保ったまま切り詰められ、前回の位置を超えて書き足された場合はサイズでも分からない。
   // 前回の位置の直前の内容で見分ける(見分けられないと、前回の位置から途中の行を読んで取りこぼす)
@@ -1100,14 +1105,14 @@ console.log('\nmodel-watch.js');
   watch(home);
   fs.writeFileSync(fileG, longFirst + rec('claude-regrow-1') + filler + filler);
   const regrew = warnOf(watch(home));
-  check('先頭を保ったまま切り詰めて前回より長く書き足されたファイルも先頭から読む', /regrow-1\(transcript 1 本\)/.test(regrew), regrew);
+  check('先頭を保ったまま切り詰めて前回より長く書き足されたファイルも先頭から読む', /regrow-1\(1 セッション\)/.test(regrew), regrew);
 
   // 1 行が読み込みの区切り(8MB)を何度もまたいでも、つなぎ直して 1 行として読む
   const fileL = path.join(home, '.claude', 'projects', 'proj3', 'bbbbbbbb-0000-0000-0000-000000000005.jsonl');
   fs.writeFileSync(fileL, JSON.stringify({ type: 'assistant', pad: 'y'.repeat(17 * 1024 * 1024),
     message: { model: 'claude-longline-1', usage: usage() } }) + '\n');
   const longLine = warnOf(watch(home));
-  check('区切りを 2 回以上またぐ長い行も 1 行として読む', /longline-1\(transcript 1 本\)/.test(longLine), longLine.slice(0, 300));
+  check('区切りを 2 回以上またぐ長い行も 1 行として読む', /longline-1\(1 セッション\)/.test(longLine), longLine.slice(0, 300));
   fs.rmSync(fileL);
 
   // 時間切れ(予算 0)なら走査を次回に回し、記録の無いファイルは次回に先頭から読む
@@ -1118,7 +1123,7 @@ console.log('\nmodel-watch.js');
   const next = watch(home);
   check('時間切れなら残りを次回に回し、その旨を stats に出す',
     late.code === 0 && !/budget-1/.test(warnOf(late)) && /時間切れで \d+ 本を次回に回した/.test(late.err), JSON.stringify(late));
-  check('時間切れで回したファイルは次回に読む', /budget-1\(transcript 1 本\)/.test(warnOf(next)), next.out);
+  check('時間切れで回したファイルは次回に読む', /budget-1\(1 セッション\)/.test(warnOf(next)), next.out);
   const idleLate = watch(home, { USAGE_TRACKER_MODEL_WATCH_BUDGET_MS: '0', USAGE_TRACKER_MODEL_WATCH_STATS: '1' });
   check('時間切れでも、変わっていないファイルは次回に回した数に入れない', idleLate.code === 0 && !/時間切れ/.test(idleLate.err), idleLate.err);
 
@@ -1143,14 +1148,48 @@ console.log('\nmodel-watch.js');
   const cut = watch(home, { USAGE_TRACKER_MODEL_WATCH_STATS: '1' }, ['-r', stubLate]);
   const resumed = warnOf(watch(home));
   check('1 本の途中で期限が来たら打ち切り、読めた分だけ通知して次回に回す',
-    cut.code === 0 && /huge-1\(transcript 1 本\)/.test(warnOf(cut)) && !/huge-2/.test(warnOf(cut)) && /時間切れで 1 本/.test(cut.err),
+    cut.code === 0 && /huge-1\(1 セッション\)/.test(warnOf(cut)) && !/huge-2/.test(warnOf(cut)) && /時間切れで 1 本/.test(cut.err),
     JSON.stringify({ ...cut, out: warnOf(cut) }));
   check('途中で打ち切ったファイルは次回に続きから読み、前半の分も数え続ける',
-    /huge-1\(transcript 1 本\)/.test(resumed) && /huge-2\(transcript 1 本\)/.test(resumed), resumed);
+    /huge-1\(1 セッション\)/.test(resumed) && /huge-2\(1 セッション\)/.test(resumed), resumed);
   // 消えた transcript は数から外れ、どこにも残っていないモデルは通知が止まる
   fs.rmSync(fileH);
   const gone = warnOf(watch(home));
   check('消えた transcript にしか無かったモデルは通知から消える', !/huge-/.test(gone) && /budget-1/.test(gone), gone);
+
+  // 区切りより長い 1 行の途中で期限が来ても、その行は読み切る(打ち切ると次回も同じ位置からで進まない)
+  const fileH3 = path.join(home, '.claude', 'projects', 'proj5', 'huge3-bbbbbbbb-0000-0000-0000-00000000000f.jsonl');
+  fs.writeFileSync(fileH3, JSON.stringify({ type: 'assistant', pad: 'w'.repeat(17 * 1024 * 1024),
+    message: { model: 'claude-hugeline-1', usage: usage() } }) + '\n');
+  const longCut = watch(home, {}, ['-r', stubLate]);
+  check('区切りより長い 1 行の途中で期限が来ても、その行は読み切って数える',
+    longCut.code === 0 && /hugeline-1\(1 セッション\)/.test(warnOf(longCut)), JSON.stringify({ ...longCut, out: warnOf(longCut) }));
+  fs.rmSync(fileH3);
+
+  // 作り直されたファイルの先頭からの読み直しを途中で打ち切っても、読み終えるまで前回の所属を残す。
+  // 残さないと、未読の後半にしか無いモデル(keep-1)が続きを読むまで通知から消える
+  const fileH2 = path.join(home, '.claude', 'projects', 'proj5', 'huge2-bbbbbbbb-0000-0000-0000-00000000000d.jsonl');
+  fs.writeFileSync(fileH2, rec('claude-keep-1') + rec('claude-old-1'));
+  watch(home);
+  fs.writeFileSync(fileH2, rec('claude-opus-5-5')
+    + JSON.stringify({ type: 'assistant', pad: 'v'.repeat(9 * 1024 * 1024), message: { model: 'claude-opus-5-5', usage: usage() } }) + '\n'
+    + rec('claude-keep-1'));
+  const midway = warnOf(watch(home, {}, ['-r', stubLate]));
+  const finished = warnOf(watch(home));
+  check('先頭からの読み直しを途中で打ち切っても、読み終えるまで前回の所属を残す',
+    /keep-1\(1 セッション\)/.test(midway) && /old-1\(1 セッション\)/.test(midway), midway);
+  check('読み直しを読み終えたら、作り直しで含まなくなったモデルを外す',
+    /keep-1\(1 セッション\)/.test(finished) && !/old-1/.test(finished), finished);
+  fs.rmSync(fileH2);
+
+  // サブエージェントの transcript は親セッションに合流させて数える(ファイルの本数だと 3 になる)
+  const sidS = 'bbbbbbbb-0000-0000-0000-00000000000e';
+  const subRec = [{ type: 'assistant', message: { model: 'claude-sub-1', usage: usage() } }];
+  writeTranscript(home, 'proj6', sidS, subRec);
+  writeTranscript(home, path.join('proj6', sidS, 'subagents'), 'agent-1', subRec);
+  writeTranscript(home, path.join('proj6', sidS, 'subagents'), 'agent-2', subRec);
+  const subs = warnOf(watch(home));
+  check('サブエージェントの transcript は親セッションに合流させて数える', /sub-1\(1 セッション\)/.test(subs), subs);
 
   // 障害の注入。fs を差し替える preload を -r で読ませる
   const stub = path.join(BASE, 'model-watch-stub.js');
@@ -1173,10 +1212,10 @@ console.log('\nmodel-watch.js');
   ]);
   const faulty = watch(home, {}, ['-r', stub]);
   check('読めないファイル・消えたディレクトリがあっても他のファイルは読んで通知する',
-    faulty.code === 0 && /faulty-ok\(transcript 1 本\)/.test(warnOf(faulty)) && !/locked-1|vanish-1/.test(warnOf(faulty)), JSON.stringify(faulty));
+    faulty.code === 0 && /faulty-ok\(1 セッション\)/.test(warnOf(faulty)) && !/locked-1|vanish-1/.test(warnOf(faulty)), JSON.stringify(faulty));
   check('読めなかったファイルを stderr に出す', /読めなかった transcript: .*proj-locked.*EBUSY/.test(faulty.err), faulty.err);
   const recovered = warnOf(watch(home));
-  check('読めなかったファイルは次回に読む', /locked-1\(transcript 1 本\)/.test(recovered) && /vanish-1\(transcript 1 本\)/.test(recovered), recovered);
+  check('読めなかったファイルは次回に読む', /locked-1\(1 セッション\)/.test(recovered) && /vanish-1\(1 セッション\)/.test(recovered), recovered);
 
   // ENOENT 以外で読めないディレクトリ(削除待ち・ロック中の EPERM)があっても止めない。配下の記録は
   // 前回のまま残す(落とすと通知の本数から外れ、次回に全部を先頭から読み直す)
@@ -1192,7 +1231,7 @@ console.log('\nmodel-watch.js');
   watch(home);
   const denied = watch(home, {}, ['-r', stubDenied]);
   check('読めないディレクトリがあっても止めず、配下で見つけていたモデルの通知を続ける',
-    denied.code === 0 && /denied-1\(transcript 1 本\)/.test(warnOf(denied)) && /locked-1/.test(warnOf(denied)), JSON.stringify(denied));
+    denied.code === 0 && /denied-1\(1 セッション\)/.test(warnOf(denied)) && /locked-1/.test(warnOf(denied)), JSON.stringify(denied));
   check('読めなかったディレクトリを stderr に出す', /読めなかった transcript: .*proj-denied.*EPERM/.test(denied.err), denied.err);
   const afterDenied = stats(home);
   check('読めなかったディレクトリ配下は、読めるようになっても先頭から読み直さない',
@@ -1204,7 +1243,7 @@ console.log('\nmodel-watch.js');
   sk.unknown['opus-5-20260101'] = { files: [path.join(proj, `${id1}.jsonl`)] };
   fs.writeFileSync(stateFile, JSON.stringify(sk));
   const carried = warnOf(watch(home));
-  check('引き継いだキーを正規化し直さない', /opus-5-20260101\(transcript 1 本\)/.test(carried), carried);
+  check('引き継いだキーを正規化し直さない', /opus-5-20260101\(1 セッション\)/.test(carried), carried);
   const sk2 = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
   delete sk2.unknown['opus-5-20260101'];
   fs.writeFileSync(stateFile, JSON.stringify(sk2));
@@ -1212,8 +1251,8 @@ console.log('\nmodel-watch.js');
   fs.writeFileSync(stateFile, '{壊れた');
   const broken = watch(home);
   check('状態ファイルが壊れていたら初回として全量を読み直し、失敗しない',
-    clean(broken) && /rewritten-2\(transcript 1 本\)/.test(warnOf(broken)) && /madeup-3\(transcript 1 本\)/.test(warnOf(broken))
-      && /madeup-2\(transcript 1 本\)/.test(warnOf(broken)) && !/madeup-1/.test(warnOf(broken)),
+    clean(broken) && /rewritten-2\(1 セッション\)/.test(warnOf(broken)) && /madeup-3\(1 セッション\)/.test(warnOf(broken))
+      && /madeup-2\(1 セッション\)/.test(warnOf(broken)) && !/madeup-1/.test(warnOf(broken)),
     JSON.stringify(broken));
   fs.writeFileSync(stateFile, JSON.stringify({ files: null, unknown: {} }));
   const nulled = watch(home);

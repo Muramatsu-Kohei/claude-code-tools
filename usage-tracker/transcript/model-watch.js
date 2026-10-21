@@ -15,7 +15,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { ROOT, walk, modelKey, isUnknownKey, isUnknownModel } = require('./lib');
+const { ROOT, walk, modelKey, isUnknownKey, isUnknownModel, fileIdentity } = require('./lib');
 
 // ROOT は ~/.claude/projects。状態は収集器・guard と同じ ~/.claude/usage-tracker に置く
 const STATE = path.join(path.dirname(ROOT), 'usage-tracker', 'model-watch.json');
@@ -28,9 +28,11 @@ const CHUNK = 8 * 1024 * 1024;
 const EDGE = 256;
 // 走査に使ってよい時間。フックの timeout(guard-hooks-snippet.json の 30 秒)で殺されると状態が
 // 保存されず、次のセッションも同じ全量走査からやり直して永久に進まない。超えたら 1 本の途中でも
-// 打ち切り、読めた分の位置を保存して残りは次回に回す。環境変数はテスト用。
+// 打ち切り、読めた分の位置を保存して残りは次回に回す。SessionStart フックは終わるまでセッション開始を
+// 待たせるので短く取る。timeout まで残る時間は、予算の外にある walk と stat、長い 1 行の読み切りに充てる。
+// 環境変数はテスト用。
 const BUDGET_ENV = process.env.USAGE_TRACKER_MODEL_WATCH_BUDGET_MS;
-const BUDGET_MS = BUDGET_ENV && Number(BUDGET_ENV) >= 0 ? Number(BUDGET_ENV) : 20000;
+const BUDGET_MS = BUDGET_ENV && Number(BUDGET_ENV) >= 0 ? Number(BUDGET_ENV) : 5000;
 // 途中で打ち切ったファイルのサイズとして記録する値。実際のサイズと一致しないので、次回は
 // 「変わっていない」と見なされず、記録した位置から続きを読む
 const UNFINISHED = -1;
@@ -47,7 +49,7 @@ function loadState() {
 
 // 一時ファイルに書いてから rename する。複数セッションが同時に起動すると書き込みが重なるが、
 // 途中まで書かれた JSON を次回読んで初回扱いになるよりは、どちらか一方が勝つ方がよい
-// (負けた側の位置が古くても、次回に同じ範囲を読み直すだけ。件数は transcript の本数で
+// (負けた側の位置が古くても、次回に同じ範囲を読み直すだけ。件数は出現した transcript の集合で
 // 数えているので、読み直しで増えることはない)。
 // Windows では相手の rename やウイルス対策ソフトが掴んでいる間、rename が EPERM などで失敗する。
 // 一時的なものなので少し待って数回やり直し、それでも駄目なときだけ失敗として扱う。
@@ -77,28 +79,35 @@ function rangeHash(fd, from, to) {
 const headOf = (fd, pos) => rangeHash(fd, 0, Math.min(EDGE, pos));
 const tailOf = (fd, pos) => rangeHash(fd, Math.max(0, pos - EDGE), pos);
 
-// prev(前回の記録)から先の、完結した行だけを読み、新しい記録・出てきたモデル・先頭から読んだかを返す。
-// 末尾の改行で終わっていない行は書き込み中のセッションのものなので読まずに残し、次回そこから読み直す。
+// prev(前回の記録)から先の、完結した行だけを読み、新しい記録・出てきたモデルと、先頭からの通読か・
+// 読み終えたかを返す。末尾の改行で終わっていない行は書き込み中のセッションのものなので読まずに残し、
+// 次回そこから読み直す。
 function scan(file, st, prev, deadline, stats) {
   const fd = fs.openSync(file, 'r');
   try {
     const size = st.size;
-    const models = new Set();
     let pos = 0;
+    // 先頭からの通読を前回途中で打ち切ったときに、そこまでに見つけていたモデル。続きを読み終えるまで
+    // 持ち越し、通読が済んだ時点でこのファイルの所属をまとめて入れ替える
+    let pending = null;
     // 前回の位置より短い、または読み終えた範囲の先頭か末尾が変わった = 作り直された。最初から読み直す。
-    // 末尾のハッシュを持たない古い状態も一度だけ読み直しになる(本数で数えるので件数は増えない)
+    // 末尾のハッシュを持たない古い状態も一度だけ読み直しになる(出現した transcript の集合で数えるので件数は増えない)
     if (prev && prev.pos <= size && headOf(fd, prev.pos) === prev.head && tailOf(fd, prev.pos) === prev.tail) {
       pos = prev.pos;
+      if (Array.isArray(prev.pending)) pending = prev.pending;
     }
     const start = pos;
+    const fromStart = start === 0 || !!pending;
+    const models = new Set(pending || []);
     let unfinished = false;
     // 改行が来るまでの断片。改行が来たときに 1 回だけ連結する(1 行が何チャンクにも
     // またがるときに、チャンクごとにつなぎ直すと長さの 2 乗でコピーが増える)
     let carry = [];
     let carryLen = 0;
     while (pos < size) {
-      // 期限は区切りごとに見る(巨大な 1 本で timeout を超えないため)。1 区切りは必ず読んで前に進める
-      if (pos > start && Date.now() >= deadline) { unfinished = true; break; }
+      // 期限は区切りごとに見る(巨大な 1 本で timeout を超えないため)。完結した行を 1 つも読めて
+      // いないうちは打ち切らない(区切りより長い行の途中で止めると、次回も同じ位置からで永久に進まない)
+      if (pos - carryLen > start && Date.now() >= deadline) { unfinished = true; break; }
       const buf = Buffer.alloc(Math.min(CHUNK, size - pos));
       const n = fs.readSync(fd, buf, 0, buf.length, pos);
       if (n <= 0) break;
@@ -122,10 +131,21 @@ function scan(file, st, prev, deadline, stats) {
     if (unfinished) stats.deferred++;
     const end = pos - carryLen;
     const rec = { pos: end, size: unfinished ? UNFINISHED : size, mtime: st.mtimeMs, head: headOf(fd, end), tail: tailOf(fd, end) };
-    return { rec, models, fromStart: start === 0 };
+    if (unfinished && fromStart) rec.pending = [...models];
+    return { rec, models, fromStart, done: !unfinished };
   } finally {
     fs.closeSync(fd);
   }
+}
+
+// transcript の ID の一覧を、何セッション分かに数える。サブエージェントの transcript は親セッションの
+// 下の別ファイルなので、ファイルの本数のままだと Agent を 10 回呼んだ 1 セッションが 11 と数えられる。
+// 帰属の決め方は集計スクリプトと同じ fileIdentity() に任せる
+function sessionCount(ids) {
+  return new Set(ids.map(id => {
+    const f = fileIdentity(path.join(ROOT, id));
+    return `${f.project}/${f.sid}`;
+  })).size;
 }
 
 function main() {
@@ -159,9 +179,9 @@ function main() {
     if (failedDirs.some(d => id.startsWith(d))) state.files[id] = rec;
   }
   for (const f of files) {
-    // 件数は「何本の transcript に出たか」で数える。レコード数だと、作り直しや状態の破損で同じ
-    // ファイルを読み直したときに増えてしまう。ただし --resume / fork は履歴を複製した新しい
-    // transcript を作るので、同じ応答が 2 本として数えられる(本数は規模の目安で、利用回数ではない)
+    // 件数は「何セッションに出たか」で数え、そのためにモデルごとの出現 transcript を持つ。レコード数だと、
+    // 作り直しや状態の破損で同じファイルを読み直したときに増えてしまう。ただし --resume / fork は履歴を
+    // 複製した新しいセッションを作るので、同じ応答が 2 つとして数えられる(規模の目安で、利用回数ではない)
     const id = path.relative(ROOT, f);
     const p = prev.files[id];
     const known = p && typeof p === 'object' ? p : null;
@@ -179,8 +199,9 @@ function main() {
       const r = scan(f, st, known, deadline, stats);
       state.files[id] = r.rec;
       // 先頭から読み直したファイルは、作り直されて前回のモデルを含まなくなっているかもしれないので、
-      // 前回までの所属をいったん外してから今回読んだ分で入れ直す
-      if (r.fromStart) for (const ids of seen.values()) ids.delete(id);
+      // 前回までの所属をいったん外してから今回読んだ分で入れ直す。ただし通読を途中で打ち切ったときは
+      // 外さない(未読の後半にしか出ないモデルが、続きを読むまでの間だけ通知から消えてしまう)
+      if (r.fromStart && r.done) for (const ids of seen.values()) ids.delete(id);
       for (const model of r.models) {
         if (!isUnknownModel(model)) continue;
         const key = modelKey(model);
@@ -213,7 +234,7 @@ function main() {
   // 通知は状態の保存より先に出す
   const keys = Object.keys(state.unknown);
   if (keys.length) {
-    const list = keys.map(k => `${k}(transcript ${state.unknown[k].files.length} 本)`).join(', ');
+    const list = keys.map(k => `${k}(${sessionCount(state.unknown[k].files)} セッション)`).join(', ');
     const msg = `usage-tracker: pricing.js に単価が無いモデルが transcript に出ている: ${list}。`
       + 'コスト集計では $0 として数えられるので、usage-tracker/transcript/pricing.js に単価を足すこと。';
     process.stdout.write(JSON.stringify({
