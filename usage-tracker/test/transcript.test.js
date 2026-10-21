@@ -155,7 +155,7 @@ check('単価表に無いモデルは名前と件数を警告する', /madeup-9\
 const ctorCost = lib.cost('claude-constructor', usage({ input_tokens: 1e6 }));
 const ctorWarn = captureWarn();
 check('Object.prototype の名前と同じモデルも単価表に無いものとして $0 にし、警告する',
-  lib.isUnknownModel('claude-constructor') && ctorCost === 0 && /constructor\(1件\)/.test(ctorWarn), ctorWarn);
+  lib.isUnknownKey('constructor') && ctorCost === 0 && /constructor\(1件\)/.test(ctorWarn), ctorWarn);
 
 // ---- コンテキスト長の帯域分類(指摘の本体) ----
 console.log('\nturncost.js');
@@ -1036,6 +1036,12 @@ console.log('\nmodel-watch.js');
   check('新しい行が無くても、単価表に足されるまで通知を続ける', /madeup-2\(1 セッション\)/.test(warnOf(third)), third.out);
   const idle = stats(home);
   check('サイズも更新時刻も変わっていないファイルは開かない', idle && idle.opened === 0 && idle.bytes === 0, JSON.stringify(idle));
+  // 何も変わっていなければ状態ファイルを書き直さない(rename で置き換えると ino が変わる)
+  const s0 = fs.statSync(stateFile);
+  watch(home);
+  const s1 = fs.statSync(stateFile);
+  check('何も変わっていなければ状態ファイルを書き直さない', s1.ino === s0.ino && s1.mtimeMs === s0.mtimeMs,
+    JSON.stringify({ before: [s0.ino, s0.mtimeMs], after: [s1.ino, s1.mtimeMs] }));
   const line = rec('claude-opus-5-5');
   fs.appendFileSync(file, line);
   const grown = stats(home);
@@ -1175,11 +1181,17 @@ console.log('\nmodel-watch.js');
     + JSON.stringify({ type: 'assistant', pad: 'v'.repeat(9 * 1024 * 1024), message: { model: 'claude-opus-5-5', usage: usage() } }) + '\n'
     + rec('claude-keep-1'));
   const midway = warnOf(watch(home, {}, ['-r', stubLate]));
+  // 持ち越しの間に単価表へ足されたモデルは、続きを読んだときに落とす。既知のキーを pending に仕込んで確かめる
+  const sm = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  const kH2 = path.relative(path.join(home, '.claude', 'projects'), fileH2);
+  sm.files[kH2].pending.push('opus-5');
+  fs.writeFileSync(stateFile, JSON.stringify(sm));
   const finished = warnOf(watch(home));
   check('先頭からの読み直しを途中で打ち切っても、読み終えるまで前回の所属を残す',
     /keep-1\(1 セッション\)/.test(midway) && /old-1\(1 セッション\)/.test(midway), midway);
   check('読み直しを読み終えたら、作り直しで含まなくなったモデルを外す',
     /keep-1\(1 セッション\)/.test(finished) && !/old-1/.test(finished), finished);
+  check('持ち越しの間に単価表へ足されたモデルは通知しない', !/opus-5\(/.test(finished), finished);
   fs.rmSync(fileH2);
 
   // サブエージェントの transcript は親セッションに合流させて数える(ファイルの本数だと 3 になる)
@@ -1247,6 +1259,19 @@ console.log('\nmodel-watch.js');
   const sk2 = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
   delete sk2.unknown['opus-5-20260101'];
   fs.writeFileSync(stateFile, JSON.stringify(sk2));
+
+  // 位置が文字列の記録は使わない。先頭と末尾のハッシュは数値に直して一致してしまうので、使うと
+  // pos += n が文字列の連結になり、保存される位置が壊れる。伸びたファイルで確かめる
+  const k1 = path.join(proj, `${id1}.jsonl`);
+  fs.appendFileSync(file, rec('claude-strpos-1'));
+  const sp = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  sp.files[k1] = { ...sp.files[k1], pos: String(sp.files[k1].pos) };
+  fs.writeFileSync(stateFile, JSON.stringify(sp));
+  const strPos = watch(home);
+  const posAfter = JSON.parse(fs.readFileSync(stateFile, 'utf8')).files[k1].pos;
+  check('位置が数値でない記録は使わず、先頭から読み直して正しい位置を残す',
+    clean(strPos) && /strpos-1\(1 セッション\)/.test(warnOf(strPos)) && posAfter === fs.statSync(file).size,
+    JSON.stringify({ posAfter, size: fs.statSync(file).size, out: warnOf(strPos) }));
 
   fs.writeFileSync(stateFile, '{壊れた');
   const broken = watch(home);

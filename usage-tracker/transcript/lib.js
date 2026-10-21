@@ -35,14 +35,11 @@ function modelKey(model) {
 
 // 単価表に無い課金対象のモデルか。cost() の $0 扱いと model-watch.js の通知は同じ判定を使う
 // (別々に持つと、片方だけ NOT_BILLED や modelKey の規則が変わって食い違う)。副作用は持たない。
-// 判定の本体は modelKey() 済みのキーで受ける isUnknownKey()。modelKey() は冪等でない
-// (末尾の日付を 1 つずつ落とす)ので、正規化済みのキーを isUnknownModel() に通し直してはいけない。
+// modelKey() 済みのキーで受ける。modelKey() は冪等でない(末尾の日付を 1 つずつ落とす)ので、
+// 呼び出し側は modelKey() を 1 回だけ掛けたキーを渡すこと。
 // PRICE は素のオブジェクトなので hasOwn で引く('claude-constructor' が Object.prototype の関数に当たらないように)。
 function isUnknownKey(key) {
   return !Object.hasOwn(PRICE, key) && !NOT_BILLED.has(key);
-}
-function isUnknownModel(model) {
-  return isUnknownKey(modelKey(model));
 }
 
 // 単価表に無いモデルは 0 円として扱うしかないが、黙って落とすと集計漏れに気づけない。
@@ -338,7 +335,7 @@ function warnUnknownModels() {
 }
 
 module.exports = {
-  PRICE, ROOT, modelKey, isUnknownKey, isUnknownModel, cost, ctxLen, walk, transcriptFiles, records,
+  PRICE, ROOT, modelKey, isUnknownKey, cost, ctxLen, walk, transcriptFiles, records,
   isNonInteractive, isNonInteractiveSession, makeNonInteractiveFilter, makeUsageCollector,
   fileIdentity, makeUuidDedupe, warnUnknownModels,
 };

@@ -9,13 +9,13 @@
 // 見つけたモデルは状態に残し、単価表に足されるまで毎回通知する(一度出して消えると、
 // そのセッションで見落とした時点で終わる)。
 //
-// 判定は lib.js の isUnknownKey() / isUnknownModel() をそのまま使い、ここで新たに持たない。見るのは
+// 判定は lib.js の isUnknownKey() をそのまま使い、ここで新たに持たない。見るのは
 // assistant レコードの message.model だけ。行の文字列から "model":"..." を拾うと、Agent ツールの入力
 // ("model":"sonnet" のようなエイリアス)まで未知モデルとして誤検知する。
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { ROOT, walk, modelKey, isUnknownKey, isUnknownModel, fileIdentity } = require('./lib');
+const { ROOT, walk, modelKey, isUnknownKey, fileIdentity } = require('./lib');
 
 // ROOT は ~/.claude/projects。状態は収集器・guard と同じ ~/.claude/usage-tracker に置く
 const STATE = path.join(path.dirname(ROOT), 'usage-tracker', 'model-watch.json');
@@ -79,7 +79,7 @@ function rangeHash(fd, from, to) {
 const headOf = (fd, pos) => rangeHash(fd, 0, Math.min(EDGE, pos));
 const tailOf = (fd, pos) => rangeHash(fd, Math.max(0, pos - EDGE), pos);
 
-// prev(前回の記録)から先の、完結した行だけを読み、新しい記録・出てきたモデルと、先頭からの通読か・
+// prev(前回の記録)から先の、完結した行だけを読み、新しい記録・出てきた単価表に無いモデルのキーと、先頭からの通読か・
 // 読み終えたかを返す。末尾の改行で終わっていない行は書き込み中のセッションのものなので読まずに残し、
 // 次回そこから読み直す。
 function scan(file, st, prev, deadline, stats) {
@@ -94,7 +94,8 @@ function scan(file, st, prev, deadline, stats) {
     // 末尾のハッシュを持たない古い状態も一度だけ読み直しになる(出現した transcript の集合で数えるので件数は増えない)
     if (prev && prev.pos <= size && headOf(fd, prev.pos) === prev.head && tailOf(fd, prev.pos) === prev.tail) {
       pos = prev.pos;
-      if (Array.isArray(prev.pending)) pending = prev.pending;
+      // 持ち越した間に単価表へ足されたものは落とす
+      if (Array.isArray(prev.pending)) pending = prev.pending.filter(k => isUnknownKey(k));
     }
     const start = pos;
     const fromStart = start === 0 || !!pending;
@@ -108,7 +109,8 @@ function scan(file, st, prev, deadline, stats) {
       // 期限は区切りごとに見る(巨大な 1 本で timeout を超えないため)。完結した行を 1 つも読めて
       // いないうちは打ち切らない(区切りより長い行の途中で止めると、次回も同じ位置からで永久に進まない)
       if (pos - carryLen > start && Date.now() >= deadline) { unfinished = true; break; }
-      const buf = Buffer.alloc(Math.min(CHUNK, size - pos));
+      // 読めた n バイトしか使わないので、ゼロ埋めは要らない(初回の全量走査で数百 MB を無駄に埋める)
+      const buf = Buffer.allocUnsafe(Math.min(CHUNK, size - pos));
       const n = fs.readSync(fd, buf, 0, buf.length, pos);
       if (n <= 0) break;
       pos += n;
@@ -125,7 +127,10 @@ function scan(file, st, prev, deadline, stats) {
         if (!line.includes('"assistant"')) continue;
         let o;
         try { o = JSON.parse(line); } catch (e) { continue; }
-        if (o.type === 'assistant' && o.message && o.message.model) models.add(o.message.model);
+        if (o.type !== 'assistant' || !o.message || !o.message.model) continue;
+        // 単価表に無いものだけを modelKey() 済みのキーで持つ(pending にも既知のモデルを溜めない)
+        const key = modelKey(o.message.model);
+        if (isUnknownKey(key)) models.add(key);
       }
     }
     if (unfinished) stats.deferred++;
@@ -184,7 +189,8 @@ function main() {
     // 複製した新しいセッションを作るので、同じ応答が 2 つとして数えられる(規模の目安で、利用回数ではない)
     const id = path.relative(ROOT, f);
     const p = prev.files[id];
-    const known = p && typeof p === 'object' ? p : null;
+    // 位置が数値でない記録(手で直した・壊れた状態)は使わない。文字列のまま足すと連結になって位置が壊れる
+    const known = p && typeof p === 'object' && Number.isFinite(p.pos) ? p : null;
     try {
       const st = fs.statSync(f);
       if (known && known.size === st.size && known.mtime === st.mtimeMs) { state.files[id] = known; continue; }
@@ -202,9 +208,7 @@ function main() {
       // 前回までの所属をいったん外してから今回読んだ分で入れ直す。ただし通読を途中で打ち切ったときは
       // 外さない(未読の後半にしか出ないモデルが、続きを読むまでの間だけ通知から消えてしまう)
       if (r.fromStart && r.done) for (const ids of seen.values()) ids.delete(id);
-      for (const model of r.models) {
-        if (!isUnknownModel(model)) continue;
-        const key = modelKey(model);
+      for (const key of r.models) {
         if (!seen.has(key)) seen.set(key, new Set());
         seen.get(key).add(id);
       }
@@ -242,6 +246,9 @@ function main() {
       hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: msg },
     }));
   }
+  // 何も変わっていなければ書かない。毎セッション(resume / clear / compact も)全体を書き直すと、
+  // 同時起動の rename 競合を自分から増やすことになる
+  if (JSON.stringify(state) === JSON.stringify(prev)) return;
   try {
     saveState(state);
   } catch (e) {
