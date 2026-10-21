@@ -181,6 +181,33 @@ check('内訳の違う2ターンが同じ 200〜300K 帯に入る', /^200〜300K
 check('キャッシュ作成ターンが 〜30K 帯に落ちない', !/^〜30K/m.test(tc.out), tc.out);
 check('基準帯が空でも倍率欄が壊れない(- を出す)', !/NaN|Infinity/.test(tc.out), tc.out);
 
+// ---- fast mode の扱い(turncost は除外、sessions は合計に含めて内訳を分ける) ----
+console.log('\nfast mode');
+(() => {
+  const home = sandbox('fast');
+  writeTranscript(home, 'proj', 'cccccccc-0000-0000-0000-000000000001', [
+    // 標準: 40K 読み + 出力 → 30〜60K 帯。fast: 同じ量で単価だけ 2 倍
+    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1000 })),
+    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1000, speed: 'fast' })),
+  ]);
+  const tcf = run('turncost.js', home);
+  check('turncost.js: fast mode のターンは帯に入れない', /^30〜60K\s+1\s/m.test(tcf.out), tcf.out);
+  check('turncost.js: 外した件数を出力に添える', /fast mode のターン 1 件/.test(tcf.out), tcf.out);
+
+  const ssf = run('sessions.js', home);
+  // opus-5: 標準 = (10*5 + 40e3*5*0.1 + 1000*25)/1e6 = 0.04505、fast = (10*10 + 40e3*10*0.1 + 1000*50)/1e6 = 0.0901
+  check('sessions.js: fast mode も合計に含める', /^セッション数: 1  総換算コスト: \$0$/m.test(ssf.out), ssf.out);
+  check('sessions.js: fast mode の分を別に示す', /うち fast mode \$0\.09。/.test(ssf.out), ssf.out);
+
+  const homeStd = sandbox('fast-none');
+  writeTranscript(homeStd, 'proj', 'cccccccc-0000-0000-0000-000000000002', [
+    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1000, speed: 'standard' })),
+  ]);
+  const ssn = run('sessions.js', homeStd);
+  const tcn = run('turncost.js', homeStd);
+  check('使っていなければ fast mode の行を出さない', !/fast mode/.test(ssn.out + tcn.out), ssn.out + tcn.out);
+})();
+
 // ---- tool_result をツール名で集計できているか ----
 console.log('\nbreakdown.js');
 writeTranscript(homeA, 'proj', 'aaaaaaaa-0000-0000-0000-000000000002', [
@@ -988,33 +1015,6 @@ const asyncChecks = (async () => {
   } catch (e) { goneThrew = true; }
   check('records(): 読めないファイルは投げずに 0 件で終わる',
     !goneThrew && goneCount === 0, `threw=${goneThrew} count=${goneCount}`);
-})();
-
-// ---- fast mode の扱い(turncost は除外、sessions は合計に含めて内訳を分ける) ----
-console.log('\nfast mode');
-(() => {
-  const home = sandbox('fast');
-  writeTranscript(home, 'proj', 'cccccccc-0000-0000-0000-000000000001', [
-    // 標準: 40K 読み + 出力 → 30〜60K 帯。fast: 同じ量で単価だけ 2 倍
-    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1000 })),
-    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1000, speed: 'fast' })),
-  ]);
-  const tcf = run('turncost.js', home);
-  check('turncost.js: fast mode のターンは帯に入れない', /^30〜60K\s+1\s/m.test(tcf.out), tcf.out);
-  check('turncost.js: 外した件数を出力に添える', /fast mode のターン 1 件/.test(tcf.out), tcf.out);
-
-  const ssf = run('sessions.js', home);
-  // opus-5: 標準 = (10*5 + 40e3*5*0.1 + 1000*25)/1e6 = 0.04505、fast = (10*10 + 40e3*10*0.1 + 1000*50)/1e6 = 0.0901
-  check('sessions.js: fast mode も合計に含める', /^セッション数: 1  総換算コスト: \$0$/m.test(ssf.out), ssf.out);
-  check('sessions.js: fast mode の分を別に示す', /うち fast mode \$0\.09。/.test(ssf.out), ssf.out);
-
-  const homeStd = sandbox('fast-none');
-  writeTranscript(homeStd, 'proj', 'cccccccc-0000-0000-0000-000000000002', [
-    assistant(usage({ input_tokens: 10, cache_read_input_tokens: 40e3, output_tokens: 1000, speed: 'standard' })),
-  ]);
-  const ssn = run('sessions.js', homeStd);
-  const tcn = run('turncost.js', homeStd);
-  check('使っていなければ fast mode の行を出さない', !/fast mode/.test(ssn.out + tcn.out), ssn.out + tcn.out);
 })();
 
 // ---- transcript が無い環境 ----
