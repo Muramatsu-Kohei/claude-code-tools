@@ -981,8 +981,9 @@ console.log('\nmodel-watch.js');
   // run() は終了コード 0 のとき stderr を捨てるので、ここでは常に stderr も取る。
   // model-watch.js は例外を握って終わるので、stderr を見ないと「失敗しない」の検査が空振りする
   const { spawnSync } = require('child_process');
-  const watch = (home, env = {}) => {
-    const r = spawnSync(process.execPath, [path.join(TRANSCRIPT, 'model-watch.js')], {
+  // pre は node の前置き引数(-r で fs を差し替えて障害を注入するのに使う)
+  const watch = (home, env = {}, pre = []) => {
+    const r = spawnSync(process.execPath, [...pre, path.join(TRANSCRIPT, 'model-watch.js')], {
       encoding: 'utf8', windowsHide: true, timeout: 30000,
       env: { ...process.env, USERPROFILE: home, HOME: home, USAGE_TRACKER_MODEL_WATCH_STATS: '', ...env },
     });
@@ -1054,8 +1055,8 @@ console.log('\nmodel-watch.js');
   check('書き込み途中の行は読まず、完結した次の回に数える',
     !/partial-1/.test(warnOf(fifth)) && /partial-1\(transcript 1 本\)/.test(warnOf(sixth)), `${fifth.out}\n${sixth.out}`);
 
-  // 初回の後に作られたファイルは先頭から読む。--resume / fork の複製のように同じモデルが
-  // 別の transcript に出たら 2 本と数える(同じファイルの読み直しでは増えない)
+  // 初回の後に作られたファイルは先頭から読む。同じモデルが別の transcript に出たら 2 本と数える
+  // (同じファイルの読み直しでは増えない。--resume / fork の複製も別の 1 本になるのは仕様)
   writeTranscript(home, 'proj2', 'bbbbbbbb-0000-0000-0000-000000000002', [
     { type: 'assistant', message: { model: 'claude-madeup-3', usage: usage() } },
     { type: 'assistant', message: { model: 'claude-madeup-2', usage: usage() } },
@@ -1089,6 +1090,71 @@ console.log('\nmodel-watch.js');
   const truncated = warnOf(watch(home));
   check('先頭を保ったまま前回より短くなったファイルも先頭から読む', /trunc-1\(transcript 1 本\)/.test(truncated), truncated);
 
+  // 先頭を保ったまま切り詰められ、前回の位置を超えて書き足された場合はサイズでも分からない。
+  // 前回の位置の直前の内容で見分ける(見分けられないと、前回の位置から途中の行を読んで取りこぼす)
+  const fileG = path.join(home, '.claude', 'projects', 'proj3', 'bbbbbbbb-0000-0000-0000-000000000004.jsonl');
+  const filler = JSON.stringify({ type: 'assistant', pad, message: { model: 'claude-opus-5-5', usage: usage() } }) + '\n';
+  fs.writeFileSync(fileG, longFirst + filler);
+  watch(home);
+  fs.writeFileSync(fileG, longFirst + rec('claude-regrow-1') + filler + filler);
+  const regrew = warnOf(watch(home));
+  check('先頭を保ったまま切り詰めて前回より長く書き足されたファイルも先頭から読む', /regrow-1\(transcript 1 本\)/.test(regrew), regrew);
+
+  // 1 行が読み込みの区切り(8MB)を何度もまたいでも、つなぎ直して 1 行として読む
+  const fileL = path.join(home, '.claude', 'projects', 'proj3', 'bbbbbbbb-0000-0000-0000-000000000005.jsonl');
+  fs.writeFileSync(fileL, JSON.stringify({ type: 'assistant', pad: 'y'.repeat(17 * 1024 * 1024),
+    message: { model: 'claude-longline-1', usage: usage() } }) + '\n');
+  const longLine = warnOf(watch(home));
+  check('区切りを 2 回以上またぐ長い行も 1 行として読む', /longline-1\(transcript 1 本\)/.test(longLine), longLine.slice(0, 300));
+  fs.rmSync(fileL);
+
+  // 時間切れ(予算 0)なら走査を次回に回し、記録の無いファイルは次回に先頭から読む
+  writeTranscript(home, 'proj4', 'bbbbbbbb-0000-0000-0000-000000000006', [
+    { type: 'assistant', message: { model: 'claude-budget-1', usage: usage() } },
+  ]);
+  const late = watch(home, { USAGE_TRACKER_MODEL_WATCH_BUDGET_MS: '0', USAGE_TRACKER_MODEL_WATCH_STATS: '1' });
+  const next = watch(home);
+  check('時間切れなら残りを次回に回し、その旨を stats に出す',
+    late.code === 0 && !/budget-1/.test(warnOf(late)) && /時間切れで \d+ 本を次回に回した/.test(late.err), JSON.stringify(late));
+  check('時間切れで回したファイルは次回に読む', /budget-1\(transcript 1 本\)/.test(warnOf(next)), next.out);
+
+  // 障害の注入。fs を差し替える preload を -r で読ませる
+  const stub = path.join(BASE, 'model-watch-stub.js');
+  fs.writeFileSync(stub, [
+    "const fs = require('fs');",
+    "const fail = (code) => { const e = new Error(code); e.code = code; return e; };",
+    "const open = fs.openSync;",
+    "fs.openSync = function (p, ...a) { if (String(p).includes('locked')) throw fail('EBUSY'); return open.call(this, p, ...a); };",
+    "const rd = fs.readdirSync;",
+    "fs.readdirSync = function (p, ...a) { if (String(p).includes('vanish')) throw fail('ENOENT'); return rd.call(this, p, ...a); };",
+  ].join('\n'));
+  writeTranscript(home, 'proj-locked', 'bbbbbbbb-0000-0000-0000-000000000007', [
+    { type: 'assistant', message: { model: 'claude-locked-1', usage: usage() } },
+  ]);
+  writeTranscript(home, path.join('proj-vanish', 'sub'), 'bbbbbbbb-0000-0000-0000-000000000008', [
+    { type: 'assistant', message: { model: 'claude-vanish-1', usage: usage() } },
+  ]);
+  writeTranscript(home, 'proj4', 'bbbbbbbb-0000-0000-0000-000000000009', [
+    { type: 'assistant', message: { model: 'claude-faulty-ok', usage: usage() } },
+  ]);
+  const faulty = watch(home, {}, ['-r', stub]);
+  check('読めないファイル・消えたディレクトリがあっても他のファイルは読んで通知する',
+    faulty.code === 0 && /faulty-ok\(transcript 1 本\)/.test(warnOf(faulty)) && !/locked-1|vanish-1/.test(warnOf(faulty)), JSON.stringify(faulty));
+  check('読めなかったファイルを stderr に出す', /読めなかった transcript: .*proj-locked.*EBUSY/.test(faulty.err), faulty.err);
+  const recovered = warnOf(watch(home));
+  check('読めなかったファイルは次回に読む', /locked-1\(transcript 1 本\)/.test(recovered) && /vanish-1\(transcript 1 本\)/.test(recovered), recovered);
+
+  // 引き継いだキーは modelKey() 済み。もう一度 modelKey() に通すと日付が落ちて単価表のキーに化け、
+  // まだ $0 で数えられているモデルの通知が消える(opus-5-20260101 → opus-5)
+  const sk = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  sk.unknown['opus-5-20260101'] = { files: ['y.jsonl'], firstSeen: '2026-01-01T00:00:00.000Z' };
+  fs.writeFileSync(stateFile, JSON.stringify(sk));
+  const carried = warnOf(watch(home));
+  check('引き継いだキーを正規化し直さない', /opus-5-20260101\(transcript 1 本\)/.test(carried), carried);
+  const sk2 = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  delete sk2.unknown['opus-5-20260101'];
+  fs.writeFileSync(stateFile, JSON.stringify(sk2));
+
   fs.writeFileSync(stateFile, '{壊れた');
   const broken = watch(home);
   check('状態ファイルが壊れていたら初回として全量を読み直し、失敗しない',
@@ -1099,14 +1165,24 @@ console.log('\nmodel-watch.js');
   const nulled = watch(home);
   check('状態ファイルの files が null でも初回として扱い、失敗しない', clean(nulled) && /madeup-3/.test(warnOf(nulled)), JSON.stringify(nulled));
 
-  // 状態を保存できなくても(同時起動の rename 競合など)、通知は先に出ている
+  // 状態を保存できなくても(同時起動の rename 競合など)、通知は先に出ている。Claude Code は
+  // 終了コード 0 のときしか stdout の JSON を読まないので、通知を出したなら 0 で終える
   fs.rmSync(stateFile, { force: true });
   fs.mkdirSync(stateFile);
   const unsaved = watch(home);
   const tmpLeft = fs.readdirSync(path.dirname(stateFile)).filter(n => n.endsWith('.tmp'));
-  check('状態を保存できなくても通知は出し、不具合は終了コード 1 と stderr で見せる',
-    unsaved.code === 1 && /madeup-3/.test(warnOf(unsaved)) && /^model-watch: /m.test(unsaved.err), JSON.stringify(unsaved));
+  check('状態を保存できなくても通知は出し、通知が読まれるよう終了コード 0 で終える',
+    unsaved.code === 0 && /madeup-3/.test(warnOf(unsaved)) && /^model-watch: 状態を保存できなかった/m.test(unsaved.err), JSON.stringify(unsaved));
   check('保存に失敗しても一時ファイルを残さない', tmpLeft.length === 0, tmpLeft.join(', '));
+  // 通知が無ければ捨てるものも無いので、不具合を終了コード 1 で見せる
+  const homeQ = sandbox('model-watch-quiet');
+  writeTranscript(homeQ, 'proj', 'bbbbbbbb-0000-0000-0000-00000000000a', [
+    { type: 'assistant', message: { model: 'claude-opus-5-5', usage: usage() } },
+  ]);
+  fs.mkdirSync(path.join(homeQ, '.claude', 'usage-tracker', 'model-watch.json'), { recursive: true });
+  const quiet = watch(homeQ);
+  check('通知が無いときの保存失敗は終了コード 1 と stderr で見せる',
+    quiet.code === 1 && quiet.out === '' && /^model-watch: 状態を保存できなかった/m.test(quiet.err), JSON.stringify(quiet));
 
   const none = path.join(BASE, 'model-watch-none');
   fs.mkdirSync(none, { recursive: true });

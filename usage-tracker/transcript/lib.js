@@ -35,19 +35,23 @@ function modelKey(model) {
 
 // 単価表に無い課金対象のモデルか。cost() の $0 扱いと model-watch.js の通知は同じ判定を使う
 // (別々に持つと、片方だけ NOT_BILLED や modelKey の規則が変わって食い違う)。副作用は持たない。
-function isUnknownModel(model) {
-  const key = modelKey(model);
+// 判定の本体は modelKey() 済みのキーで受ける isUnknownKey()。modelKey() は冪等でない
+// (末尾の日付を 1 つずつ落とす)ので、正規化済みのキーを isUnknownModel() に通し直してはいけない。
+function isUnknownKey(key) {
   return !PRICE[key] && !NOT_BILLED.has(key);
+}
+function isUnknownModel(model) {
+  return isUnknownKey(modelKey(model));
 }
 
 // 単価表に無いモデルは 0 円として扱うしかないが、黙って落とすと集計漏れに気づけない。
 // 見かけた名前を控えておき、呼び出し側が最後に warnUnknownModels() で報告する。
-// 記録するかどうかは isUnknownModel() に任せる(課金対象外の <synthetic> などは記録しない)。
+// 記録するかどうかは isUnknownKey() に任せる(課金対象外の <synthetic> などは記録しない)。
 function cost(model, u) {
   const key = modelKey(model);
   const p = PRICE[key];
   if (!p) {
-    if (isUnknownModel(model)) unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
+    if (isUnknownKey(key)) unknownModels.set(key, (unknownModels.get(key) || 0) + 1);
     return 0;
   }
   // 段階料金のモデルは prompt 長で単価表ごと切り替える(超えた分だけでなく全体が高い側になる)
@@ -79,10 +83,14 @@ function ctxLen(u) {
     + (u.input_tokens || 0);
 }
 
+// 走査中に消えたサブディレクトリ(別セッションの後片付けや cleanupPeriodDays の削除)は飛ばす。
+// 1 つの消失で全体を落とさないため。起点の dir が無いのは呼び出し側の誤りなので投げる。
 function walk(dir, out = []) {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, e.name);
-    if (e.isDirectory()) walk(p, out);
+    if (e.isDirectory()) {
+      try { walk(p, out); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+    }
     else if (e.name.endsWith('.jsonl')) out.push(p);
   }
   return out;
@@ -323,7 +331,7 @@ function warnUnknownModels() {
 }
 
 module.exports = {
-  PRICE, ROOT, modelKey, isUnknownModel, cost, ctxLen, walk, transcriptFiles, records,
+  PRICE, ROOT, modelKey, isUnknownKey, isUnknownModel, cost, ctxLen, walk, transcriptFiles, records,
   isNonInteractive, isNonInteractiveSession, makeNonInteractiveFilter, makeUsageCollector,
   fileIdentity, makeUuidDedupe, warnUnknownModels,
 };
