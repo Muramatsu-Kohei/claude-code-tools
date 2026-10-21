@@ -41,7 +41,7 @@ const HEAVY = new Set(['Read', 'Grep', 'Glob', 'Bash', 'PowerShell', 'WebFetch',
         heavy: 0, task: 0,  // メインでの重いツール呼び出し数 / サブエージェント委譲回数
         costMain: 0, costSub: 0,
         costFast: 0,        // うち fast mode の分(main/sub の内数)
-        fastApprox: false,  // costFast に fast の単価が無いモデルの分(標準単価の概算)が入ったか
+        fastApprox: false,  // costFast に概算の分(isApproxFast(): fast の単価が無いモデル、Opus 4.6)が入ったか
         start: null, end: null,
       };
       byId.set(sid, s);

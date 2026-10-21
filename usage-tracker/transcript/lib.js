@@ -363,7 +363,7 @@ function warnUnknownModels() {
   const fmt = m => [...m.entries()].map(([k, n]) => `${k}(${n}件)`).join(', ');
   if (unknownModels.size) console.error(`\n警告: pricing.js に単価が無いモデルを $0 として集計した: ${fmt(unknownModels)}`);
   if (missingFast.size) {
-    console.error(`\n警告: pricing.js に fast mode の単価が無いモデルのレコードがあった(集計に入る分は標準単価で数える。集計外のセッションの分も含む): ${fmt(missingFast)}`);
+    console.error(`\n警告: pricing.js に fast mode の単価が無いモデルのレコードがあった(額に入れる集計では標準単価で数える。集計から外したレコードも件数に含む): ${fmt(missingFast)}`);
   }
 }
 

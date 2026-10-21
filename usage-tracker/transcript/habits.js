@@ -458,8 +458,9 @@ function activeMinutes(sorted, gapMin) {
     },
     cost: stat.totalCost,
     fastCost: stat.fastCost,
-    // fastCost に fast の単価が無いモデルの分が標準単価で入っている(下限の概算)。stderr の警告は
-    // JSON の利用側に届かないことが多いので、値の横に持たせる。
+    // fastCost が概算か(lib.js の isApproxFast())。fast の単価が無いモデルの分は標準単価で入るので
+    // 低く出るが、Opus 4.6 は当時の割増・割引を扱わないので高くも低くも出る。下限とは限らない。
+    // stderr の警告は JSON の利用側に届かないことが多いので、値の横に持たせる。
     fastApprox: stat.fastApprox,
   };
 

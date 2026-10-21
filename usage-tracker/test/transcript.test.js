@@ -217,6 +217,16 @@ console.log('\nfast mode');
   const tcs = run('turncost.js', homeSw);
   check('turncost.js: fast の直後の標準ターンも帯から外し、件数を添える',
     /^30〜60K\s+2\s/m.test(tcs.out) && /fast mode のターン 1 件と、その直後の標準ターン 1 件/.test(tcs.out), tcs.out);
+  // Opus 以外の fast の直後に Opus の標準ターンが来ると、外れるのは直後のターンだけになる。それでも件数を出す
+  const homeSw2 = sandbox('fast-switch-other');
+  writeTranscript(homeSw2, 'proj', 'cccccccc-0000-0000-0000-00000000000a', [
+    { ...assistant(usage({ output_tokens: 100, speed: 'fast' })),
+      message: { model: 'claude-sonnet-5-5', usage: usage({ output_tokens: 100, speed: 'fast' }) } },
+    assistant(usage({ input_tokens: 10, cache_creation_input_tokens: 40e3, output_tokens: 100 })),
+  ]);
+  const tcs2 = run('turncost.js', homeSw2);
+  check('turncost.js: 直後のターンだけを外したときも件数を添える',
+    /fast mode のターン 0 件と、その直後の標準ターン 1 件/.test(tcs2.out), tcs2.out);
 
   const ssf = run('sessions.js', home);
   // opus-5: 標準 = (10*5 + 40e3*5*0.1 + 1e6*25)/1e6 = 25.02、fast = (10*10 + 40e3*10*0.1 + 1e6*50)/1e6 = 50.04
@@ -257,6 +267,9 @@ console.log('\nfast mode');
   check('sessions.js と habits.js の fast の行は同じ文面',
     (sst.out.match(/^\(うち fast mode .*$/m) || [])[0] === (hbt.out.match(/^\(うち fast mode .*$/m) || [])[0],
     sst.out + hbt.out);
+  // 境界: 0.5 未満は「$0.5 未満」、0.5 ちょうどは総額と同じ toFixed(0) の丸めで $1
+  check('fastCostLine: 0.5 の手前は「$0.5 未満」、0.5 ちょうどは $1',
+    /\$0\.5 未満/.test(lib.fastCostLine(0.4999, false)) && /うち fast mode \$1。/.test(lib.fastCostLine(0.5, false)));
 
   // fast の単価が無いモデル(sonnet-5-5)の fast は標準単価で入るので、額が概算である旨を添える
   // 標準単価: (10*2 + 40e3*2*0.05 + 1e6*10)/1e6 = 10.02 → $10

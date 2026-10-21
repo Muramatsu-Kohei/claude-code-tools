@@ -83,7 +83,9 @@ const HEAVY_FROM = 150e3;
     if (sdkRecords) excluded.push(`単独レコード ${sdkRecords} 件`);
     console.log(`(非対話実行 claude -p の${excluded.join(' / ')}は集計から除外)\n`);
   }
-  if (fastTurns) {
+  // 直後のターンだけが外れることもある(Opus 以外の fast の後に Opus の標準ターンが来たとき)。
+  // そのときも件数を出さないと、帯のターン数が説明なく減る
+  if (fastTurns || afterFastTurns) {
     console.log(`(fast mode のターン ${fastTurns} 件と、その直後の標準ターン ${afterFastTurns} 件は単価が違うので集計から除外)\n`);
   }
   console.log(`コンテキスト長      ターン数    合計$    $/ターン  ${BASE_LABEL}比`);
