@@ -3284,4 +3284,19 @@ function pingLines(logPath) {
     lines.length === 1 && lines[0] === 'refresh-personal-tok', lines.join(','));
 }
 
+// --- 端末へのエラー文面は process.stderr を通す ---
+// fs.writeSync(2) は UTF-8 のバイト列をそのままコンソールへ渡すので、コードページが 932 の
+// 端末では「繧ｨ繝ｩ繝ｼ:」のように化けていた(PowerShell 7 で実際に出た)。化け方そのものは
+// 実コンソールでしか再現できないため、ここでは経路だけを見る: stderr を端末に見せかけて
+// (test/tty-stderr.js)、エラー文面が process.stderr.write を通ったことを [tty] の印で確かめる。
+{
+  const home = sandbox('tty-stderr', { current: creds('pro') });
+  const r = runSwap(home, ['save', 'bad name!'], {
+    NODE_OPTIONS: '--require ' + path.join(__dirname, 'tty-stderr.js'),
+  });
+  check('端末では名前の検証エラーで中止する', r.code === 1, r.out + r.err);
+  check('端末ではエラー文面が process.stderr を通る(fs.writeSync で直接書かない)',
+    r.err.startsWith('[tty]エラー: アカウント名に使えない文字'), r.err);
+}
+
 report();
