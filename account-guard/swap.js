@@ -199,8 +199,16 @@ const DAY_MS = 86400000;
 // 文面を出すところまで。stdout に既に何かを出している場所では、process.exit が直前の
 // console.log を切ることがあるので、そこではこちらで出して exitCode を立て、自然に抜ける
 // (cmdSwap の「別アカウントだと確認できません」案内と同じ扱い)。
+// ただし端末へは fs.writeSync を使わない。生の UTF-8 バイトがそのままコンソールへ渡り、
+// コンソールのコードページ(日本語 Windows の既定は 932)で解釈されて文字化けする。
+// process.stderr は端末なら UTF-16 で書く(WriteConsoleW)のでコードページに左右されず、
+// 書き込みも呼び出しの中で終わるので、直後に exit しても切れない。
 function failText(msg) {
   const line = 'エラー: ' + msg + '\n';
+  if (process.stderr.isTTY) {
+    process.stderr.write(line);
+    return;
+  }
   try {
     fs.writeSync(2, line);
   } catch {
