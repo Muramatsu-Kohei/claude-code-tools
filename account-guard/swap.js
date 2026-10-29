@@ -201,8 +201,13 @@ const DAY_MS = 86400000;
 // (cmdSwap の「別アカウントだと確認できません」案内と同じ扱い)。
 // ただし端末へは fs.writeSync を使わない。生の UTF-8 バイトがそのままコンソールへ渡り、
 // コンソールのコードページ(日本語 Windows の既定は 932)で解釈されて文字化けする。
-// process.stderr は端末なら UTF-16 で書く(WriteConsoleW)のでコードページに左右されず、
-// 書き込みも呼び出しの中で終わるので、直後に exit しても切れない。
+// process.stderr は端末なら UTF-16 で書く(WriteConsoleW)のでコードページに左右されない。
+// 直後の exit で切れないかについて: Node のドキュメントは Windows の端末への書き込みを
+// 「非同期」としているが、libuv の実装は write の呼び出しの中で WriteConsoleW を済ませている。
+// CP932 のコンソールで約 6 万バイトを書いた直後に exit しても末尾まで届くことを実測した。
+// 保証は実装頼みだが、仮に切れても writeSync を入れる前の状態に戻るだけで、化けるより軽い。
+// 分岐は OS を問わない。POSIX の端末への書き込みはドキュメント上も同期なので、
+// どの OS でも端末へは process.stderr を使えば足り、Windows 専用に絞る理由がない。
 function failText(msg) {
   const line = 'エラー: ' + msg + '\n';
   if (process.stderr.isTTY) {
